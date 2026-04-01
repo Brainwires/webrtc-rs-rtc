@@ -169,7 +169,7 @@ impl ReceiverStream {
                     | (self.last_seq_num as u32 & 0xFFFF),
                 last_sender_report: self.last_sender_report,
                 fraction_lost,
-                total_lost: self.total_lost,
+                total_lost: self.total_lost as i32,
                 delay,
                 jitter: self.jitter as u32,
             }],
