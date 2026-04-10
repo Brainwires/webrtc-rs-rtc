@@ -235,7 +235,6 @@ impl<P: Interceptor> JitterBufferInterceptor<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream_info::RTPHeaderExtension;
     use crate::{Registry, stream_info::StreamInfo};
     use sansio::Protocol;
     use shared::{TransportContext, TransportMessage};

@@ -640,11 +640,11 @@ mod tests {
     }
 
     /// When both peers open the same negotiated stream, the second
-    /// `open_stream` call must fail with `ErrStreamAlreadyExist`.  This
-    /// exercises the peer-race scenario described in RFC 8832 where both
-    /// sides send `DATA_CHANNEL_OPEN` for the same pre-negotiated stream ID.
+    /// `open_stream` call should succeed gracefully because pre-negotiated
+    /// channels treat `ErrStreamAlreadyExist` as non-fatal (the peer race
+    /// scenario described in RFC 8832).
     #[test]
-    fn negotiated_dial_duplicate_stream_returns_already_exist() {
+    fn negotiated_dial_duplicate_stream_succeeds() {
         let (mut ctx, association_handle) = make_ctx_with_association();
         let payload = make_dcep_open_payload();
 
@@ -668,6 +668,8 @@ mod tests {
 
         // Second dial on the same stream ID: simulates the peer race where
         // both sides send DATA_CHANNEL_OPEN for the same negotiated channel.
+        // This should succeed because the handler treats ErrStreamAlreadyExist
+        // as non-fatal for pre-negotiated channels.
         let msg2 = TaggedRTCMessageInternal {
             now: Instant::now(),
             transport: TransportContext::default(),
@@ -681,11 +683,8 @@ mod tests {
         };
 
         let mut handler = SctpHandler::new(&mut ctx);
-        let result = handler.handle_write(msg2);
-
-        assert!(
-            matches!(result, Err(shared::error::Error::ErrStreamAlreadyExist)),
-            "expected ErrStreamAlreadyExist for duplicate negotiated stream, got: {result:?}"
-        );
+        handler
+            .handle_write(msg2)
+            .expect("second negotiated open must succeed (duplicate is non-fatal)");
     }
 }
