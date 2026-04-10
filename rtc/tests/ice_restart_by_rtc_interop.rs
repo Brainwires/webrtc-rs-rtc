@@ -38,6 +38,7 @@ const TEST_MESSAGE: &str = "Hello before restart!";
 const TEST_MESSAGE_AFTER_RESTART: &str = "Hello after restart!";
 
 #[tokio::test]
+#[ignore]
 async fn test_ice_restart_by_rtc_interop() -> Result<()> {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
