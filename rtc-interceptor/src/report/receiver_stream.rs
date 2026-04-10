@@ -3,6 +3,13 @@ use std::time::Instant;
 /// Number of packets tracked per u64 entry in the bitmap.
 const PACKETS_PER_ENTRY: usize = 64;
 
+/// Maximum value for `total_lost` per RFC 3550 §6.4.1.
+///
+/// The wire format is a signed 24-bit integer.  We store it as `u32` but
+/// clamp to the signed-positive maximum (`0x7F_FFFF`) so the sign bit
+/// stays clear when the value is serialised into the 24-bit RTCP field.
+const MAX_TOTAL_LOST: u32 = 0x7F_FFFF;
+
 pub(crate) struct ReceiverStream {
     ssrc: u32,
     receiver_ssrc: u32,
@@ -21,7 +28,7 @@ pub(crate) struct ReceiverStream {
     jitter: f64,
     last_sender_report: u32,
     last_sender_report_time: Option<Instant>,
-    total_lost: i32,
+    total_lost: u32,
 }
 
 impl ReceiverStream {
@@ -137,15 +144,12 @@ impl ReceiverStream {
             }
         };
 
-        self.total_lost += total_lost_since_report as i32;
-
-        // Clamp to signed 24-bit range per RFC 3550 §6.4.1
-        if total_lost_since_report > 0x7FFFFF {
-            total_lost_since_report = 0x7FFFFF;
-        }
-        if self.total_lost > 0x7FFFFF {
-            self.total_lost = 0x7FFFFF;
-        }
+        // Clamp before adding to prevent overflow (RFC 3550 §6.4.1: signed 24-bit max)
+        total_lost_since_report = total_lost_since_report.min(MAX_TOTAL_LOST);
+        self.total_lost = self
+            .total_lost
+            .saturating_add(total_lost_since_report)
+            .min(MAX_TOTAL_LOST);
 
         // Calculate DLSR (Delay Since Last SR) - RFC 3550
         // Return 0 if no SR has been received yet
@@ -461,9 +465,9 @@ mod tests {
 
     #[test]
     fn test_receiver_stream_24bit_loss_clamping() {
-        // Test that total_lost is clamped to signed 24-bit max (0x7FFFFF)
+        // Test that total_lost is clamped to signed 24-bit max (MAX_TOTAL_LOST)
         let mut stream = ReceiverStream::new(123456, 90000);
-        stream.total_lost = 0x7FFFFE; // Almost at signed 24-bit max
+        stream.total_lost = MAX_TOTAL_LOST - 1; // Almost at max
 
         let now = Instant::now();
 
@@ -473,7 +477,7 @@ mod tests {
 
         let rr = stream.generate_report(now);
 
-        // Should be clamped to signed 24-bit max (0x7FFFFF)
-        assert_eq!(rr.reports[0].total_lost, 0x7FFFFF);
+        // Should be clamped to MAX_TOTAL_LOST (0x7F_FFFF per RFC 3550 §6.4.1)
+        assert_eq!(rr.reports[0].total_lost, MAX_TOTAL_LOST);
     }
 }
