@@ -13,6 +13,7 @@
 #[cfg(test)]
 mod data_channel_test;
 
+use crate::message::message_type::{MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_THRESHOLD};
 use crate::message::{
     message_channel_ack::*, message_channel_close::*, message_channel_open::*,
     message_channel_threshold::*, *,
@@ -179,7 +180,7 @@ impl DataChannel {
         }
 
         let mut read_buf = buf;
-        let msg = Message::unmarshal(&mut read_buf)?;
+        let msg = unmarshal_from_peer(&mut read_buf)?;
 
         if let Message::DataChannelOpen(dco) = msg {
             config.channel_type = dco.channel_type;
@@ -250,7 +251,7 @@ impl DataChannel {
     where
         B: Buf,
     {
-        let msg = Message::unmarshal(data)?;
+        let msg = unmarshal_from_peer(data)?;
 
         match msg {
             Message::DataChannelOpen(_) => {
@@ -495,4 +496,18 @@ impl sansio::Protocol<DataChannelMessage, DataChannelMessage, ()> for DataChanne
         self.handshake_complete = false;
         self.write_data_channel_close()
     }
+}
+
+/// Parses a DCEP message the peer sent.
+///
+/// Types 0x00 (threshold) and 0x01 (close) are this crate's own: they travel from a data channel
+/// to the SCTP layer on the write path and are never put on the wire. One that arrives from the
+/// peer is refused by its type byte, before any of its body is read.
+fn unmarshal_from_peer<B: Buf>(buf: &mut B) -> Result<Message> {
+    if let Some(&message_type) = buf.chunk().first()
+        && (message_type == MESSAGE_TYPE_THRESHOLD || message_type == MESSAGE_TYPE_CLOSE)
+    {
+        return Err(Error::InvalidMessageType(message_type));
+    }
+    Message::unmarshal(buf)
 }

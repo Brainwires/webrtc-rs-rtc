@@ -824,3 +824,50 @@ async fn test_poll_data_channel() -> Result<()> {
     Ok(())
 }
 */
+
+/// DCEP types 0x00 (threshold) and 0x01 (close) are internal to this stack and never sent on
+/// the wire. From the peer they are refused, whether they would open a channel or arrive on
+/// one, and they cause no write.
+#[test]
+fn test_internal_dcep_types_from_the_peer_are_refused() -> Result<()> {
+    let (a0, _a1) = create_new_association_pair()?;
+    let internal: [&[u8]; 3] = [&[0x00, 0x00, 0x00, 0x00, 0x10, 0x00], &[0x00], &[0x01]];
+    for payload in internal {
+        assert!(
+            DataChannel::accept(
+                DataChannelConfig::default(),
+                a0,
+                100,
+                PayloadProtocolIdentifier::Dcep,
+                payload,
+            )
+            .is_err(),
+            "accept() took {payload:?}"
+        );
+
+        let mut dc = DataChannel::dial(
+            DataChannelConfig {
+                label: "in-band".to_string(),
+                ..Default::default()
+            },
+            a0,
+            100,
+        )?;
+        while dc.poll_write().is_some() {}
+        assert!(
+            dc.handle_read(DataChannelMessage {
+                association_handle: a0,
+                stream_id: 100,
+                ppi: PayloadProtocolIdentifier::Dcep,
+                payload: BytesMut::from(payload),
+                negotiated: false,
+            })
+            .is_err(),
+            "an open channel took {payload:?}"
+        );
+        assert!(dc.poll_write().is_none());
+        assert!(dc.poll_read().is_none());
+        assert!(!dc.is_handshake_complete());
+    }
+    Ok(())
+}
