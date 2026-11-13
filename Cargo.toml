@@ -381,3 +381,8 @@ bench = false
 name = "perfect-negotiation"
 path = "examples/perfect-negotiation/perfect-negotiation.rs"
 bench = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

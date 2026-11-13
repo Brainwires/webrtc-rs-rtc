@@ -871,3 +871,43 @@ fn test_internal_dcep_types_from_the_peer_are_refused() -> Result<()> {
     }
     Ok(())
 }
+
+/// Fuzz regression (`data_channel_handle_dcep`, minimised input `2f00f9ff79005b00`): a one-byte
+/// DCEP payload `0x00` on a new stream, or on an open channel, panicked the receiver.
+#[test]
+fn test_one_byte_dcep_payload_is_an_error() {
+    assert!(
+        DataChannel::accept(
+            DataChannelConfig::default(),
+            0,
+            1,
+            PayloadProtocolIdentifier::Dcep,
+            &[0x00]
+        )
+        .is_err()
+    );
+
+    let mut dc = DataChannel::accept(
+        DataChannelConfig::default(),
+        0,
+        1,
+        PayloadProtocolIdentifier::Dcep,
+        &Message::DataChannelOpen(DataChannelOpen {
+            channel_type: ChannelType::Reliable,
+            priority: 0,
+            reliability_parameter: 0,
+            label: b"chat".to_vec(),
+            protocol: vec![],
+        })
+        .marshal()
+        .unwrap(),
+    )
+    .unwrap();
+    let msg = DataChannelMessage {
+        stream_id: 1,
+        ppi: PayloadProtocolIdentifier::Dcep,
+        payload: BytesMut::from(&[0x00][..]),
+        ..Default::default()
+    };
+    assert!(dc.handle_read(msg).is_err());
+}

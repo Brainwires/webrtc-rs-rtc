@@ -714,6 +714,10 @@ pub use {
 };
 
 pub mod data_channel;
+/// Entry points for stateful fuzz targets. Gated behind `cfg(fuzzing)`; not part of the
+/// supported API.
+#[cfg(fuzzing)]
+pub mod fuzzing;
 pub mod media_stream;
 pub mod peer_connection;
 pub mod rtp_transceiver;

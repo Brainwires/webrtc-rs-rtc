@@ -57,6 +57,10 @@ pub use crypto;
 pub mod config;
 /// The encrypt/decrypt state for one SRTP/SRTCP session.
 pub mod context;
+/// Entry points for stateful fuzz targets. Gated behind `cfg(fuzzing)`; not part of the
+/// supported API.
+#[cfg(fuzzing)]
+pub mod fuzzing;
 mod key_derivation;
 /// Per-context options, currently the replay-detector factory.
 pub mod option;

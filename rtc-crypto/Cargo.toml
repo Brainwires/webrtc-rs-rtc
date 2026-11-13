@@ -39,3 +39,8 @@ openssl = { version = "0.10.72", optional = true }
 
 [dev-dependencies]
 pem.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

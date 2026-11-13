@@ -57,7 +57,8 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
 - RTP: the header extension block is always consumed whole, so a one-byte block containing
   ID 15 no longer leaves its remainder at the front of the payload, and an item longer than its
   block is an error instead of swallowing payload bytes. `Header::marshal_size()` now matches the
-  wire, which the SRTP keystream offset depends on.
+  wire, which the SRTP keystream offset depends on; a header that claimed more than the packet
+  made SRTP's AEAD cipher panic splitting it (found by the `context_decrypt` fuzz target).
 - RTCP: Slice Loss Indication is payload-specific feedback (PT 206, RFC 4585 §6.3.2); it was
   marshalled as, and only parsed from, PT 205, so a received SLI never parsed.
 - Media writers: the IVF writer's frame buffer is bounded at 16 MiB and the H.265 writer's FU
@@ -66,7 +67,8 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
   a ChangeCipherSpec at the last epoch; SCTP error causes longer than their ABORT/ERROR chunk
   (reachable on an association's first packet) and TSN arithmetic at the u32 wrap (a peer initial
   TSN of 0, FORWARD-TSN to u32::MAX, fragmented messages across the wrap, reconfig sequence
-  numbers); a DCEP threshold message without its body; ICE candidates with a component outside
+  numbers); a DCEP threshold message without its body (also found by the
+  `data_channel_handle_dcep` fuzz target); ICE candidates with a component outside
   1..=256 (they underflowed the priority); a remote numeric mid of `isize::MAX` (the next local
   offer overflowed); RTCP FIR / transport-cc length multiplication in `u16`; the sample builder's
   drop counters and the OGG writer's granule position on wrapping or reordered timestamps.
@@ -87,6 +89,19 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
   and no `bincode` (RUSTSEC-2025-0141). The examples' signaling, `rtc-signal` and the `rtc-ice`
   ping-pong example move from `hyper` 0.14 to `hyper` 1 (HTTP/1 only), so `h2` 0.3
   (RUSTSEC-2026-0258) is gone. None of these reached the library's own dependency graph.
+- Fuzzing: stateful targets that drive the real state machines, deterministically (seeded
+  randomness, a fixed key exchange and certificate, the clock passed in, no sockets): a DTLS
+  handshake to an in-memory peer with records injected before, during and after it — plaintext or
+  encrypted under the peer's keys, so they reach the fragment buffer, the handshake cache, epoch
+  handling and GCM / CCM / ChaCha20 / CBC decryption (`rtc-dtls`, `conn_handle_records`);
+  SRTP/SRTCP decryption with fixed keys, of raw packets and of packets the sender protected
+  (`rtc-srtp`, `context_decrypt`); an ICE agent fed authenticated binding requests and responses
+  and non-STUN datagrams in the Checking, Connected and Failed states and across restarts
+  (`rtc-ice`, `agent_handle_inbound`); a TURN client fed server responses, Data indications and
+  ChannelData (`rtc-turn`, `client_handle_inbound`); the data-channel handler fed DCEP and user
+  messages (`rtc`, `data_channel_handle_dcep`); and the H.264, H.265, VP8, VP9, AV1 and Opus
+  depacketizers fed payload sequences (`rtc-rtp`, `depacketize_sequence`). All run in the fuzz
+  workflow and OSS-Fuzz.
 
 ### Fork features kept across the sync
 

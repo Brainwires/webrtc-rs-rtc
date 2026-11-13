@@ -35,3 +35,8 @@ lazy_static.workspace = true
 [[bench]]
 name = "bench"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

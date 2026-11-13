@@ -63,6 +63,10 @@ pub mod agent;
 pub mod attributes;
 /// Candidate types, priorities, and SDP `a=candidate` parsing.
 pub mod candidate;
+/// Entry points for stateful fuzz targets. Gated behind `cfg(fuzzing)`; not part of the
+/// supported API.
+#[cfg(all(fuzzing, any(feature = "crypto-ring", feature = "crypto-aws-lc-rs")))]
+pub mod fuzzing;
 /// mDNS candidate handling, which hides private addresses behind `.local` names.
 pub mod mdns;
 /// UDP/TCP over IPv4/IPv6, as a candidate's transport.
