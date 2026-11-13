@@ -94,3 +94,8 @@ futures.workspace = true
 [[bench]]
 name = "record_protection"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

@@ -58,5 +58,9 @@
 pub use crypto;
 
 pub mod client;
+/// Entry points for stateful fuzz targets. Gated behind `cfg(fuzzing)`; not part of the
+/// supported API.
+#[cfg(all(fuzzing, any(feature = "crypto-ring", feature = "crypto-aws-lc-rs")))]
+pub mod fuzzing;
 /// The TURN-specific STUN attributes, methods and ChannelData framing.
 pub mod proto;

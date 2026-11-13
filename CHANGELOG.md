@@ -43,6 +43,19 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
 - Data channels: a DCEP message of the internal threshold type (`0x00`) shorter than its body
   is a parse error; one byte from the peer on any stream used to panic the receiver (found by
   `data_channel_handle_dcep`).
+- Fuzzing: stateful targets that drive the real state machines, deterministically (seeded
+  randomness, a fixed key exchange and certificate, the clock passed in, no sockets): a DTLS
+  handshake to an in-memory peer with records injected before, during and after it — plaintext or
+  encrypted under the peer's keys, so they reach the fragment buffer, the handshake cache, epoch
+  handling and GCM / CCM / ChaCha20 / CBC decryption (`rtc-dtls`, `conn_handle_records`);
+  SRTP/SRTCP decryption with fixed keys, of raw packets and of packets the sender protected
+  (`rtc-srtp`, `context_decrypt`); an ICE agent fed authenticated binding requests and responses
+  and non-STUN datagrams in the Checking, Connected and Failed states and across restarts
+  (`rtc-ice`, `agent_handle_inbound`); a TURN client fed server responses, Data indications and
+  ChannelData (`rtc-turn`, `client_handle_inbound`); the data-channel handler fed DCEP and user
+  messages (`rtc`, `data_channel_handle_dcep`); and the H.264, H.265, VP8, VP9, AV1 and Opus
+  depacketizers fed payload sequences (`rtc-rtp`, `depacketize_sequence`). All run in the fuzz
+  workflow and OSS-Fuzz.
 
 ### Fork features kept across the sync
 

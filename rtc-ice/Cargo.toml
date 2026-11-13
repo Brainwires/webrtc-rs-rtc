@@ -48,3 +48,8 @@ ctrlc.workspace = true
 name = "ping_pong"
 path = "examples/ping_pong.rs"
 bench = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

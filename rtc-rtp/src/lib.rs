@@ -62,6 +62,10 @@ pub mod codec;
 ///
 /// [RFC 8285]: https://datatracker.ietf.org/doc/html/rfc8285
 pub mod extension;
+/// Entry points for stateful fuzz targets. Gated behind `cfg(fuzzing)`; not part of the
+/// supported API.
+#[cfg(fuzzing)]
+pub mod fuzzing;
 /// The RTP header, its extensions, and the bit masks that encode it.
 pub mod header;
 /// A whole RTP packet: header plus payload.
