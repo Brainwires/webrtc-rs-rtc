@@ -56,6 +56,21 @@ FORWARD-TSN/SACK/receive window and stream-id checks; TURN client server-address
 retransmission de-duplication and rate limit; bounded H.264 FU-A and AV1 OBU checks; sha-256
 fingerprint selection; fuzzing CI fixes and stateful SCTP targets. See CHANGELOG.md.
 
+### Defaults the fork narrows on purpose
+
+- DTLS: the default WebRTC cipher suites are AEAD only (AES-128-GCM, ChaCha20-Poly1305); the
+  AES-256-CBC-SHA suites are opt-in. This is the one deliberate exception to rule 1, decided by
+  the maintainer for security. To offer CBC again, list the suites with
+  `SettingEngineBuilder::with_dtls_cipher_suites` (for example
+  `CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_256_Cbc_Sha`).
+
+### Upstream API replacements taken
+
+Removed upstream APIs with a replacement that covers them are taken as breaking changes, without
+shims: `CryptoPrivateKeyKind`, `KeyingMaterialExporter`, `extract_session_keys_from_dtls`,
+`MessageIntegrity::default`, `FnTimeGen`, the old `Packet` message type and the
+`SettingEngine::set_*` setters. CHANGELOG.md lists the new API for each.
+
 ### Upstream changes not taken (reverted inside the merge)
 
 | Upstream commit | What it removed or narrowed | What the fork does instead |

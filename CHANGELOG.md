@@ -17,8 +17,19 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
   and 32 buffered messages), so a peer can no longer overflow the stack or grow the buffer
   without limit. The queue of records awaiting decryption (64) and the handshake cache (64) are
   bounded.
-- DTLS: the default WebRTC cipher suites are AEAD only (AES-128-GCM, ChaCha20-Poly1305); the
-  AES-256-CBC-SHA suites are offered only when listed with `with_dtls_cipher_suites`.
+- DTLS: the default WebRTC cipher suites are AEAD only (AES-128-GCM, ChaCha20-Poly1305). The
+  AES-256-CBC-SHA suites are no longer offered by default. To opt back in, list them explicitly:
+
+  ```rust
+  use dtls::cipher_suite::CipherSuiteId;
+  let setting_engine = SettingEngineBuilder::new()
+      .with_dtls_cipher_suites(vec![
+          CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+          CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_256_Cbc_Sha,
+          CipherSuiteId::Tls_Ecdhe_Rsa_With_Aes_256_Cbc_Sha,
+      ])
+      .build();
+  ```
 - SRTP/SRTCP: per-SSRC state is created only once a packet authenticates.
 - ICE: once a pair is selected, non-STUN datagrams from any address but its remote are dropped.
   Role conflicts are handled only for requests that pass MESSAGE-INTEGRITY. Consent freshness is
@@ -52,6 +63,18 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
   un-negotiated header extensions through; a Relay policy without a TURN URL is accepted with a
   warning; the `openssl` / `vendored-openssl` / `pem` features and `RTCCertificate::from_key_pair`
   are kept.
+
+### Breaking changes (upstream replacements taken, no shims)
+
+| Removed | Use instead |
+|---|---|
+| `dtls::crypto::CryptoPrivateKeyKind` and `CryptoPrivateKey::{kind, serialized_der}` | `CryptoPrivateKey::signing_key` (`Arc<dyn crypto::SigningKey>`); export with `SigningKey::to_pkcs8_der()` |
+| `KeyingMaterialExporter` trait | the inherent `dtls::state::State::export_keying_material` |
+| `srtp` `extract_session_keys_from_dtls` | `set_session_keys_from_keying_material` |
+| `MessageIntegrity::default()` (an empty key) | `MessageIntegrity::new_short_term_integrity_with_provider` / `new_long_term_integrity_with_provider` / `new_raw_integrity_with_provider` |
+| `FnTimeGen` / the packetizer's `time_gen` | pass the time: `new_packetizer(now, …)`, `packetize(now, …)` |
+| `rtc_interceptor::Packet` as the chain's message type | `AttributedPacket { attributes, packet: Packet }` (`TaggedPacket` now carries it; match on `msg.message.packet`) |
+| `SettingEngine::set_*` setters | `SettingEngineBuilder::new().with_*(…).build()` (every former setter has a `with_*`) |
 
 ### Fixed
 
