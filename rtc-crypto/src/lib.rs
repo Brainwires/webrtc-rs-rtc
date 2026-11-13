@@ -5,6 +5,8 @@
 
 mod algorithm;
 mod error;
+#[cfg(feature = "openssl")]
+mod openssl_ctr;
 mod provider;
 mod secret;
 mod traits;
@@ -18,6 +20,8 @@ pub mod conformance;
 
 pub use algorithm::*;
 pub use error::CryptoError;
+#[cfg(feature = "openssl")]
+pub use openssl_ctr::openssl_aes_ctr;
 pub use provider::default_provider;
 pub use secret::SecretVec;
 pub use traits::*;

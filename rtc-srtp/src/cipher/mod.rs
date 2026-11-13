@@ -1,7 +1,5 @@
 pub mod cipher_aead_aes_gcm;
 pub mod cipher_aes_cm_hmac_sha1;
-#[cfg(feature = "openssl")]
-mod openssl_ctr;
 
 use bytes::BytesMut;
 use crypto::{CryptoError, RTCCrypto};

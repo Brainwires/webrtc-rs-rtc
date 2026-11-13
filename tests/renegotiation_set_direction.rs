@@ -1,9 +1,3 @@
-/// Integration test: verify that changing a transceiver's direction triggers
-/// an `OnNegotiationNeededEvent`, and that setting the same direction does not.
-///
-/// Per W3C WebRTC §5.5, mutating the direction property MUST update the
-/// negotiation-needed flag, causing the peer connection to fire the event.
-use std::time::Instant;
 use rtc::peer_connection::RTCPeerConnectionBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_OPUS, MediaEngine};
@@ -17,6 +11,12 @@ use rtc::rtp_transceiver::rtp_sender::RTCRtpCodec;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters;
 use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use rtc::sansio::Protocol;
+/// Integration test: verify that changing a transceiver's direction triggers
+/// an `OnNegotiationNeededEvent`, and that setting the same direction does not.
+///
+/// Per W3C WebRTC §5.5, mutating the direction property MUST update the
+/// negotiation-needed flag, causing the peer connection to fire the event.
+use std::time::Instant;
 
 fn drain_events(pc: &mut rtc::peer_connection::RTCPeerConnection) -> Vec<RTCPeerConnectionEvent> {
     let mut events = vec![];
@@ -44,7 +44,6 @@ fn make_media_engine() -> MediaEngine {
                 rtcp_feedback: vec![],
             },
             payload_type: 111,
-            ..Default::default()
         },
         RtpCodecKind::Audio,
     )
@@ -63,8 +62,8 @@ fn ephemeral_port() -> u16 {
 
 fn build_pc(dtls_role: RTCDtlsRole, port: u16) -> rtc::peer_connection::RTCPeerConnection {
     let se = SettingEngineBuilder::new()
-    .with_answering_dtls_role(dtls_role)
-    .build();
+        .with_answering_dtls_role(dtls_role)
+        .build();
 
     let config = RTCConfigurationBuilder::new()
         .with_ice_servers(vec![RTCIceServer {
@@ -110,11 +109,19 @@ fn test_set_direction_change_triggers_renegotiation() {
 
     // Complete an initial offer/answer cycle to clear is_negotiation_ongoing.
     let offer = offer_pc.create_offer(None).unwrap();
-    offer_pc.set_local_description(Instant::now(), offer.clone()).unwrap();
-    answer_pc.set_remote_description(Instant::now(), offer).unwrap();
+    offer_pc
+        .set_local_description(Instant::now(), offer.clone())
+        .unwrap();
+    answer_pc
+        .set_remote_description(Instant::now(), offer)
+        .unwrap();
     let answer = answer_pc.create_answer(None).unwrap();
-    answer_pc.set_local_description(Instant::now(), answer.clone()).unwrap();
-    offer_pc.set_remote_description(Instant::now(), answer).unwrap();
+    answer_pc
+        .set_local_description(Instant::now(), answer.clone())
+        .unwrap();
+    offer_pc
+        .set_remote_description(Instant::now(), answer)
+        .unwrap();
 
     // Drain all events from the initial negotiation.
     drain_events(&mut offer_pc);

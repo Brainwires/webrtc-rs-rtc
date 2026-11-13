@@ -22,7 +22,8 @@ pub(crate) struct JitterBufferStream {
     last_released: Option<u16>,
     // --- RFC 3550 §A.8 adaptive delay state ---
     last_rtp_ts: u32,
-    last_arrival: Instant,
+    /// Arrival time of the last packet used for the jitter estimate; `None` until the first.
+    last_arrival: Option<Instant>,
     jitter: f64, // running estimate in RTP clock units
     started: bool,
     // --- Configuration ---
@@ -45,7 +46,7 @@ impl JitterBufferStream {
             buffer: VecDeque::new(),
             last_released: None,
             last_rtp_ts: 0,
-            last_arrival: Instant::now(),
+            last_arrival: None,
             jitter: 0.0,
             started: false,
             target_delay: initial_delay.max(min_delay).min(max_delay),
@@ -73,7 +74,9 @@ impl JitterBufferStream {
             if rtp_diff > 0
                 && rtp_diff < 0x8000_0000
                 && self.clock_rate > 0
-                && let Some(arrival_diff) = now.checked_duration_since(self.last_arrival)
+                && let Some(arrival_diff) = self
+                    .last_arrival
+                    .and_then(|last| now.checked_duration_since(last))
             {
                 let arrival_diff = arrival_diff.as_secs_f64();
                 let d = (arrival_diff * self.clock_rate as f64 - rtp_diff as f64).abs();
@@ -87,12 +90,12 @@ impl JitterBufferStream {
                     .min(self.max_delay);
 
                 self.last_rtp_ts = rtp_ts;
-                self.last_arrival = now;
+                self.last_arrival = Some(now);
             }
         } else {
             self.started = true;
             self.last_rtp_ts = rtp_ts;
-            self.last_arrival = now;
+            self.last_arrival = Some(now);
         }
         now + self.target_delay
     }

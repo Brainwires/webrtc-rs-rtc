@@ -636,7 +636,8 @@ impl<'a> InterceptorHandler<'a> {
             // A layer is established by its primary codec; repair flows are associated through
             // the coding's rtx/fec SSRCs (or rrid), not by binding the layer to a repair codec.
             .find(|codec| {
-                codec.payload_type == payload_type && !is_repair_mime_type(&codec.rtp_codec.mime_type)
+                codec.payload_type == payload_type
+                    && !is_repair_mime_type(&codec.rtp_codec.mime_type)
             })
             .cloned()
         else {

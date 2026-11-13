@@ -93,8 +93,8 @@ async fn test_simulcast_rtx_rrid_association() -> Result<()> {
     let offerer_addr = offerer_socket.local_addr()?;
 
     let answerer_se = SettingEngineBuilder::new()
-    .with_answering_dtls_role(RTCDtlsRole::Server)
-    .build();
+        .with_answering_dtls_role(RTCDtlsRole::Server)
+        .build();
     let mut answerer_me = make_media_engine()?;
     let answerer_registry = rtc::interceptor::Registry::new();
     let answerer_registry =
@@ -130,8 +130,8 @@ async fn test_simulcast_rtx_rrid_association() -> Result<()> {
     answerer_pc.add_local_candidate(RTCIceCandidate::from(&ac).to_json()?)?;
 
     let offerer_se = SettingEngineBuilder::new()
-    .with_answering_dtls_role(RTCDtlsRole::Server)
-    .build();
+        .with_answering_dtls_role(RTCDtlsRole::Server)
+        .build();
     let mut offerer_me = make_media_engine()?;
     let offerer_registry = rtc::interceptor::Registry::new();
     let offerer_registry =
@@ -307,10 +307,13 @@ async fn test_simulcast_rtx_rrid_association() -> Result<()> {
                 if let Some(id) = rid_id {
                     header.set_extension(id, bytes::Bytes::from(rid.as_bytes().to_vec()))?;
                 }
-                let _ = rtp_sender.write_rtp(Instant::now(), rtp::packet::Packet {
-                    header,
-                    payload: bytes::Bytes::from(dummy.clone()),
-                });
+                let _ = rtp_sender.write_rtp(
+                    Instant::now(),
+                    rtp::packet::Packet {
+                        header,
+                        payload: bytes::Bytes::from(dummy.clone()),
+                    },
+                );
             }
 
             // After we've sent enough base packets, send RTX packets with rrid
@@ -332,10 +335,13 @@ async fn test_simulcast_rtx_rrid_association() -> Result<()> {
                         // rrid = base rid value
                         header.set_extension(id, bytes::Bytes::from(rid.as_bytes().to_vec()))?;
                     }
-                    let _ = rtp_sender.write_rtp(Instant::now(), rtp::packet::Packet {
-                        header,
-                        payload: bytes::Bytes::from(dummy.clone()),
-                    });
+                    let _ = rtp_sender.write_rtp(
+                        Instant::now(),
+                        rtp::packet::Packet {
+                            header,
+                            payload: bytes::Bytes::from(dummy.clone()),
+                        },
+                    );
                 }
                 rtx_sent = true;
                 log::info!("Sent RTX packets with rrid for all 3 layers");

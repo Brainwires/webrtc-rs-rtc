@@ -5,7 +5,7 @@ use shared::marshal::Marshal;
 /// Helper: create a minimal valid header and marshal it, returning the result.
 fn marshal_header(header: &Header) -> shared::error::Result<usize> {
     let mut buf = vec![0u8; header.marshal_size()];
-    header.marshal_to(&mut &mut buf[..])
+    header.marshal_to(&mut buf[..])
 }
 
 // -- CSRC validation --

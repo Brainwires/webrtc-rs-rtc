@@ -55,7 +55,7 @@ history stays intact.
 | `8080cef3` | `write_rtp` stopped rewriting an un-negotiated payload type to the encoding's codec | The fuzzy-match fallback stays; only a packet with no matching codec at all is an error. |
 | `1f1b0874` (#123) | `write_rtp` errors on header extension ids not negotiated on the sender | They are passed through (with a trace log), as before. |
 | `702ffbc0` | `RTCConfiguration::validate` rejects a Relay policy without a TURN URL | Warns instead; an application may add its own relay candidates. |
-| `fd81f68f` (crypto P4) | Removed the `openssl` / `vendored-openssl` features (rtc, rtc-srtp) | Features kept: the AES-CM SRTP keystream comes from OpenSSL when enabled (`rtc-srtp/src/cipher/openssl_ctr.rs`). |
+| `fd81f68f` (crypto P4) | Removed the `openssl` / `vendored-openssl` features (rtc, rtc-srtp) | Features kept: the AES-CM SRTP keystream comes from OpenSSL when enabled (`rtc-crypto/src/openssl_ctr.rs`, reached through `rtc-srtp`'s `openssl` feature so `rtc-crypto` stays the only crate naming a crypto implementation). |
 | crypto P5/P6 | Removed the `pem` feature name (rtc, rtc-dtls) | Kept as a no-op feature (PEM is always built now), so dependents that enable it still build. |
 
 ### Fork features dropped because upstream's is a strict superset

@@ -16,8 +16,8 @@ default = ["crypto-ring"]
 crypto-ring = ["crypto/crypto-ring"]
 crypto-aws-lc-rs = ["crypto/crypto-aws-lc-rs"]
 # Kept by the Brainwires fork (upstream removed them): AES-CM keystream from OpenSSL.
-openssl = ["dep:openssl"]
-vendored-openssl = ["openssl", "openssl/vendored"]
+openssl = ["crypto/openssl"]
+vendored-openssl = ["crypto/vendored-openssl"]
 
 [dependencies]
 shared = { workspace = true, default-features = false, features = ["marshal", "replay"] }
@@ -27,7 +27,6 @@ crypto.workspace = true
 
 byteorder.workspace = true
 bytes.workspace = true
-openssl = { version = "0.10.72", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

@@ -172,7 +172,9 @@ fn main() -> Result<()> {
                     println!("relay read: {:?} from {}", &data[..], from);
                     // Echo back
                     if let Some(&relay_addr) = relayed_addr.as_ref() {
-                        client.relay(relay_addr)?.send_to(Instant::now(), &data[..], from)?;
+                        client
+                            .relay(relay_addr)?
+                            .send_to(Instant::now(), &data[..], from)?;
                     }
                 }
                 _ => {}
@@ -181,10 +183,10 @@ fn main() -> Result<()> {
 
         // Compute next timeout.
         let mut eto = Instant::now() + Duration::from_millis(100);
-        if let Some(to) = client.poll_timeout() {
-            if to < eto {
-                eto = to;
-            }
+        if let Some(to) = client.poll_timeout()
+            && to < eto
+        {
+            eto = to;
         }
         let delay_from_now = eto
             .checked_duration_since(Instant::now())

@@ -1,17 +1,30 @@
-//! OpenSSL AES-CTR keystream for the AES-CM SRTP profiles, behind the `openssl` feature.
+//! OpenSSL AES-CTR stream cipher, behind the `openssl` feature.
 //!
-//! Upstream removed the `openssl` / `vendored-openssl` features when SRTP moved onto
+//! Upstream removed `rtc-srtp`'s `openssl` / `vendored-openssl` features when SRTP moved onto
 //! `rtc-crypto` (fd81f68f). The Brainwires fork keeps them (it never removes a feature; see
-//! FORK.md): with `openssl` enabled the AES-CM profiles' keystream comes from OpenSSL, as it
-//! did before, while key derivation, HMAC-SHA1 and the AEAD profiles stay on the selected
-//! `rtc-crypto` provider.
+//! FORK.md), with the OpenSSL code here so `rtc-crypto` stays the only crate that names a
+//! crypto implementation. `rtc-srtp` with `openssl` takes the AES-CM profiles' keystream from
+//! [`openssl_aes_ctr`]; key derivation, HMAC-SHA1 and the AEAD profiles stay on the selected
+//! provider.
 
-use crypto::{CryptoError, StreamCipher, StreamCipherAlgorithm};
+use crate::{CryptoError, StreamCipher, StreamCipherAlgorithm};
 use openssl::cipher::Cipher;
 use openssl::cipher_ctx::CipherCtx;
 
-/// AES-128/256-CTR from OpenSSL, keyed once per SRTP context.
-pub(crate) struct OpensslAesCtr {
+/// Builds an AES-128/256-CTR [`StreamCipher`] backed by OpenSSL, keyed once.
+///
+/// # Errors
+///
+/// Fails for a non-CTR algorithm, a key of the wrong length, or an OpenSSL error.
+pub fn openssl_aes_ctr(
+    algorithm: StreamCipherAlgorithm,
+    key: &[u8],
+) -> Result<Box<dyn StreamCipher>, CryptoError> {
+    Ok(Box::new(OpensslAesCtr::new(algorithm, key)?))
+}
+
+/// AES-128/256-CTR from OpenSSL.
+struct OpensslAesCtr {
     ctx: CipherCtx,
 }
 
@@ -20,7 +33,7 @@ fn openssl_error(error: openssl::error::ErrorStack) -> CryptoError {
 }
 
 impl OpensslAesCtr {
-    pub(crate) fn new(algorithm: StreamCipherAlgorithm, key: &[u8]) -> Result<Self, CryptoError> {
+    fn new(algorithm: StreamCipherAlgorithm, key: &[u8]) -> Result<Self, CryptoError> {
         let (cipher, key_len) = match algorithm {
             StreamCipherAlgorithm::Aes128Ctr => (Cipher::aes_128_ctr(), 16),
             StreamCipherAlgorithm::Aes256Ctr => (Cipher::aes_256_ctr(), 32),
@@ -85,7 +98,7 @@ mod tests {
     /// The OpenSSL keystream must match the selected provider's, byte for byte.
     #[test]
     fn openssl_ctr_matches_the_provider_keystream() {
-        let provider = crypto::default_provider().expect("a built-in crypto provider for tests");
+        let provider = crate::default_provider().expect("a built-in crypto provider for tests");
         for (algorithm, key_len) in [
             (StreamCipherAlgorithm::Aes128Ctr, 16),
             (StreamCipherAlgorithm::Aes256Ctr, 32),

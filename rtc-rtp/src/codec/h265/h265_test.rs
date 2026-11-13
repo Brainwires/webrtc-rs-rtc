@@ -988,7 +988,7 @@ fn test_h265_packet_real() -> Result<()> {
 /// normal-sized NALUs are still packed into the aggregation packet.
 #[test]
 fn test_h265_oversized_nalu_in_aggregation_buffer() -> Result<()> {
-    let mut pck = HevcPayloader::default();
+    let mut pck = HevcPayloader;
 
     // Build a payload with two NALUs: one normal-sized and one genuinely
     // oversized (> u16::MAX = 65535 bytes) to hit the oversized NALU path.
@@ -1017,8 +1017,8 @@ fn test_h265_oversized_nalu_in_aggregation_buffer() -> Result<()> {
     assert_eq!(result[0].len(), 5, "first packet should be the 5-byte NALU");
 
     // Remaining packets should be FU fragments of the oversized NALU
-    for i in 1..result.len() {
-        let header = H265NALUHeader::new(result[i][0], result[i][1]);
+    for (i, packet) in result.iter().enumerate().skip(1) {
+        let header = H265NALUHeader::new(packet[0], packet[1]);
         assert!(
             header.is_fragmentation_unit(),
             "packet {} should be a fragmentation unit",
@@ -1034,7 +1034,7 @@ fn test_h265_oversized_nalu_in_aggregation_buffer() -> Result<()> {
 /// fields (F, layer_id, tid) reflect only the NALUs actually in the packet.
 #[test]
 fn test_h265_aggregation_header_excludes_oversized_nalus() -> Result<()> {
-    let mut pck = HevcPayloader::default();
+    let mut pck = HevcPayloader;
 
     // Three NALUs: two small ones and one oversized (> u16::MAX).
     // The oversized NALU should be excluded from the AP and emitted separately.
@@ -1067,8 +1067,8 @@ fn test_h265_aggregation_header_excludes_oversized_nalus() -> Result<()> {
     );
 
     // Remaining packets should be FU fragments of the oversized NALU
-    for i in 1..result.len() {
-        let fu_header = H265NALUHeader::new(result[i][0], result[i][1]);
+    for (i, packet) in result.iter().enumerate().skip(1) {
+        let fu_header = H265NALUHeader::new(packet[0], packet[1]);
         assert!(
             fu_header.is_fragmentation_unit(),
             "packet {} should be a fragmentation unit",
@@ -1083,7 +1083,7 @@ fn test_h265_aggregation_header_excludes_oversized_nalus() -> Result<()> {
 /// should be FU-fragmented into multiple packets via emit().
 #[test]
 fn test_h265_flush_single_oversized_nalu_fu_fragmentation() -> Result<()> {
-    let mut pck = HevcPayloader::default();
+    let mut pck = HevcPayloader;
 
     // Single NALU larger than MTU to trigger FU fragmentation. This tests
     // that flush_aggregation_buffer with a single oversized NALU correctly

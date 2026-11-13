@@ -1611,6 +1611,37 @@ impl RTCPeerConnection {
     }
 }
 
+fn is_same_remote_track(
+    receiver: &RTCRtpReceiverInternal,
+    incoming_track: &sdp::TrackDetails,
+) -> bool {
+    let track = receiver.track();
+    if track.track_id() != &incoming_track.track_id
+        || track.stream_id() != &incoming_track.stream_id
+    {
+        return false;
+    }
+
+    let codings = receiver.get_coding_parameters();
+    if !incoming_track.rids.is_empty() {
+        let mut current: Vec<&str> = codings.iter().map(|c| c.rid.as_str()).collect();
+        let mut remote: Vec<&str> = incoming_track.rids.iter().map(String::as_str).collect();
+        current.sort_unstable();
+        remote.sort_unstable();
+        return current == remote;
+    }
+
+    match (codings, incoming_track.ssrc) {
+        ([coding], Some(ssrc)) => {
+            coding.rid.is_empty()
+                && coding.ssrc == Some(ssrc)
+                && coding.rtx.as_ref().map(|r| r.ssrc) == incoming_track.rtx_ssrc
+                && coding.fec.as_ref().map(|f| f.ssrc) == incoming_track.fec_ssrc
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod rejected_mline_generate_matched_sdp_tests {
     use super::*;
@@ -1677,7 +1708,8 @@ a=mid:1\r\n";
 
         let mut pc = build_video_only_pc();
         let offer = RTCSessionDescription::offer(offer_sdp.to_string()).unwrap();
-        pc.set_remote_description(std::time::Instant::now(), offer).unwrap();
+        pc.set_remote_description(std::time::Instant::now(), offer)
+            .unwrap();
 
         let answer = pc.create_answer(None).unwrap();
         let lines: Vec<&str> = answer.sdp.lines().collect();
@@ -1729,7 +1761,8 @@ a=mid:1\r\n";
 
         let mut pc = build_video_only_pc();
         let offer = RTCSessionDescription::offer(offer_sdp.to_string()).unwrap();
-        pc.set_remote_description(std::time::Instant::now(), offer).unwrap();
+        pc.set_remote_description(std::time::Instant::now(), offer)
+            .unwrap();
 
         let answer = pc.create_answer(None).unwrap();
         let lines: Vec<&str> = answer.sdp.lines().collect();
@@ -1773,7 +1806,8 @@ a=ssrc:22222 cname:test\r\n";
 
         let mut pc = build_video_only_pc();
         let offer = RTCSessionDescription::offer(offer_sdp.to_string()).unwrap();
-        pc.set_remote_description(std::time::Instant::now(), offer).unwrap();
+        pc.set_remote_description(std::time::Instant::now(), offer)
+            .unwrap();
 
         let answer = pc.create_answer(None).unwrap();
         let lines: Vec<&str> = answer.sdp.lines().collect();
@@ -1830,7 +1864,8 @@ a=mid:2\r\n";
 
         let mut pc = build_video_only_pc();
         let offer = RTCSessionDescription::offer(offer_sdp.to_string()).unwrap();
-        pc.set_remote_description(std::time::Instant::now(), offer).unwrap();
+        pc.set_remote_description(std::time::Instant::now(), offer)
+            .unwrap();
 
         let answer = pc.create_answer(None).unwrap();
         let lines: Vec<&str> = answer.sdp.lines().collect();
@@ -1877,7 +1912,8 @@ a=mid:2\r\n";
 
         let mut pc = build_video_only_pc();
         let offer = RTCSessionDescription::offer(offer_sdp.to_string()).unwrap();
-        pc.set_remote_description(std::time::Instant::now(), offer).unwrap();
+        pc.set_remote_description(std::time::Instant::now(), offer)
+            .unwrap();
 
         let answer = pc.create_answer(None).unwrap();
         let lines: Vec<&str> = answer.sdp.lines().collect();
@@ -1903,36 +1939,5 @@ a=mid:2\r\n";
             "application must be rejected, got: {}",
             m_lines[2]
         );
-    }
-}
-
-fn is_same_remote_track(
-    receiver: &RTCRtpReceiverInternal,
-    incoming_track: &sdp::TrackDetails,
-) -> bool {
-    let track = receiver.track();
-    if track.track_id() != &incoming_track.track_id
-        || track.stream_id() != &incoming_track.stream_id
-    {
-        return false;
-    }
-
-    let codings = receiver.get_coding_parameters();
-    if !incoming_track.rids.is_empty() {
-        let mut current: Vec<&str> = codings.iter().map(|c| c.rid.as_str()).collect();
-        let mut remote: Vec<&str> = incoming_track.rids.iter().map(String::as_str).collect();
-        current.sort_unstable();
-        remote.sort_unstable();
-        return current == remote;
-    }
-
-    match (codings, incoming_track.ssrc) {
-        ([coding], Some(ssrc)) => {
-            coding.rid.is_empty()
-                && coding.ssrc == Some(ssrc)
-                && coding.rtx.as_ref().map(|r| r.ssrc) == incoming_track.rtx_ssrc
-                && coding.fec.as_ref().map(|f| f.ssrc) == incoming_track.fec_ssrc
-        }
-        _ => false,
     }
 }

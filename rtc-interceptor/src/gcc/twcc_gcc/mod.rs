@@ -141,7 +141,7 @@ impl<P> GccInterceptorBuilder<P> {
             inner,
             local_streams: HashMap::new(),
             send_times: HashMap::new(),
-            start_time: Instant::now(),
+            start_time: None,
             trendline: TrendlineFilter::new(),
             rate_controller: AimdRateController::new(
                 self.min_bitrate_bps as f64,
@@ -173,7 +173,9 @@ pub struct GccInterceptor<P> {
     send_times: HashMap<u16, f64>,
 
     /// Monotonic baseline for converting `Instant` values to milliseconds.
-    start_time: Instant,
+    /// Time origin for send timestamps: the first TWCC-stamped packet's `now` (sans-I/O:
+    /// the interceptor never reads the clock itself).
+    start_time: Option<Instant>,
 
     trendline: TrendlineFilter,
     rate_controller: AimdRateController,
@@ -197,7 +199,8 @@ impl<P: Interceptor> GccInterceptor<P> {
             let mut buf = ext_bytes.clone();
             if let Ok(tcc_ext) = TransportCcExtension::unmarshal(&mut buf) {
                 let seq = tcc_ext.transport_sequence;
-                let send_ms = msg.now.duration_since(self.start_time).as_secs_f64() * 1000.0;
+                let start_time = *self.start_time.get_or_insert(msg.now);
+                let send_ms = msg.now.saturating_duration_since(start_time).as_secs_f64() * 1000.0;
                 self.send_times.insert(seq, send_ms);
 
                 // Prune entries > 512 sequence numbers behind the current head.
@@ -469,10 +472,7 @@ mod tests {
     /// Build a chain with TwccSender (outer) → GccInterceptor (inner).
     ///
     /// GCC must be inner so `handle_write` sees TWCC-stamped packets.
-    fn make_chain() -> (
-        impl Protocol<TaggedPacket, TaggedPacket, ()> + crate::Interceptor,
-        GccHandle,
-    ) {
+    fn make_chain() -> (impl crate::Interceptor, GccHandle) {
         use crate::TwccSenderBuilder;
         let (gcc_builder, handle) = GccInterceptorBuilder::new();
         // GCC sits nearer the wire than TwccSender, so writes are stamped before GCC sees them.
@@ -540,10 +540,12 @@ mod tests {
         let rtcp_pkt = TransportMessage {
             now: Instant::now(),
             transport: TransportContext::default(),
-            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(rtcp::receiver_report::ReceiverReport {
-                ssrc: 42,
-                ..Default::default()
-            })])),
+            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(
+                rtcp::receiver_report::ReceiverReport {
+                    ssrc: 42,
+                    ..Default::default()
+                },
+            )])),
         };
         // Should not panic; non-TWCC RTCP is forwarded.
         chain.handle_read(rtcp_pkt).unwrap();

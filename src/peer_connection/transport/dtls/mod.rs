@@ -234,7 +234,7 @@ impl DtlsTransport {
                                 .hash(HashAlgorithm::Sha256, &certs[0])
                                 .map_err(|error| Error::Crypto(error.to_string()))?;
                             let values: Vec<String> =
-                                hashed.iter().map(|x| format! {"{x:02x}"}).collect();
+                                hashed.iter().map(|x| format!("{x:02x}")).collect();
                             let remote_value = values.join(":").to_lowercase();
 
                             if remote_value == fp.value.to_lowercase() {
@@ -321,9 +321,12 @@ impl DtlsTransport {
             self.state,
             RTCDtlsTransportState::Connected | RTCDtlsTransportState::Connecting
         );
-        let same_remote = self.remote_dtls_parameters.as_ref().is_some_and(|previous| {
-            same_fingerprints(&previous.fingerprints, &remote_dtls_parameters.fingerprints)
-        });
+        let same_remote = self
+            .remote_dtls_parameters
+            .as_ref()
+            .is_some_and(|previous| {
+                same_fingerprints(&previous.fingerprints, &remote_dtls_parameters.fingerprints)
+            });
         if healthy && same_remote && new_role == self.dtls_role {
             // Nothing DTLS depends on changed: keep the session over the restarted ICE path.
             return Ok(());
@@ -621,12 +624,14 @@ mod tests {
     fn dummy_params(role: RTCDtlsRole) -> RTCDtlsParameters {
         RTCDtlsParameters {
             role,
-            fingerprints: vec![crate::peer_connection::transport::dtls::fingerprint::RTCDtlsFingerprint {
-                algorithm: "sha-256".to_owned(),
-                value: "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:\
+            fingerprints: vec![
+                crate::peer_connection::transport::dtls::fingerprint::RTCDtlsFingerprint {
+                    algorithm: "sha-256".to_owned(),
+                    value: "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:\
                         00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00"
-                    .to_owned(),
-            }],
+                        .to_owned(),
+                },
+            ],
         }
     }
 
@@ -932,7 +937,11 @@ mod tests {
         // An ICE restart with the same remote fingerprint and setup role.
         t.restart(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
             .unwrap();
-        assert_eq!(t.state, RTCDtlsTransportState::Connected, "the session must be kept");
+        assert_eq!(
+            t.state,
+            RTCDtlsTransportState::Connected,
+            "the session must be kept"
+        );
         assert!(
             t.dtls_handshake_config.is_none(),
             "no new handshake may be prepared"

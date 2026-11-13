@@ -66,9 +66,7 @@ impl CipherAesCmHmacSha1 {
         // from OpenSSL; otherwise from the selected provider.
         #[cfg(feature = "openssl")]
         let new_stream_cipher = |key: &[u8]| -> Result<Box<dyn StreamCipher>> {
-            Ok(Box::new(
-                super::openssl_ctr::OpensslAesCtr::new(algorithm, key).map_err(crypto_error)?,
-            ))
+            crypto::openssl_aes_ctr(algorithm, key).map_err(crypto_error)
         };
         #[cfg(not(feature = "openssl"))]
         let new_stream_cipher = |key: &[u8]| -> Result<Box<dyn StreamCipher>> {

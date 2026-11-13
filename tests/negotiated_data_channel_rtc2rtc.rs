@@ -56,8 +56,8 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
     log::info!("Offerer peer bound to {}", offerer_local_addr);
 
     let offerer_setting_engine = SettingEngineBuilder::new()
-    .with_answering_dtls_role(RTCDtlsRole::Server)
-    .build();
+        .with_answering_dtls_role(RTCDtlsRole::Server)
+        .build();
 
     let offerer_config = RTCConfigurationBuilder::new()
         .with_ice_servers(vec![RTCIceServer {
@@ -76,12 +76,12 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
     let dc_label = "negotiated-channel";
     let offerer_dc_id = offerer_pc
         .create_data_channel(
-        dc_label,
-        Some(RTCDataChannelInit {
-            negotiated: Some(NEGOTIATED_CHANNEL_ID),
-            ..Default::default()
-        }),
-    )?
+            dc_label,
+            Some(RTCDataChannelInit {
+                negotiated: Some(NEGOTIATED_CHANNEL_ID),
+                ..Default::default()
+            }),
+        )?
         .id();
     log::info!(
         "Offerer created negotiated DataChannel '{}' with id={}",
@@ -116,8 +116,8 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
     log::info!("Answerer peer bound to {}", answerer_local_addr);
 
     let answerer_setting_engine = SettingEngineBuilder::new()
-    .with_answering_dtls_role(RTCDtlsRole::Client)
-    .build();
+        .with_answering_dtls_role(RTCDtlsRole::Client)
+        .build();
 
     let answerer_config = RTCConfigurationBuilder::new()
         .with_ice_servers(vec![RTCIceServer {
@@ -135,12 +135,12 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
     // Create negotiated DataChannel on answerer side (same label and ID)
     let answerer_dc_id = answerer_pc
         .create_data_channel(
-        dc_label,
-        Some(RTCDataChannelInit {
-            negotiated: Some(NEGOTIATED_CHANNEL_ID),
-            ..Default::default()
-        }),
-    )?
+            dc_label,
+            Some(RTCDataChannelInit {
+                negotiated: Some(NEGOTIATED_CHANNEL_ID),
+                ..Default::default()
+            }),
+        )?
         .id();
     log::info!(
         "Answerer created negotiated DataChannel '{}' with id={}",
@@ -247,15 +247,12 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
                         offerer_connected = true;
                     }
                 }
-                RTCPeerConnectionEvent::OnDataChannel(dc_event) => match dc_event {
-                    RTCDataChannelEvent::OnOpen(channel_id) => {
-                        log::info!("Offerer data channel {} opened", channel_id);
-                        if channel_id == offerer_dc_id {
-                            offerer_dc_opened = true;
-                        }
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(channel_id)) => {
+                    log::info!("Offerer data channel {} opened", channel_id);
+                    if channel_id == offerer_dc_id {
+                        offerer_dc_opened = true;
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -311,15 +308,12 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
                         answerer_connected = true;
                     }
                 }
-                RTCPeerConnectionEvent::OnDataChannel(dc_event) => match dc_event {
-                    RTCDataChannelEvent::OnOpen(channel_id) => {
-                        log::info!("Answerer data channel {} opened", channel_id);
-                        if channel_id == answerer_dc_id {
-                            answerer_dc_opened = true;
-                        }
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(channel_id)) => {
+                    log::info!("Answerer data channel {} opened", channel_id);
+                    if channel_id == answerer_dc_id {
+                        answerer_dc_opened = true;
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -348,12 +342,11 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
             && offerer_dc_opened
             && answerer_dc_opened
             && !offerer_message_sent
+            && let Some(mut dc) = offerer_pc.data_channel(offerer_dc_id)
         {
-            if let Some(mut dc) = offerer_pc.data_channel(offerer_dc_id) {
-                log::info!("Offerer sending message: '{}'", TEST_MESSAGE_FROM_OFFERER);
-                dc.send_text(Instant::now(), TEST_MESSAGE_FROM_OFFERER.to_string())?;
-                offerer_message_sent = true;
-            }
+            log::info!("Offerer sending message: '{}'", TEST_MESSAGE_FROM_OFFERER);
+            dc.send_text(Instant::now(), TEST_MESSAGE_FROM_OFFERER.to_string())?;
+            offerer_message_sent = true;
         }
 
         if offerer_connected
@@ -361,12 +354,11 @@ async fn test_negotiated_data_channel_rtc_to_rtc() -> Result<()> {
             && offerer_dc_opened
             && answerer_dc_opened
             && !answerer_message_sent
+            && let Some(mut dc) = answerer_pc.data_channel(answerer_dc_id)
         {
-            if let Some(mut dc) = answerer_pc.data_channel(answerer_dc_id) {
-                log::info!("Answerer sending message: '{}'", TEST_MESSAGE_FROM_ANSWERER);
-                dc.send_text(Instant::now(), TEST_MESSAGE_FROM_ANSWERER.to_string())?;
-                answerer_message_sent = true;
-            }
+            log::info!("Answerer sending message: '{}'", TEST_MESSAGE_FROM_ANSWERER);
+            dc.send_text(Instant::now(), TEST_MESSAGE_FROM_ANSWERER.to_string())?;
+            answerer_message_sent = true;
         }
 
         // Check if both sides received the expected messages

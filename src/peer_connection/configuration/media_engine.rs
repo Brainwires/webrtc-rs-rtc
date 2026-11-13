@@ -1258,7 +1258,11 @@ mod default_fec_codec_test {
             .map(|c| c.payload_type)
             .collect();
 
-        assert_eq!(ulpfec, vec![116], "default codecs must keep ULPFEC at PT 116");
+        assert_eq!(
+            ulpfec,
+            vec![116],
+            "default codecs must keep ULPFEC at PT 116"
+        );
     }
 
     // The constant remains part of the public API so an application can opt in.

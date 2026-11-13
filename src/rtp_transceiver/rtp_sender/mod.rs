@@ -440,7 +440,10 @@ impl RTCRtpSender<'_> {
                     packet.header.payload_type,
                     codecs
                         .iter()
-                        .map(|codec| format!("{}:{}", codec.rtp_codec.mime_type, codec.payload_type))
+                        .map(|codec| format!(
+                            "{}:{}",
+                            codec.rtp_codec.mime_type, codec.payload_type
+                        ))
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -448,10 +451,7 @@ impl RTCRtpSender<'_> {
             }
             trace!(
                 "rtp_sender {:?} rewriting RTP ssrc {} pt {} to the encoding's negotiated pt {}",
-                self.id,
-                packet.header.ssrc,
-                packet.header.payload_type,
-                codec.payload_type
+                self.id, packet.header.ssrc, packet.header.payload_type, codec.payload_type
             );
             packet.header.payload_type = codec.payload_type;
         }
@@ -467,9 +467,7 @@ impl RTCRtpSender<'_> {
         }) {
             trace!(
                 "rtp_sender {:?} RTP ssrc {} carries header extension id {} that is not negotiated on this sender leg; passing it through",
-                self.id,
-                packet.header.ssrc,
-                ext.id,
+                self.id, packet.header.ssrc, ext.id,
             );
         }
 

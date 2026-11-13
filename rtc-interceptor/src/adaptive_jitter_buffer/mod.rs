@@ -270,18 +270,17 @@ mod tests {
         TransportMessage {
             now: Instant::now(),
             transport: TransportContext::default(),
-            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(rtcp::receiver_report::ReceiverReport {
-                ssrc,
-                ..Default::default()
-            })])),
+            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(
+                rtcp::receiver_report::ReceiverReport {
+                    ssrc,
+                    ..Default::default()
+                },
+            )])),
         }
     }
 
     /// Build a chain with a short initial delay for testing.
-    fn make_chain(
-        initial_ms: u64,
-        max_ms: u64,
-    ) -> impl Protocol<TaggedPacket, TaggedPacket, ()> + crate::Interceptor {
+    fn make_chain(initial_ms: u64, max_ms: u64) -> impl crate::Interceptor {
         Registry::new()
             .with(
                 Slot::JitterBuffer,

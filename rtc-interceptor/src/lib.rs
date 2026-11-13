@@ -246,9 +246,6 @@ pub use adaptive_jitter_buffer::{
     JitterBufferBuilder as AdaptiveJitterBufferBuilder,
     JitterBufferInterceptor as AdaptiveJitterBufferInterceptor,
 };
-pub use gcc::twcc_gcc::{GccHandle, GccInterceptor, GccInterceptorBuilder, GccShared};
-/// Derive macros for nested (`#[next]`-field) interceptors.
-pub use interceptor_derive::{Interceptor, interceptor};
 pub use cc::estimator::{BandwidthEstimator, ConstantBitrate, EstimatorStats};
 pub use cc::interceptor::{
     CongestionControlBuilder, CongestionControlInterceptor,
@@ -285,6 +282,9 @@ pub use gcc::rate_control::{
 pub use gcc::slope::{DelayTrend, SlopeEstimator};
 pub use gcc::state::RateControlState;
 pub use gcc::threshold::{AdaptiveThreshold, DEFAULT_INITIAL_MS as GCC_THRESHOLD_INITIAL_MS};
+pub use gcc::twcc_gcc::{GccHandle, GccInterceptor, GccInterceptorBuilder, GccShared};
+/// Derive macros for nested (`#[next]`-field) interceptors.
+pub use interceptor_derive::{Interceptor, interceptor};
 pub use intervalpli::generator::{
     DEFAULT_INTERVAL as INTERVAL_PLI_DEFAULT_INTERVAL, IntervalPliInterceptor,
 };

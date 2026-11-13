@@ -784,7 +784,8 @@ mod test {
     fn test_configuration_json_round_trip() {
         // Build a config with a non-empty certificates vec so we can prove
         // that serde(skip) actually omits them from the JSON output.
-        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key pair");
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate key pair");
         let cert = RTCCertificate::from_key_pair(kp).expect("create certificate");
 
         let original = RTCConfigurationBuilder::new()
