@@ -18,6 +18,10 @@ const AV1_Y_MASK: u8 = 0b0100_0000;
 const AV1_W_MASK: u8 = 0b0011_0000;
 const AV1_N_MASK: u8 = 0b0000_1000;
 
+/// Largest OBU reassembled across RTP packets. Far above any real one (a 4K key frame's tile
+/// group is a few hundred KiB); a reassembly that would grow past it is dropped.
+pub const MAX_AV1_OBU_SIZE: usize = 4 * 1024 * 1024;
+
 /// AV1 RTP Depacketizer
 ///
 /// Depacketizes AV1 RTP packets into low overhead bitstream format with obu_size fields.
@@ -113,20 +117,34 @@ impl Depacketizer for Av1Depacketizer {
                     continue;
                 }
 
-                // Combine buffered data with current fragment
-                let mut combined = std::mem::take(&mut self.buffer);
-                combined.extend_from_slice(&payload[offset..offset + length_field]);
-                combined.freeze()
+                // Bounded: a peer that keeps setting Y must not grow this without limit.
+                if self.buffer.len() + length_field > MAX_AV1_OBU_SIZE {
+                    self.buffer.clear();
+                    return Err(Error::ErrShortPacket);
+                }
+                // Appended in place, so a long fragment chain costs linear time; the buffer
+                // used to be copied whole into a new one for every packet.
+                self.buffer
+                    .extend_from_slice(&payload[offset..offset + length_field]);
+                if is_last && obu_y {
+                    // Still not complete: keep buffering.
+                    break;
+                }
+                offset += length_field;
+                std::mem::take(&mut self.buffer).freeze()
             } else {
-                payload.slice(offset..offset + length_field)
+                let fragment = payload.slice(offset..offset + length_field);
+                offset += length_field;
+                // If this is the last OBU and Y flag is set, buffer it for next packet
+                if is_last && obu_y {
+                    if length_field > MAX_AV1_OBU_SIZE {
+                        return Err(Error::ErrShortPacket);
+                    }
+                    self.buffer = BytesMut::from(fragment.as_ref());
+                    break;
+                }
+                fragment
             };
-            offset += length_field;
-
-            // If this is the last OBU and Y flag is set, buffer it for next packet
-            if is_last && obu_y {
-                self.buffer = BytesMut::from(obu_buffer.as_ref());
-                break;
-            }
 
             // Skip empty OBUs
             if obu_buffer.is_empty() {
@@ -245,6 +263,58 @@ fn write_leb128(buf: &mut BytesMut, mut value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An OBU fragmented across packets (Y set, then Z and Y set on every following packet)
+    /// is bounded at `MAX_AV1_OBU_SIZE`, and the buffer grows in place. It used to grow
+    /// without limit, and was copied whole into a new buffer for every packet.
+    #[test]
+    fn fragment_chain_is_bounded() {
+        let mut depacketizer = Av1Depacketizer::new();
+        // Z=0, Y=1, W=1: one OBU, continued in the next packet.
+        let mut first = vec![0x50, 0x30];
+        first.extend_from_slice(&[0xab; 1200]);
+        assert!(depacketizer.depacketize(&Bytes::from(first)).is_ok());
+
+        // Z=1, Y=1, W=1: a middle fragment.
+        let mut middle = vec![0xd0];
+        middle.extend_from_slice(&[0xab; 1200]);
+        let middle = Bytes::from(middle);
+        let mut refused = false;
+        for _ in 0..(MAX_AV1_OBU_SIZE / 1200 + 2) {
+            if depacketizer.depacketize(&middle).is_err() {
+                refused = true;
+                break;
+            }
+            assert!(depacketizer.buffer.len() <= MAX_AV1_OBU_SIZE);
+        }
+        assert!(refused, "the reassembly passed MAX_AV1_OBU_SIZE");
+        assert!(depacketizer.buffer.is_empty(), "the partial OBU is dropped");
+    }
+
+    /// A fragmented OBU still reassembles: start, middle and end fragments.
+    #[test]
+    fn fragment_chain_reassembles() {
+        let mut depacketizer = Av1Depacketizer::new();
+        // Z=0, Y=1, W=1; OBU header 0x30 (frame, no size field) and two payload bytes.
+        assert!(
+            depacketizer
+                .depacketize(&Bytes::from_static(&[0x50, 0x30, 0x01, 0x02]))
+                .unwrap()
+                .is_empty()
+        );
+        // Z=1, Y=1, W=1.
+        assert!(
+            depacketizer
+                .depacketize(&Bytes::from_static(&[0xd0, 0x03, 0x04]))
+                .unwrap()
+                .is_empty()
+        );
+        // Z=1, Y=0, W=1: the end.
+        let obu = depacketizer
+            .depacketize(&Bytes::from_static(&[0x90, 0x05]))
+            .unwrap();
+        assert_eq!(&obu[..], &[0x32, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05]);
+    }
 
     /// A one-byte OBU whose header sets the extension flag must be rejected, not sliced past its
     /// end (`[2..]` on a one-byte buffer) or underflow the payload-size computation.

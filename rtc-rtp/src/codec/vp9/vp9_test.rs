@@ -362,3 +362,35 @@ fn test_vp9_partition_head_checker_is_partition_head() -> Result<()> {
 
     Ok(())
 }
+
+/// A depacketizer is used for a whole stream. The reference indices of one flexible-mode packet
+/// used to stay in `pdiff`, so after two packets every further one failed with
+/// `ErrTooManyPDiff`; and each scalability structure appended its picture group to the last
+/// one's, without bound.
+#[test]
+fn test_vp9_per_picture_state_does_not_accumulate() -> Result<()> {
+    let mut pck = Vp9Packet::default();
+    // P=1, F=1; two P_DIFFs (1 with N=1, then 1 with N=0); one payload byte.
+    let flexible = Bytes::from_static(&[0x50, 0x03, 0x02, 0xaa]);
+    for _ in 0..10 {
+        let payload = pck.depacketize(&flexible)?;
+        assert_eq!(&payload[..], &[0xaa]);
+        assert_eq!(pck.pdiff, vec![1, 1]);
+    }
+
+    // V=1; SS with N_S=0, G=1, N_G=255 pictures (T=0, U=0, R=0 each).
+    let mut ss = vec![0x02, 0x02, 0xff];
+    ss.extend(std::iter::repeat_n(0x00, 255));
+    ss.push(0xaa);
+    let ss = Bytes::from(ss);
+    for _ in 0..10 {
+        pck.depacketize(&ss)?;
+        assert_eq!(pck.pgtid.len(), 255);
+        assert_eq!(pck.pgu.len(), 255);
+        assert_eq!(pck.pgpdiff.len(), 255);
+    }
+    // A packet without reference indices reports none.
+    pck.depacketize(&Bytes::from_static(&[0x00, 0xaa]))?;
+    assert!(pck.pdiff.is_empty());
+    Ok(())
+}

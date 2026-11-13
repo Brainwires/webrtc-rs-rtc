@@ -222,6 +222,11 @@ impl Depacketizer for Vp9Packet {
 
         let mut payload_index = 1;
 
+        // The reference indices describe this packet's picture only. They used to accumulate
+        // across packets, so a long-lived depacketizer failed every flexible-mode packet once
+        // two had been seen.
+        self.pdiff.clear();
+
         if self.i {
             payload_index = self.parse_picture_id(reader, payload_index)?;
         }
@@ -416,6 +421,11 @@ impl Vp9Packet {
 
         let ns = (self.ns + 1) as usize;
         self.ng = 0;
+        // A scalability structure replaces the previous one; its picture-group description
+        // used to be appended to the old one on every SS, growing without bound.
+        self.pgtid.clear();
+        self.pgu.clear();
+        self.pgpdiff.clear();
 
         if self.y {
             if reader.remaining() < 4 * ns {
