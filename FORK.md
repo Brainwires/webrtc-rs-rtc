@@ -52,9 +52,11 @@ history stays intact.
 Peer-input hardening upstream does not have: bounded DTLS fragment reassembly, early-record queue
 and handshake cache; AEAD-only default DTLS suites; SRTP state only after authentication; ICE
 source filtering, authenticated role conflicts and consent, candidate caps; bounded SCTP
-FORWARD-TSN/SACK/receive window and stream-id checks; TURN client server-address filtering; NACK
-retransmission de-duplication and rate limit; bounded H.264 FU-A and AV1 OBU checks; sha-256
-fingerprint selection; fuzzing CI fixes and stateful SCTP targets. See CHANGELOG.md.
+FORWARD-TSN/SACK/receive window and stream-id checks, DCEP stream-id parity; TURN client
+server-address filtering and response MESSAGE-INTEGRITY checks; errors instead of panics on
+malformed DTLS/SCTP/DCEP/ICE/SDP/RTCP input; NACK retransmission de-duplication and rate limit;
+bounded H.264 FU-A and AV1 OBU checks; sha-256 fingerprint selection; fuzzing CI fixes and
+stateful SCTP targets. See CHANGELOG.md.
 
 ### Upstream changes not taken (reverted inside the merge)
 

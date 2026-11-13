@@ -28,6 +28,22 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
   spun for billions of iterations); a SACK acknowledging never-sent DATA is ignored; DATA more than
   65535 TSNs past the cumulative TSN, or on a stream id past the negotiated count, is dropped.
 - TURN client: STUN messages and ChannelData are accepted only from the configured servers.
+- TURN client: a response to an authenticated request (Allocate after the 401 exchange, Refresh,
+  CreatePermission, ChannelBind; success or error) must carry a MESSAGE-INTEGRITY made with the
+  long-term key the request was signed with. One that does not is dropped and the transaction
+  keeps retransmitting. Only 401 and 438 error responses, which servers send unsigned, may lack
+  it (RFC 8489 §9.2.4). A forged LIFETIME=0 Refresh response no longer releases an allocation.
+- Data channels: an in-band channel the peer opens on a stream id of this side's parity (even for
+  the DTLS client, odd for the server, RFC 8832 §6) is refused and its stream reset, so the peer
+  cannot take an id this side may assign. Negotiated channels are unaffected.
+- Malformed peer input is an error instead of a panic: DTLS handshake message_seq exhaustion and
+  a ChangeCipherSpec at the last epoch; SCTP error causes longer than their ABORT/ERROR chunk
+  (reachable on an association's first packet) and TSN arithmetic at the u32 wrap (a peer initial
+  TSN of 0, FORWARD-TSN to u32::MAX, fragmented messages across the wrap, reconfig sequence
+  numbers); a DCEP threshold message without its body; ICE candidates with a component outside
+  1..=256 (they underflowed the priority); a remote numeric mid of `isize::MAX` (the next local
+  offer overflowed); RTCP FIR / transport-cc length multiplication in `u16`; the sample builder's
+  drop counters and the OGG writer's granule position on wrapping or reordered timestamps.
 - NACK responder: each packet is resent at most once per 20 ms however often it is NACKed, and
   the retransmission queue is bounded.
 - Depacketizers: H.264 FU-A reassembly needs a start fragment and is bounded at 4 MiB; a one-byte
