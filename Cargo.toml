@@ -191,8 +191,11 @@ ctrlc.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 
-# integration test with old webrtc crate
-webrtc = "0.14.0"
+# Interop tests against the independent (pre-sans-I/O) webrtc implementation. 0.17.3 is the
+# last release of that line, and the first whose DTLS uses p256 0.14 (crypto-bigint 0.7, past
+# RUSTSEC-2026-0387) and no bincode. webrtc 0.20+ is built on the upstream `rtc` crates, so it
+# would test this stack against its own lineage.
+webrtc = "0.17.3"
 
 [[example]]
 name = "broadcast"
