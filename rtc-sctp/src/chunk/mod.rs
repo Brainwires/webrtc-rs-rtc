@@ -146,6 +146,10 @@ impl ErrorCause {
         if len < ERROR_CAUSE_HEADER_LENGTH as u16 {
             return Err(Error::ErrErrorCauseTooSmall);
         }
+        // The cause length is the peer's; it must fit the chunk it came in.
+        if len as usize > buf.len() {
+            return Err(Error::ErrErrorCauseTooSmall);
+        }
 
         let value_length = len as usize - ERROR_CAUSE_HEADER_LENGTH;
         let raw = buf.slice(ERROR_CAUSE_HEADER_LENGTH..ERROR_CAUSE_HEADER_LENGTH + value_length);

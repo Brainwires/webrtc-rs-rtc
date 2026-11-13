@@ -856,3 +856,16 @@ fn test_chunk_heartbeat_ack_roundtrip() -> Result<()> {
     assert_eq!(raw, parsed.marshal()?);
     Ok(())
 }
+
+/// An error cause whose length field runs past the end of its chunk is a parse error. It used
+/// to slice past the buffer and panic, and ABORT/ERROR chunks are parsed before the association
+/// checks anything, so the first packet from an unknown peer could do it.
+#[test]
+fn test_error_cause_longer_than_its_chunk_is_rejected() {
+    // ABORT, 8 bytes: one cause (code 13) claiming a 255-byte length.
+    let abort = Bytes::from_static(&[0x06, 0x00, 0x00, 0x08, 0x00, 0x0d, 0x00, 0xff]);
+    assert!(ChunkAbort::unmarshal(&abort).is_err());
+    // ERROR, the same cause.
+    let error = Bytes::from_static(&[0x09, 0x00, 0x00, 0x08, 0x00, 0x0d, 0x00, 0xff]);
+    assert!(ChunkError::unmarshal(&error).is_err());
+}

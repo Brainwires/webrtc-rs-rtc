@@ -1656,3 +1656,27 @@ fn test_sample_builder_data() {
     // only the last packet should be dropped
     assert_eq!(j, 0x1FFFF);
 }
+
+/// A peer sending only packets that can never build a sample (here VP8 payloads that are not a
+/// partition head) makes every one a drop. The u16 drop counter used to overflow and panic
+/// after 65536 of them; it saturates instead.
+#[test]
+fn test_sample_builder_drop_counter_does_not_overflow() {
+    let now = Instant::now();
+    let mut s = SampleBuilder::new(10, rtp::codec::vp8::Vp8Packet::default(), 90000);
+    for i in 0..70_000u32 {
+        s.push(
+            now,
+            Packet {
+                header: Header {
+                    marker: true,
+                    sequence_number: i as u16,
+                    timestamp: i,
+                    ..Default::default()
+                },
+                payload: bytes!(0x00, 0x00, 0x00, 0x00, 0x00),
+            },
+        );
+        while s.pop(now).is_some() {}
+    }
+}

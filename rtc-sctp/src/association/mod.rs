@@ -1713,8 +1713,14 @@ impl Association {
         // Meaning, if peer_last_tsn+1 points to a chunk that is received,
         // advance peer_last_tsn until peer_last_tsn+1 points to unreceived chunk.
         //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
-        while self.payload_queue.pop(self.peer_last_tsn + 1).is_some() {
-            self.peer_last_tsn += 1;
+        // TSNs are serial numbers (RFC 4960 §1.6): the cumulative point wraps past u32::MAX,
+        // which a peer reaches at once with an initial TSN of 0 or a FORWARD-TSN to u32::MAX.
+        while self
+            .payload_queue
+            .pop(self.peer_last_tsn.wrapping_add(1))
+            .is_some()
+        {
+            self.peer_last_tsn = self.peer_last_tsn.wrapping_add(1);
             //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
 
             let rst_reqs: Vec<ParamOutgoingResetRequest> =
@@ -2155,7 +2161,7 @@ impl Association {
         // reconfig_response_sequence_number.
         if !sis_to_reset.is_empty() {
             let rsn = self.generate_next_rsn();
-            let tsn = self.my_next_tsn - 1;
+            let tsn = self.my_next_tsn.wrapping_sub(1);
 
             let c = ChunkReconfig {
                 param_a: Some(Box::new(ParamOutgoingResetRequest {
@@ -2409,12 +2415,12 @@ impl Association {
 
             if !sis_to_reset.is_empty() {
                 let rsn = self.generate_next_rsn();
-                let tsn = self.my_next_tsn - 1;
+                let tsn = self.my_next_tsn.wrapping_sub(1);
                 debug!(
                     "[{}] sending RECONFIG: rsn={} tsn={} streams={:?}",
                     self.side,
                     rsn,
-                    self.my_next_tsn - 1,
+                    self.my_next_tsn.wrapping_sub(1),
                     sis_to_reset
                 );
 
@@ -3156,7 +3162,7 @@ impl Association {
     /// generate_next_rsn returns the my_next_rsn and increases it. The caller should hold the lock.
     fn generate_next_rsn(&mut self) -> u32 {
         let rsn = self.my_next_rsn;
-        self.my_next_rsn += 1;
+        self.my_next_rsn = self.my_next_rsn.wrapping_add(1);
         rsn
     }
 

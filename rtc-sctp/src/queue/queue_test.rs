@@ -1194,3 +1194,41 @@ fn test_payload_queue_refuses_tsns_beyond_the_receive_window() {
     assert!(!pq.can_push(&far, cumulative_tsn));
     assert!(!pq.can_push(&very_far, cumulative_tsn));
 }
+
+/// TSNs are serial numbers: a fragmented message whose TSNs wrap past u32::MAX reassembles.
+/// The contiguity check used to compute `u32::MAX + 1` and panic.
+#[test]
+fn test_reassembly_queue_fragments_across_the_tsn_wrap() -> Result<()> {
+    for unordered in [false, true] {
+        let mut rq = ReassemblyQueue::new(0);
+        let first = ChunkPayloadData {
+            unordered,
+            payload_type: PayloadProtocolIdentifier::Binary,
+            beginning_fragment: true,
+            tsn: u32::MAX,
+            stream_sequence_number: 0,
+            user_data: Bytes::from_static(b"AB"),
+            ..Default::default()
+        };
+        let last = ChunkPayloadData {
+            unordered,
+            payload_type: PayloadProtocolIdentifier::Binary,
+            ending_fragment: true,
+            tsn: 0,
+            stream_sequence_number: 0,
+            user_data: Bytes::from_static(b"CD"),
+            ..Default::default()
+        };
+        // The end arrives first, so the start completes the set.
+        rq.push(last);
+        assert!(
+            rq.push(first),
+            "unordered={unordered}: set should be complete"
+        );
+        let chunks = rq.read().expect("a complete message");
+        let mut buf = [0u8; 8];
+        let n = chunks.read(&mut buf)?;
+        assert_eq!(&buf[..n], b"ABCD", "unordered={unordered}");
+    }
+    Ok(())
+}

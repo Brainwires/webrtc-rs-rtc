@@ -848,14 +848,18 @@ impl DTLSConn {
                     return (false, None, None);
                 }
 
-                let new_remote_epoch = h.epoch + 1;
+                // A ChangeCipherSpec is not authenticated, so its epoch is only the peer's
+                // claim; the last epoch has no successor to change to.
+                let Some(new_remote_epoch) = h.epoch.checked_add(1) else {
+                    return (false, None, None);
+                };
                 debug!(
                     "{}: <- ChangeCipherSpec (epoch: {})",
                     srv_cli_str(self.is_client),
                     new_remote_epoch
                 );
 
-                if epoch + 1 == new_remote_epoch {
+                if epoch.checked_add(1) == Some(new_remote_epoch) {
                     self.state.remote_epoch = new_remote_epoch;
                     self.replay_detector[h.epoch as usize].accept();
                 }

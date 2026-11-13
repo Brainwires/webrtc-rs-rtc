@@ -183,7 +183,7 @@ impl<T: Depacketizer> SampleBuilder<T> {
 
                 if !matches!(err, BuildError::InvalidPartition(_)) {
                     // In the InvalidPartition case `build_sample` will have already adjusted `dropped_packets`.
-                    self.dropped_packets += 1;
+                    self.dropped_packets = self.dropped_packets.saturating_add(1);
                 }
 
                 // could not build the sample so drop it
@@ -313,9 +313,9 @@ impl<T: Depacketizer> SampleBuilder<T> {
                 .unwrap_or(false)
             });
 
-            self.dropped_packets += consume.count();
+            self.dropped_packets = self.dropped_packets.saturating_add(consume.count());
             if is_padding {
-                self.padding_packets += consume.count();
+                self.padding_packets = self.padding_packets.saturating_add(consume.count());
             }
             self.purge_consumed_location(&consume, true);
             self.purge_consumed_buffers();

@@ -243,3 +243,27 @@ fn test_fragment_buffer_caps_buffered_messages() -> Result<()> {
     assert_eq!(f.cache.len(), MAX_BUFFERED_MESSAGES);
     Ok(())
 }
+
+/// Every empty handshake message a peer sends consumes one 16-bit message_seq. Popping the
+/// 65536th used to overflow the counter and panic; the last sequence number is never handed
+/// out instead.
+#[test]
+fn test_fragment_buffer_message_sequence_space_is_exhausted_without_panicking() -> Result<()> {
+    let mut f = FragmentBuffer::new();
+    let mut popped = 0u32;
+    for seq in 0..=u16::MAX {
+        // An empty HelloRequest: complete as soon as it arrives.
+        let mut record = vec![
+            0x16, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00,
+            0x00, 0x00, 0x00,
+        ];
+        record.extend_from_slice(&seq.to_be_bytes());
+        record.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        f.push(&record)?;
+        while f.pop().is_ok() {
+            popped += 1;
+        }
+    }
+    assert_eq!(popped, u32::from(u16::MAX));
+    Ok(())
+}

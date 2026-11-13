@@ -2732,3 +2732,35 @@ fn test_early_encrypted_queue_is_bounded() {
         "the early encrypted queue must stop growing at its cap"
     );
 }
+
+/// A ChangeCipherSpec is not authenticated, so its epoch is whatever the sender claims. One at
+/// the last epoch has no successor; it used to overflow `epoch + 1` and panic.
+#[test]
+fn test_change_cipher_spec_at_the_last_epoch_is_dropped() {
+    use crate::cipher_suite::CipherSuite;
+    use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
+    cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    )
+    .unwrap();
+    conn.state.cipher_suite = Some(cs);
+    conn.state.remote_epoch = u16::MAX;
+
+    let change_cipher_spec: Vec<u8> = vec![
+        0x14, // content_type: ChangeCipherSpec
+        0xfe, 0xfd, // protocol_version: DTLS 1.2
+        0xff, 0xff, // epoch: 65535
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sequence_number: 0
+        0x00, 0x01, // content_len: 1
+        0x01,
+    ];
+    let _ = conn.read(&change_cipher_spec);
+    assert_eq!(conn.state.remote_epoch, u16::MAX);
+}

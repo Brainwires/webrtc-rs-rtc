@@ -219,3 +219,23 @@ fn test_ogg_writer_add_large_packet_with_multiple_of_255() -> Result<()> {
 
     Ok(())
 }
+
+/// RTP timestamps wrap and can arrive out of order; the granule position used to subtract them
+/// unchecked and panic on the first timestamp lower than its predecessor.
+#[test]
+fn test_ogg_writer_decreasing_timestamp_does_not_panic() -> Result<()> {
+    let mut writer = OggWriter::new(Cursor::new(Vec::<u8>::new()), 48000, 2)?;
+    for timestamp in [1000, 999, u32::MAX, 5] {
+        let packet = rtp::Packet {
+            header: rtp::Header {
+                version: 2,
+                payload_type: 111,
+                timestamp,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(&[0x45; 10]),
+        };
+        writer.write_rtp(&packet)?;
+    }
+    Ok(())
+}

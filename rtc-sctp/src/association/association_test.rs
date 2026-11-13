@@ -1854,3 +1854,25 @@ fn test_handle_data_beyond_stream_limit_is_discarded() -> Result<()> {
     );
     Ok(())
 }
+
+/// TSNs wrap (RFC 4960 §1.6). A peer whose initial TSN is 0 leaves `peer_last_tsn` at u32::MAX,
+/// and advancing the cumulative TSN past it used to overflow and panic on the first DATA.
+#[test]
+fn test_handle_data_across_the_tsn_wrap() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    a.peer_last_tsn = u32::MAX - 1;
+    for tsn in [u32::MAX, 0, 1] {
+        let d = ChunkPayloadData {
+            tsn,
+            stream_identifier: 0,
+            stream_sequence_number: tsn.wrapping_add(1) as u16,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"x"),
+            ..Default::default()
+        };
+        a.handle_data(&d)?;
+    }
+    assert_eq!(a.peer_last_tsn, 1);
+    Ok(())
+}

@@ -94,3 +94,19 @@ fn test_message_marshal() {
 
     assert_eq!(actual, expected);
 }
+
+/// A DCEP message whose type is the threshold message but whose body is missing is a parse
+/// error; reading the body used to panic in `Buf::get_u8`/`get_u32`. The type byte alone is
+/// what a peer sends as a one-byte DCEP payload.
+#[test]
+fn test_message_unmarshal_short_threshold_is_an_error() {
+    for len in 1..6 {
+        let mut payload = vec![0u8; len];
+        payload[0] = 0x00; // DataChannelThreshold
+        let mut buf = Bytes::from(payload);
+        assert!(
+            Message::unmarshal(&mut buf).is_err(),
+            "a {len}-byte threshold message parsed"
+        );
+    }
+}

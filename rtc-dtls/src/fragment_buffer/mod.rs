@@ -104,6 +104,12 @@ impl FragmentBuffer {
 
     pub fn pop(&mut self) -> Result<(Vec<u8>, u16)> {
         let seq_num = self.current_message_sequence_number;
+        // message_seq is 16 bits and no handshake comes near using them all, but a peer can
+        // push empty messages that each consume one; the last one is never handed out, so the
+        // counter cannot overflow.
+        let Some(next_seq_num) = seq_num.checked_add(1) else {
+            return Err(Error::ErrEmptyFragment);
+        };
         if !self.cache.contains_key(&seq_num) {
             return Err(Error::ErrEmptyFragment);
         }
@@ -135,7 +141,7 @@ impl FragmentBuffer {
         };
 
         self.cache.remove(&seq_num);
-        self.current_message_sequence_number += 1;
+        self.current_message_sequence_number = next_seq_num;
 
         Ok((content, epoch))
     }

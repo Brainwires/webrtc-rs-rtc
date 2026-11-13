@@ -538,3 +538,19 @@ fn test_candidate_base_addr() -> Result<()> {
 
     Ok(())
 }
+
+/// RFC 8445 §5.1.1.1: component ids run from 1 to 256. A remote candidate outside that range
+/// is a parse error; it used to parse, and its priority then computed `256 - component` and
+/// panicked.
+#[test]
+fn test_unmarshal_candidate_component_out_of_range() {
+    for component in [300u32, 257, 65535, 0] {
+        let line = format!("candidate:1 {component} udp 0 1.2.3.4 9 typ host");
+        assert!(
+            unmarshal_candidate(&line).map(|c| c.priority()).is_err(),
+            "component {component} was accepted"
+        );
+    }
+    let c = unmarshal_candidate("candidate:1 256 udp 0 1.2.3.4 9 typ host").unwrap();
+    assert_eq!(c.priority() & 0xff, 0);
+}

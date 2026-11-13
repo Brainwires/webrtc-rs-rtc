@@ -338,7 +338,7 @@ impl Candidate {
         // one.
         (1 << 24) * u32::from(self.candidate_type().preference())
             + (1 << 8) * u32::from(self.local_preference())
-            + (256 - u32::from(self.component()))
+            + 256u32.saturating_sub(u32::from(self.component()))
     }
 
     /// Returns `Option<CandidateRelatedAddress>`.
@@ -565,8 +565,15 @@ pub fn unmarshal_candidate(raw: &str) -> Result<Candidate> {
     // Foundation
     let foundation = split[0].to_owned();
 
-    // Component
+    // Component: RFC 8445 §5.1.1.1 numbers components from 1 to 256, and priority() relies on
+    // the bound (its last term is `256 - component`).
     let component: u16 = split[1].parse()?;
+    if !(1..=256).contains(&component) {
+        return Err(Error::Other(format!(
+            "{:?}: component {component} is outside 1..=256",
+            Error::ErrParseComponent
+        )));
+    }
 
     // Network
     let network = split[2].to_owned();

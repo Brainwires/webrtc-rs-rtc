@@ -590,7 +590,7 @@ impl Unmarshal for TransportLayerCc {
 
         // https://tools.ietf.org/html/rfc4585#page-33
         // header's length + payload's length
-        let total_length = 4 * (h.length + 1) as usize;
+        let total_length = 4 * (h.length as usize + 1);
 
         if total_length < HEADER_LENGTH + PACKET_CHUNK_OFFSET {
             return Err(Error::PacketTooShort);
