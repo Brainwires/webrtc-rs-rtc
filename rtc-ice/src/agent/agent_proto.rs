@@ -4,7 +4,7 @@ use mdns::{MDNS_PORT, MdnsEvent};
 impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
     type Rout = TaggedBytesMut;
     type Wout = TaggedBytesMut;
-    type Eout = Event;
+    type Eout = TaggedEvent;
     type Error = Error;
     type Time = Instant;
 
@@ -36,6 +36,7 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
                                 error!("mDNS Query {} timed out for {}", id, c.address());
                             }
                         }
+                        _ => {}
                     }
                 }
                 remote_candidates
@@ -113,6 +114,7 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
                             error!("mDNS Query {} timed out for {}", id, c.address());
                         }
                     }
+                    _ => {}
                 }
             }
             remote_candidates
@@ -122,7 +124,8 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
         self.trigger_request_connectivity_check(remote_candidates);
 
         if self.ufrag_pwd.remote_credentials.is_some()
-            && self.last_checking_time + self.get_timeout_interval() <= now
+            && (self.force_candidate_contact
+                || self.last_checking_time + self.get_timeout_interval() <= now)
         {
             self.contact(now);
         }
@@ -136,8 +139,19 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
             None
         };
 
-        let ice_timeout = if self.ufrag_pwd.remote_credentials.is_some() {
-            Some(self.last_checking_time + self.get_timeout_interval())
+        let ice_timeout = if self.ufrag_pwd.remote_credentials.is_some()
+            && !matches!(
+                self.connection_state,
+                ConnectionState::Failed | ConnectionState::Closed
+            ) {
+            if self.force_candidate_contact {
+                // A connectivity check was requested; ask the driver to call
+                // `handle_timeout` as soon as possible. `last_checking_time` is in the
+                // past, so the resulting deadline is immediate.
+                Some(self.last_checking_time)
+            } else {
+                Some(self.last_checking_time + self.get_timeout_interval())
+            }
         } else {
             None
         };
@@ -147,9 +161,9 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
     }
 
     fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.set_selected_pair(None);
+        self.set_selected_pair(None, None);
         self.delete_all_candidates(false);
-        self.update_connection_state(ConnectionState::Closed);
+        self.update_connection_state(None, ConnectionState::Closed);
         if let Some(mdns_conn) = &mut self.mdns {
             mdns_conn.close()?;
         }

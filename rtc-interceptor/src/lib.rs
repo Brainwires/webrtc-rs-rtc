@@ -27,94 +27,107 @@
 //! | [`TwccSenderInterceptor`] | Adds transport-wide sequence numbers to outgoing RTP packets |
 //! | [`TwccReceiverInterceptor`] | Tracks incoming packets and generates TransportLayerCC feedback |
 //!
+//! ## Congestion control
+//!
+//! | Interceptor | Description |
+//! |-------------|-------------|
+//! | [`PacerInterceptor`] | Releases outgoing packets at a target rate rather than in bursts |
+//! | [`Rfc8888Interceptor`] | Reports per-packet arrival times back to the sender (RFC 8888) |
+//!
 //! ## Utility
 //!
 //! | Interceptor | Description |
 //! |-------------|-------------|
-//! | [`NoopInterceptor`] | Pass-through terminal for interceptor chains |
+//! | [`NoopInterceptor`] | Ends the inbound RTCP path; the last interceptor in a chain |
 //!
 //! # Design
 //!
-//! Each interceptor wraps an inner `Interceptor` and can:
-//! - Process incoming/outgoing RTP/RTCP packets
-//! - Modify packet contents (headers, payloads)
-//! - Generate new packets (e.g., RTCP Sender/Receiver Reports)
-//! - Handle timeouts for periodic tasks (e.g., report generation)
-//! - Track stream statistics and state
+//! A chain is a flat list of interceptors driven over a shared belt. Each one can:
+//! - transform a packet passing through, or swallow it to drop or delay it
+//! - emit packets it generated or was holding, which rejoin the belt and carry on
+//! - act on timeouts, for periodic work like report generation
+//! - track stream statistics and state
 //!
-//! All interceptors work with [`TaggedPacket`] (RTP or RTCP packets with transport metadata).
-//! The innermost interceptor is typically [`NoopInterceptor`], which serves as the terminal.
+//! All interceptors work with [`TaggedPacket`] — an RTP or RTCP packet with transport metadata,
+//! carrying [`Attribute`]s that say what happened to it on the way. No interceptor holds a
+//! reference to another; [`Registry`] assembles the list and walks it. [`Registry::build`] appends
+//! [`NoopInterceptor`] last, so inbound RTCP stops before the application — control traffic the
+//! interceptors act on is not media the caller asked for. An interceptor that wants a particular
+//! packet delivered anyway attaches [`Attribute::DeliverToApplication`] to it.
 //!
-//! # No Direction Concept
+//! # Direction
 //!
-//! **Important:** Unlike PeerConnection's pipeline where `read` and `write` have
-//! opposite processing direction orders, interceptors have **no direction concept**.
+//! A chain is a flat list ordered by **distance from the wire**: the first interceptor is closest to the
+//! network, the last closest to the application. Direction is a property of the walk, not of the
+//! structure:
 //!
-//! In PeerConnection's pipeline:
 //! ```text
-//! Read:  Network → HandlerA → HandlerB → HandlerC → Application
-//! Write: Application → HandlerC → HandlerB → HandlerA → Network
-//!        (reversed order)
+//! read   (network → application)   forward:  first → … → last
+//! write  (application → network)   reverse:  last  → … → first
 //! ```
 //!
-//! In Interceptor chains, all operations flow in the **same direction**:
-//! ```text
-//! handle_read:    Outer → Inner (A.handle_read calls B.handle_read calls C.handle_read)
-//! handle_write:   Outer → Inner (A.handle_write calls B.handle_write calls C.handle_write)
-//! handle_event:   Outer → Inner (A.handle_event calls B.handle_event calls C.handle_event)
-//! handle_timeout: Outer → Inner (A.handle_timeout calls B.handle_timeout calls C.handle_timeout)
+//! Each interceptor is fed from a shared belt and its output is collected back onto it, so **what a
+//! interceptor emits is seen by every interceptor still ahead of it in the walk**. A retransmission emitted
+//! mid-chain still gets paced, numbered and recorded, because there is no way out of the chain
+//! except through the interceptors that follow.
 //!
-//! poll_read:    Outer → Inner (A.poll_read calls B.poll_read calls C.poll_read)
-//! poll_write:   Outer → Inner (A.poll_write calls B.poll_write calls C.poll_write)
-//! poll_event:   Outer → Inner (A.poll_event calls B.poll_event calls C.poll_event)
-//! poll_timeout: Outer → Inner (A.poll_timeout calls B.poll_timeout calls C.poll_timeout)
-//! ```
-//!
-//! This means interceptors are symmetric - they process `read`, `write`, and `event`
-//! in the same structural order. The distinction between "inbound" and "outbound"
-//! is semantic (based on message content), not structural (based on call order).
+//! One list serves both directions, so "closest to the wire" means one thing rather than opposite
+//! things per direction — which is why the send history and the FEC decoder sit next to each
+//! other, one being the last thing on the way out and the other the first on the way in.
 //!
 //! # Quick Start
 //!
-//! ```ignore
+//! ```
 //! use rtc_interceptor::{
-//!     Registry, SenderReportBuilder, ReceiverReportBuilder,
-//!     NackGeneratorBuilder, NackResponderBuilder,
-//!     TwccSenderBuilder, TwccReceiverBuilder,
+//!     NackGeneratorBuilder, NackResponderBuilder, ReceiverReportBuilder,
+//!     Registry, SenderReportBuilder, Slot, TwccReceiverBuilder, TwccSenderBuilder,
 //! };
 //! use std::time::Duration;
 //!
-//! // Build a full-featured interceptor chain
+//! // The slot decides the position, not the order of these calls; they are listed
+//! // wire-to-application here only because that reads the way the chain runs — forwards on the
+//! // read path, and in reverse on the write path.
 //! let chain = Registry::new()
-//!     // RTCP reports
-//!     .with(SenderReportBuilder::new()
-//!         .with_interval(Duration::from_secs(1))
-//!         .build())
-//!     .with(ReceiverReportBuilder::new()
-//!         .with_interval(Duration::from_secs(1))
-//!         .build())
-//!     // NACK for packet loss recovery
-//!     .with(NackGeneratorBuilder::new()
-//!         .with_size(512)
-//!         .with_interval(Duration::from_millis(100))
-//!         .build())
-//!     .with(NackResponderBuilder::new()
-//!         .with_size(1024)
-//!         .build())
-//!     // TWCC for congestion control
-//!     .with(TwccSenderBuilder::new().build())
-//!     .with(TwccReceiverBuilder::new()
-//!         .with_interval(Duration::from_millis(100))
-//!         .build())
+//!     .with(Slot::TwccSender, TwccSenderBuilder::new().build())
+//!     .with(Slot::NackResponder, NackResponderBuilder::new().build())
+//!     .with(Slot::NackGenerator, NackGeneratorBuilder::new().build())
+//!     .with(Slot::TwccReceiver, TwccReceiverBuilder::new().build())
+//!     .with(Slot::ReceiverReport, ReceiverReportBuilder::new().build())
+//!     .with(Slot::SenderReport, SenderReportBuilder::new().with_interval(Duration::from_secs(1)).build())
 //!     .build();
+//!
+//! // `build` appends [`NoopInterceptor`] last, so inbound RTCP — control traffic the interceptors
+//! // above act on — stops there rather than arriving mixed in with the application's media. To
+//! // receive some of it, add an interceptor that marks those packets `DeliverToApplication`.
+//! # let _ = chain;
 //! ```
+//!
+//! # One chain type
+//!
+//! [`Registry::build`] returns a single concrete type whatever it was built from, so a struct can
+//! hold one without a type parameter and two connections with different chains share a collection:
+//!
+//! ```
+//! use rtc_interceptor::{Slot, NackGeneratorBuilder, Registry, SenderReportBuilder};
+//!
+//! # let nack_enabled = true; // e.g. from configuration, negotiated SDP, …
+//! let chain = if nack_enabled {
+//!     Registry::new().with(Slot::NackGenerator, NackGeneratorBuilder::new().build()).build()
+//! } else {
+//!     Registry::new().with(Slot::SenderReport, SenderReportBuilder::new().build()).build()
+//! };
+//! ```
+//!
+//! The cost is one virtual call per interceptor per packet, which is nothing beside SRTP.
 //!
 //! # Stream Binding
 //!
 //! Before interceptors can process packets for a stream, the stream must be bound:
 //!
-//! ```ignore
-//! use rtc_interceptor::{StreamInfo, RTCPFeedback, RTPHeaderExtension};
+//! ```
+//! use rtc_interceptor::{Slot, Interceptor, RTCPFeedback, RTPHeaderExtension, Registry, StreamInfo};
+//!
+//! let mut chain = Registry::new().build();
 //!
 //! // Create stream info with NACK and TWCC support
 //! let stream_info = StreamInfo {
@@ -140,173 +153,210 @@
 //! chain.bind_remote_stream(&stream_info);
 //! ```
 //!
-//! # Creating Custom Interceptors
+//! # Writing your own
 //!
-//! Use the derive macros to easily create custom interceptors:
+//! Implement [`sansio::Protocol`] and [`Interceptor`], then add it wherever it belongs in the
+//! list. What `handle_*` takes in, `poll_*` gives back — so even a pass-through needs a queue,
+//! because the queue is what the next interceptor is fed from:
 //!
-//! ```ignore
-//! use rtc_interceptor::{Interceptor, interceptor, TaggedPacket, StreamInfo};
+//! ```
+//! use rtc_interceptor::{Slot, Interceptor, Registry, StreamInfo, TaggedPacket};
+//! use sansio::Protocol;
 //! use std::collections::VecDeque;
+//! use std::time::Instant;
 //!
-//! #[derive(Interceptor)]
-//! pub struct MyInterceptor<P: Interceptor> {
-//!     #[next]
-//!     next: P,  // The next interceptor in the chain (can use any field name)
-//!     buffer: VecDeque<TaggedPacket>,
+//! /// Counts packets on their way out.
+//! #[derive(Default)]
+//! struct Counter {
+//!     sent: u64,
+//!     read_queue: VecDeque<TaggedPacket>,
+//!     write_queue: VecDeque<TaggedPacket>,
 //! }
 //!
-//! #[interceptor]
-//! impl<P: Interceptor> MyInterceptor<P> {
-//!     #[overrides]
+//! impl Protocol<TaggedPacket, TaggedPacket, ()> for Counter {
+//!     type Rout = TaggedPacket;
+//!     type Wout = TaggedPacket;
+//!     type Eout = ();
+//!     type Error = shared::error::Error;
+//!     type Time = Instant;
+//!
 //!     fn handle_read(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
-//!         // Custom logic here
-//!         self.next.handle_read(msg)
+//!         self.read_queue.push_back(msg);
+//!         Ok(())
+//!     }
+//!
+//!     fn poll_read(&mut self) -> Option<Self::Rout> {
+//!         self.read_queue.pop_front()
+//!     }
+//!
+//!     fn handle_write(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
+//!         self.sent += 1;
+//!         self.write_queue.push_back(msg); // queueing nothing would swallow it
+//!         Ok(())
+//!     }
+//!
+//!     fn poll_write(&mut self) -> Option<Self::Wout> {
+//!         self.write_queue.pop_front()
 //!     }
 //! }
+//!
+//! impl Interceptor for Counter {
+//!     fn bind_local_stream(&mut self, _info: &StreamInfo) {}
+//!     fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
+//!     fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
+//!     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
+//! }
+//!
+//! let chain = Registry::new().with(Slot::NackGenerator, Counter::default()).build();
+//! # let _ = chain;
 //! ```
 //!
-//! - `#[derive(Interceptor)]` - Marks a struct as an interceptor, requires `#[next]` field
-//! - `#[interceptor]` - Generates `Protocol` and `Interceptor` trait implementations
-//! - `#[overrides]` - Marks methods with custom implementations (non-marked methods delegate to next)
-//!
-//! See the [`Interceptor`] trait documentation for more details.
+//! Queue nothing to drop or delay a packet, and queue delayed or generated ones whenever they are
+//! ready — from [`handle_timeout`](sansio::Protocol::handle_timeout), say. They leave through
+//! `poll_*` and continue through every interceptor ahead.
 
 #![warn(rust_2018_idioms)]
+#![warn(missing_docs)]
 #![allow(dead_code)]
 
-use shared::TransportMessage;
 use std::time::Instant;
 
-mod noop;
-mod registry;
+pub(crate) mod chain;
+pub(crate) mod noop;
+pub(crate) mod registry;
 
+pub(crate) mod adaptive_jitter_buffer;
+pub(crate) mod cc;
+pub(crate) mod flexfec;
 pub(crate) mod gcc;
-pub(crate) mod jitter_buffer;
+pub(crate) mod intervalpli;
+pub(crate) mod jitterbuffer;
 pub(crate) mod nack;
+pub(crate) mod pacing;
+pub(crate) mod packet;
 pub(crate) mod report;
+pub(crate) mod rfc8888;
+pub(crate) mod rtpfb;
 pub(crate) mod stream_info;
 pub(crate) mod twcc;
 
-pub use gcc::{GccHandle, GccInterceptorBuilder};
-pub use jitter_buffer::{JitterBufferBuilder, JitterBufferInterceptor};
-pub use nack::{
-    generator::{NackGeneratorBuilder, NackGeneratorInterceptor},
-    responder::{NackResponderBuilder, NackResponderInterceptor},
+// Fork additions kept over upstream (see FORK.md): the TWCC-driven GCC interceptor with its
+// shared bitrate handle, and the adaptive (RFC 3550 jitter + playout-delay extension) jitter buffer.
+pub use adaptive_jitter_buffer::{
+    JitterBufferBuilder as AdaptiveJitterBufferBuilder,
+    JitterBufferInterceptor as AdaptiveJitterBufferInterceptor,
 };
-pub use noop::NoopInterceptor;
-pub use registry::Registry;
-pub use report::{
-    receiver::{ReceiverReportBuilder, ReceiverReportInterceptor},
-    sender::{SenderReportBuilder, SenderReportInterceptor},
-};
-pub use stream_info::{RTCPFeedback, RTPHeaderExtension, StreamInfo};
-pub use twcc::{
-    receiver::{TwccReceiverBuilder, TwccReceiverInterceptor},
-    sender::{TwccSenderBuilder, TwccSenderInterceptor},
-};
-
-// Re-export derive macros for creating custom interceptors
-// - `Interceptor` derive macro: marks a struct as an interceptor with #[next] field
-// - `interceptor` attribute macro: generates Protocol and Interceptor trait implementations
+pub use gcc::twcc_gcc::{GccHandle, GccInterceptor, GccInterceptorBuilder, GccShared};
+/// Derive macros for nested (`#[next]`-field) interceptors.
 pub use interceptor_derive::{Interceptor, interceptor};
+pub use cc::estimator::{BandwidthEstimator, ConstantBitrate, EstimatorStats};
+pub use cc::interceptor::{
+    CongestionControlBuilder, CongestionControlInterceptor,
+    DEFAULT_PRUNE_HORIZON as CONGESTION_CONTROL_DEFAULT_PRUNE_HORIZON,
+};
+pub use flexfec::bit_array::BitArray;
+pub use flexfec::coverage::{MAX_FEC_PACKETS, MAX_MEDIA_PACKETS, ProtectionCoverage};
+pub use flexfec::draft03::decoder::{FlexFec03Decoder, ParseError as FlexFecParseError};
+pub use flexfec::draft03::encoder::FlexFec03Encoder;
+pub use flexfec::draft03::receiver::{FlexFec03ReceiveBuilder, FlexFec03ReceiveInterceptor};
+pub use flexfec::draft03::sender::{
+    DEFAULT_NUM_FEC_PACKETS, DEFAULT_NUM_MEDIA_PACKETS, FlexFec03SendBuilder,
+    FlexFec03SendInterceptor,
+};
+pub use gcc::arrival_group::{
+    ArrivalGroup, ArrivalGroupAccumulator, DEFAULT_BURST_INTERVAL as GCC_DEFAULT_BURST_INTERVAL,
+    InterGroupDelay,
+};
+pub use gcc::estimator::{
+    DEFAULT_INITIAL_BITRATE as GCC_INITIAL_BITRATE, DEFAULT_MAX_BITRATE as GCC_MAX_BITRATE,
+    DEFAULT_MIN_BITRATE as GCC_MIN_BITRATE, Gcc,
+};
+pub use gcc::kalman::Kalman;
+pub use gcc::loss::{
+    DEFAULT_HIGH_LOSS as GCC_HIGH_LOSS, DEFAULT_LOSS_INTERVAL as GCC_LOSS_INTERVAL,
+    DEFAULT_LOW_LOSS as GCC_LOW_LOSS, LossController,
+};
+pub use gcc::overuse::{DEFAULT_OVERUSE_TIME as GCC_DEFAULT_OVERUSE_TIME, OveruseDetector, Usage};
+pub use gcc::rate_calc::{DEFAULT_WINDOW as GCC_RATE_WINDOW, RateCalculator};
+pub use gcc::rate_control::{
+    DEFAULT_DECREASE_FACTOR as GCC_DECREASE_FACTOR, DEFAULT_INCREASE_FACTOR as GCC_INCREASE_FACTOR,
+    DEFAULT_RATE_CONTROL_INTERVAL as GCC_RATE_CONTROL_INTERVAL, RateController,
+};
+pub use gcc::slope::{DelayTrend, SlopeEstimator};
+pub use gcc::state::RateControlState;
+pub use gcc::threshold::{AdaptiveThreshold, DEFAULT_INITIAL_MS as GCC_THRESHOLD_INITIAL_MS};
+pub use intervalpli::generator::{
+    DEFAULT_INTERVAL as INTERVAL_PLI_DEFAULT_INTERVAL, IntervalPliInterceptor,
+};
+pub use jitterbuffer::buffer::{
+    JitterBuffer, JitterBufferStats, Rejected, State as JitterBufferState,
+};
+pub use jitterbuffer::receiver::{
+    DEFAULT_CAPACITY as JITTER_BUFFER_DEFAULT_CAPACITY,
+    DEFAULT_DEPTH as JITTER_BUFFER_DEFAULT_DEPTH, JitterBufferBuilder, JitterBufferInterceptor,
+};
+pub use nack::generator::{NackGeneratorBuilder, NackGeneratorInterceptor};
+pub use nack::responder::{NackResponderBuilder, NackResponderInterceptor};
+pub use noop::NoopInterceptor;
+pub use pacing::pacer::{MIN_BURST_BITS as PACER_MIN_BURST_BITS, Pacer};
+pub use pacing::sender::{
+    DEFAULT_BITRATE as PACER_DEFAULT_BITRATE, DEFAULT_QUEUE_LIMIT as PACER_DEFAULT_QUEUE_LIMIT,
+    PacerBuilder, PacerInterceptor,
+};
+pub use packet::{Attribute, AttributedPacket, Packet, TaggedPacket};
+pub use registry::{Registry, Slot};
+pub use report::receiver::{ReceiverReportBuilder, ReceiverReportInterceptor};
+pub use report::sender::{SenderReportBuilder, SenderReportInterceptor};
+pub use rfc8888::recorder::CcFeedbackRecorder;
+pub use rfc8888::sender::{
+    DEFAULT_INTERVAL as RFC8888_DEFAULT_INTERVAL,
+    DEFAULT_MAX_REPORT_SIZE as RFC8888_DEFAULT_MAX_REPORT_SIZE, Rfc8888Builder, Rfc8888Interceptor,
+};
+pub use rtpfb::acknowledgement::{Acknowledgement, PacketReport, Report};
+pub use rtpfb::convert::{convert_ccfb, convert_twcc};
+pub use rtpfb::history::History;
+pub use stream_info::{RTCPFeedback, RTPHeaderExtension, StreamInfo};
+pub use twcc::receiver::{TwccReceiverBuilder, TwccReceiverInterceptor};
+pub use twcc::sender::{TwccSenderBuilder, TwccSenderInterceptor};
 
-/// RTP/RTCP Packet
+/// One interceptor of packet processing.
 ///
-/// An enum representing either an RTP or RTCP packet that can be processed
-/// by interceptors in the chain.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Packet {
-    /// RTP (Real-time Transport Protocol) packet containing media data
-    Rtp(rtp::Packet),
-    /// RTCP (RTP Control Protocol) packets for feedback and statistics
-    Rtcp(Vec<Box<dyn rtcp::Packet>>),
-}
-
-/// Tagged packet with transport metadata.
+/// An interceptor is a [`sansio::Protocol`] like everything else in this stack: packets arrive
+/// through `handle_read`/`handle_write` and leave through `poll_read`/`poll_write`. What is
+/// different is that nothing is wired to anything — an interceptor does not know what is on either
+/// side of it. [`Registry`] builds a flat list and the chain it returns moves packets along it.
 ///
-/// A [`TransportMessage`] wrapping a [`Packet`], which includes transport-level
-/// context such as source/destination addresses and protocol information.
-/// This is the primary message type passed through interceptor chains.
-pub type TaggedPacket = TransportMessage<Packet>;
-
-/// Trait for RTP/RTCP interceptors with fixed Protocol type parameters.
+/// # The contract
 ///
-/// `Interceptor` is a marker trait that requires implementors to also implement
-/// [`sansio::Protocol`] with specific fixed type parameters for RTP/RTCP processing:
-/// - `Rin`, `Win`, `Rout`, `Wout` = [`TaggedPacket`]
-/// - `Ein`, `Eout` = `()`
-/// - `Time` = [`Instant`]
-/// - `Error` = [`shared::error::Error`]
+/// **What `handle_*` takes in, `poll_*` gives back.** The chain hands you a packet, then asks what
+/// you have ready; whatever you return is what the next interceptor receives. So an interceptor
+/// that passes packets through still needs a queue — take the packet in `handle_read`, hand it
+/// back from `poll_read`.
 ///
-/// This trait adds stream binding methods and provides a [`with()`](Interceptor::with)
-/// method for composable chaining of interceptors.
+/// | To | Do |
+/// |---|---|
+/// | pass a packet through | queue it in `handle_*`, return it from `poll_*` |
+/// | transform it | queue the modified packet |
+/// | drop or delay it | queue nothing; a delayed one is queued later, from `handle_timeout` |
+/// | generate one | queue it whenever you like; it joins the walk from `poll_*` |
+/// | act on a timer | `handle_timeout`, and report the deadline from `poll_timeout` |
 ///
-/// # Creating Custom Interceptors
+/// # What you emit continues
 ///
-/// ## Using Derive Macros (Recommended)
+/// A packet returned from `poll_write` is handed to the next interceptor in the walk and passes
+/// through every one still ahead of it. Nothing can bypass an interceptor by being generated past
+/// it — which is the class of bug the previous, nested design allowed, and why a retransmission
+/// used to escape the pacer, the transport-wide numbering and the send history.
 ///
-/// The easiest way to create a custom interceptor is using the derive macros:
+/// The same is true in reverse: it also means **nothing reaches the wire or the application except
+/// by passing through the interceptors that follow it**. An interceptor that keeps a packet to
+/// itself keeps it from everything downstream, deliberately.
 ///
-/// ```ignore
-/// use rtc_interceptor::{Interceptor, interceptor, TaggedPacket, Packet, StreamInfo};
-/// use std::collections::VecDeque;
+/// # Direction
 ///
-/// #[derive(Interceptor)]
-/// pub struct MyInterceptor<P: Interceptor> {
-///     #[next]
-///     next: P,  // The next interceptor in the chain
-///     buffer: VecDeque<TaggedPacket>,
-/// }
+/// Read walks the list forwards, write walks it in reverse, so one ordering serves both: the first
+/// interceptor is closest to the network in both directions.
 ///
-/// #[interceptor]
-/// impl<P: Interceptor> MyInterceptor<P> {
-///     #[overrides]
-///     fn handle_read(&mut self, msg: TaggedPacket) -> Result<(), Self::Error> {
-///         // Custom logic here
-///         self.next.handle_read(msg)
-///     }
-/// }
-/// ```
-///
-/// The `#[derive(Interceptor)]` macro requires a `#[next]` field that contains the
-/// next interceptor in the chain. The `#[interceptor]` attribute on the impl block
-/// generates the `Protocol` and `Interceptor` trait implementations, delegating
-/// non-overridden methods to the next interceptor.
-///
-/// Use `#[overrides]` to mark methods with custom implementations.
-///
-/// ## Manual Implementation
-///
-/// For more control, you can implement the traits manually:
-///
-/// ```ignore
-/// pub struct MyInterceptor<P> {
-///     inner: P,
-/// }
-///
-/// impl<P: Interceptor> Protocol<TaggedPacket, TaggedPacket, ()> for MyInterceptor<P> {
-///     type Rout = TaggedPacket;
-///     type Wout = TaggedPacket;
-///     type Eout = ();
-///     type Time = Instant;
-///     type Error = shared::error::Error;
-///     // ... implement Protocol methods
-/// }
-///
-/// impl<P: Interceptor> Interceptor for MyInterceptor<P> {
-///     fn bind_local_stream(&mut self, _info: &StreamInfo) {}
-///     fn unbind_local_stream(&mut self, _info: &StreamInfo) {}
-///     fn bind_remote_stream(&mut self, _info: &StreamInfo) {}
-///     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
-/// }
-/// ```
-///
-/// # Using with Registry
-///
-/// ```ignore
-/// let chain = Registry::new()
-///     .with(|inner| MyInterceptor { next: inner, buffer: VecDeque::new() });
-/// ```
 pub trait Interceptor:
     sansio::Protocol<
         TaggedPacket,
@@ -317,28 +367,17 @@ pub trait Interceptor:
         Eout = (),
         Time = Instant,
         Error = shared::error::Error,
-    > + Sized
-    + Send
+    > + Send
     + Sync
-    + 'static
 {
-    /// Wrap this interceptor with another layer.
+    /// Wraps this interceptor in an outer one built by `f`, for nested (`#[next]`-field)
+    /// interceptors written with the [`Interceptor`](derive@Interceptor) derive. The result is an
+    /// ordinary interceptor and can be placed in a [`Registry`] slot.
     ///
-    /// The wrapper function receives `self` and returns a new interceptor
-    /// that wraps it.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use std::time::Duration;
-    /// use rtc_interceptor::{NoopInterceptor, SenderReportBuilder};
-    ///
-    /// // Using the builder pattern (recommended)
-    /// let chain = NoopInterceptor::new()
-    ///     .with(SenderReportBuilder::new().with_interval(Duration::from_secs(1)).build());
-    /// ```
+    /// Kept by the Brainwires fork: upstream removed it with the list-based chain.
     fn with<O, F>(self, f: F) -> O
     where
+        Self: Sized,
         F: FnOnce(Self) -> O,
         O: Interceptor,
     {
@@ -360,71 +399,54 @@ pub trait Interceptor:
     fn unbind_remote_stream(&mut self, info: &StreamInfo);
 }
 
-#[cfg(test)]
-mod derive_tests {
-    use super::*;
-    #[allow(unused_imports)]
-    use shared::error::Error;
+/// An interceptor whose concrete type has been erased.
+///
+/// `Interceptor` is object safe, which is what lets a chain be a flat list of these rather than a
+/// tower of nested types.
+pub type BoxedInterceptor = Box<dyn Interceptor>;
 
-    /// Test interceptor that uses the derive macro.
-    /// It should automatically delegate all Protocol and Interceptor methods to inner.
-    #[derive(Interceptor)]
-    pub struct SimplePassthrough<P: Interceptor> {
-        #[next]
-        inner: P,
+impl<P: Interceptor + ?Sized> Interceptor for Box<P> {
+    fn bind_local_stream(&mut self, info: &StreamInfo) {
+        (**self).bind_local_stream(info)
     }
 
-    // Empty impl block - #[interceptor] generates all delegations
-    #[interceptor]
-    impl<P: Interceptor> SimplePassthrough<P> {}
-
-    impl<P: Interceptor> SimplePassthrough<P> {
-        fn new(inner: P) -> Self {
-            Self { inner }
-        }
+    fn unbind_local_stream(&mut self, info: &StreamInfo) {
+        (**self).unbind_local_stream(info)
     }
 
-    #[test]
-    fn test_derive_interceptor_basic() {
-        // Build a chain with the derived interceptor
-        let mut chain = SimplePassthrough::new(NoopInterceptor::new());
-
-        // Test that delegation works
-        let pkt = TaggedPacket {
-            now: std::time::Instant::now(),
-            transport: Default::default(),
-            message: Packet::Rtp(rtp::Packet::default()),
-        };
-
-        // handle_write should delegate to inner
-        sansio::Protocol::handle_write(&mut chain, pkt).unwrap();
-
-        // poll_write should return the packet from inner
-        let result = sansio::Protocol::poll_write(&mut chain);
-        assert!(result.is_some());
+    fn bind_remote_stream(&mut self, info: &StreamInfo) {
+        (**self).bind_remote_stream(info)
     }
 
-    #[test]
-    fn test_derive_interceptor_close() {
-        let mut chain = SimplePassthrough::new(NoopInterceptor::new());
+    fn unbind_remote_stream(&mut self, info: &StreamInfo) {
+        (**self).unbind_remote_stream(info)
+    }
+}
 
-        // close should delegate to inner without error
-        sansio::Protocol::close(&mut chain).unwrap();
+/// Blanket implementation for mutable references.
+///
+/// This lets a borrowed chain satisfy an `Interceptor` bound, so a function taking
+/// `I: Interceptor` by value can be called with `&mut chain` and leave ownership with the
+/// caller. It mirrors [`sansio::Protocol`]'s own `&mut P` implementation, and the same idiom
+/// in `std` (`impl Read for &mut R`, `impl Iterator for &mut I`).
+///
+/// This is only expressible because [`Interceptor`] does not require `'static`: `&'a mut P`
+/// outlives only `'a`. [`Registry::with`] is where the `'static` bound is asked for instead —
+/// locally, by the one method that has to box what it is given.
+impl<P: Interceptor + ?Sized> Interceptor for &mut P {
+    fn bind_local_stream(&mut self, info: &StreamInfo) {
+        (**self).bind_local_stream(info)
     }
 
-    #[test]
-    fn test_derive_interceptor_stream_binding() {
-        let mut chain = SimplePassthrough::new(NoopInterceptor::new());
+    fn unbind_local_stream(&mut self, info: &StreamInfo) {
+        (**self).unbind_local_stream(info)
+    }
 
-        let info = StreamInfo {
-            ssrc: 12345,
-            ..Default::default()
-        };
+    fn bind_remote_stream(&mut self, info: &StreamInfo) {
+        (**self).bind_remote_stream(info)
+    }
 
-        // These should delegate to inner without panic
-        chain.bind_local_stream(&info);
-        chain.unbind_local_stream(&info);
-        chain.bind_remote_stream(&info);
-        chain.unbind_remote_stream(&info);
+    fn unbind_remote_stream(&mut self, info: &StreamInfo) {
+        (**self).unbind_remote_stream(info)
     }
 }

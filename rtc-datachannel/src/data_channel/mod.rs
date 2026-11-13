@@ -1,3 +1,15 @@
+//! One data channel over an SCTP stream.
+//!
+//! A [`DataChannel`](crate::data_channel::DataChannel) is opened either by the DCEP handshake (`DATA_CHANNEL_OPEN`, then
+//! `DATA_CHANNEL_ACK`) or out of band when [`DataChannelConfig::negotiated`](crate::data_channel::DataChannelConfig::negotiated) is set and both
+//! sides already agreed the stream id through signalling.
+//!
+//! The reliability the channel is opened with maps onto SCTP send parameters:
+//! [`get_reliability_params`](crate::data_channel::DataChannel::get_reliability_params) turns a
+//! [`ChannelType`](crate::message::message_channel_open::ChannelType) into the ordered flag and
+//! partial-reliability setting SCTP needs, and
+//! [`get_channel_type_and_reliability_parameter`](crate::data_channel::DataChannel::get_channel_type_and_reliability_parameter)
+//! goes the other way from the W3C `maxPacketLifeTime`/`maxRetransmits` pair.
 #[cfg(test)]
 mod data_channel_test;
 
@@ -17,29 +29,42 @@ const RECEIVE_MTU: usize = 8192;
 /// DataChannelConfig is used to configure the data channel.
 #[derive(Eq, PartialEq, Default, Clone, Debug)]
 pub struct DataChannelConfig {
+    /// The reliability and ordering guarantees to request.
     pub channel_type: ChannelType,
+    /// Whether the channel was negotiated out of band.
+    ///
+    /// When `true` no DCEP `DATA_CHANNEL_OPEN` is sent — both sides are assumed to have agreed
+    /// the stream id and parameters through signalling instead.
     pub negotiated: bool,
+    /// The channel's relative priority; see the `CHANNEL_PRIORITY_*` constants.
     pub priority: u16,
+    /// The retransmission count or message lifetime, interpreted according to
+    /// [`Self::channel_type`].
     pub reliability_parameter: u32,
+    /// The channel label, used to distinguish channels on the same association.
     pub label: String,
+    /// The subprotocol name, or empty if none.
     pub protocol: String,
 }
 
 /// DataChannelMessage is used for data sent over SCTP.
-// Note: #[non_exhaustive] is intentional — this crate is pre-1.0 (0.20.0-alpha)
-// and adding the `negotiated` field would otherwise be a semver-breaking change
-// for downstream code that constructs `DataChannelMessage` via struct literals.
-#[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct DataChannelMessage {
+    /// Identifies the SCTP association this message belongs to.
     pub association_handle: usize,
+    /// The SCTP stream the message arrived on or should be sent on.
     pub stream_id: u16,
+    /// The payload protocol identifier, which distinguishes DCEP control messages from string
+    /// and binary user data.
     pub ppi: PayloadProtocolIdentifier,
+    /// The message bytes.
     pub payload: BytesMut,
-    /// When `true`, the channel was created via out-of-band (pre-negotiated)
-    /// negotiation.  The SCTP handler opens the stream but does **not** send
-    /// the DCEP open message over the wire, because both peers already agree
-    /// on the channel parameters.
+
+    /// Marks a `DATA_CHANNEL_OPEN` that belongs to an out-of-band *negotiated*
+    /// channel (W3C WebRTC `RTCDataChannelInit.negotiated`). Such a message is
+    /// only used to open and configure the local SCTP stream and must not be
+    /// transmitted to the peer, which already created its own channel with the
+    /// pre-agreed stream id. Ignored for every other message.
     pub negotiated: bool,
 }
 
@@ -71,6 +96,9 @@ pub struct DataChannel {
 
     read_outs: VecDeque<DataChannelMessage>,
     write_outs: VecDeque<DataChannelMessage>,
+
+    /// Whether the DCEP handshake for this channel has completed.
+    handshake_complete: bool,
 
     // stats
     messages_sent: usize,
@@ -106,17 +134,13 @@ impl DataChannel {
     ) -> Result<Self> {
         let mut data_channel = DataChannel::new(config.clone(), association_handle, stream_id);
 
-        // Build a DCEP DataChannelOpen that the SCTP handler intercepts to
-        // register the underlying SCTP stream.
-        //
-        // For in-band channels (negotiated=false) the message is also sent over
-        // the wire to initiate the DCEP handshake per RFC 8832 sec. 3.
-        //
-        // For pre-negotiated channels (negotiated=true) the message is
-        // internal-only: the SCTP handler opens the stream and sets its
-        // reliability parameters but does NOT send DCEP to the peer.  Without
-        // this the SCTP association never registers the stream, causing every
-        // subsequent write to fail with "Stream not existed" (issue #61).
+        // Both in-band and out-of-band (negotiated) channels emit a
+        // DATA_CHANNEL_OPEN so the underlying SCTP stream gets opened and its
+        // reliability parameters configured (the Channel Type / Reliability
+        // Parameter mapping in RFC 8832 section 5.1). For a negotiated channel
+        // the message is flagged so the transport opens the stream locally
+        // without sending the DCEP handshake to the peer; that suppression is
+        // required by the W3C WebRTC `negotiated` semantics, not by DCEP.
         let msg = Message::DataChannelOpen(DataChannelOpen {
             channel_type: config.channel_type,
             priority: config.priority,
@@ -131,9 +155,13 @@ impl DataChannel {
             stream_id,
             ppi: PayloadProtocolIdentifier::Dcep,
             payload: msg,
-            // Forward the negotiated flag so the SCTP handler can skip the DCEP write.
             negotiated: config.negotiated,
         });
+
+        // Out-of-band `negotiated` channels have no handshake, so they are
+        // handshake-complete immediately. In-band channels stay incomplete until
+        // `handle_dcep` processes the peer's `DATA_CHANNEL_ACK`.
+        data_channel.handshake_complete = config.negotiated;
 
         Ok(data_channel)
     }
@@ -166,6 +194,10 @@ impl DataChannel {
         let mut data_channel = DataChannel::new(config, association_handle, stream_id);
 
         data_channel.write_data_channel_ack()?;
+
+        // The remote side's OPEN has been processed and the ACK is written out,
+        // so the handshake is complete.
+        data_channel.handshake_complete = true;
 
         Ok(data_channel)
     }
@@ -200,8 +232,18 @@ impl DataChannel {
         self.stream_id
     }
 
+    /// The configuration this channel was opened with.
     pub fn config(&self) -> &DataChannelConfig {
         &self.config
+    }
+
+    /// Whether the DCEP handshake for this channel has completed.
+    ///
+    /// For a locally-created in-band channel this becomes `true` only when the peer's
+    /// `DATA_CHANNEL_ACK` is received; for a remote channel it is `true` from `accept()`;
+    /// for an out-of-band `negotiated` channel it is `true` from `dial()`.
+    pub fn is_handshake_complete(&self) -> bool {
+        self.handshake_complete
     }
 
     fn handle_dcep<B>(&mut self, data: &mut B) -> Result<()>
@@ -219,6 +261,8 @@ impl DataChannel {
             }
             Message::DataChannelAck(_) => {
                 debug!("Received DATA_CHANNEL_ACK");
+                // The initiator's DCEP handshake is complete.
+                self.handshake_complete = true;
             }
             _ => {
                 return Err(Error::InvalidMessageType(msg.message_type() as u8));
@@ -235,7 +279,7 @@ impl DataChannel {
             stream_id: self.stream_id,
             ppi: PayloadProtocolIdentifier::Dcep,
             payload: ack,
-            ..Default::default()
+            negotiated: false,
         });
         Ok(())
     }
@@ -247,7 +291,7 @@ impl DataChannel {
             stream_id: self.stream_id,
             ppi: PayloadProtocolIdentifier::Dcep,
             payload: close,
-            ..Default::default()
+            negotiated: false,
         });
         Ok(())
     }
@@ -260,7 +304,7 @@ impl DataChannel {
             stream_id: self.stream_id,
             ppi: PayloadProtocolIdentifier::Dcep,
             payload: low_threshold,
-            ..Default::default()
+            negotiated: false,
         });
         Ok(())
     }
@@ -273,7 +317,7 @@ impl DataChannel {
             stream_id: self.stream_id,
             ppi: PayloadProtocolIdentifier::Dcep,
             payload: low_threshold,
-            ..Default::default()
+            negotiated: false,
         });
         Ok(())
     }
@@ -297,6 +341,10 @@ impl DataChannel {
         self.stream.on_buffered_amount_low(f)
     }*/
 
+    /// Decomposes a [`ChannelType`] into the SCTP send parameters it implies.
+    ///
+    /// Returns whether delivery is unordered, together with the reliability type and value SCTP
+    /// needs for partial reliability.
     pub fn get_reliability_params(channel_type: ChannelType) -> (bool, ReliabilityType) {
         match channel_type {
             ChannelType::Reliable => (false, ReliabilityType::Reliable),
@@ -308,6 +356,10 @@ impl DataChannel {
         }
     }
 
+    /// Derives the [`ChannelType`] and reliability parameter from the `maxPacketLifeTime` /
+    /// `maxRetransmits` pair the W3C API exposes.
+    ///
+    /// The two are mutually exclusive; supplying neither yields a fully reliable channel.
     pub fn get_channel_type_and_reliability_parameter(
         ordered: bool,
         max_retransmits: Option<u16>,
@@ -348,6 +400,10 @@ impl DataChannel {
         (channel_type, reliability_parameter)
     }
 
+    /// Builds the payload protocol identifier and payload for a user message.
+    ///
+    /// Empty messages get their own identifiers (`StringEmpty`/`BinaryEmpty`) because SCTP
+    /// cannot carry a zero-length payload.
     pub fn get_data_channel_message(is_string: bool, data: BytesMut) -> DataChannelMessage {
         // https://tools.ietf.org/html/draft-ietf-rtcweb-data-channel-12#section-6.6
         // SCTP does not support the sending of empty user messages.  Therefore,
@@ -435,6 +491,8 @@ impl sansio::Protocol<DataChannelMessage, DataChannelMessage, ()> for DataChanne
         // a corresponding notification to the application layer that the reset
         // has been performed.  Streams are available for reuse after a reset
         // has been performed.
+        // Closing resets the handshake-complete flag.
+        self.handshake_complete = false;
         self.write_data_channel_close()
     }
 }

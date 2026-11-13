@@ -1,3 +1,11 @@
+//! The RTCP header.
+//!
+//! Four bytes on every packet: version and padding flags, a 5-bit count whose meaning depends on
+//! the packet type, the [`PacketType`](crate::header::PacketType) itself, and a length in 32-bit words. The `*_SHIFT` and
+//! `*_MASK` constants describe how the flags pack into the first octet.
+//!
+//! The length field is why RTCP is compound: several packets can be concatenated in one
+//! datagram and walked by stepping over each header's length.
 use shared::{
     error::{Error, Result},
     marshal::{Marshal, MarshalSize, Unmarshal},
@@ -9,17 +17,27 @@ use bytes::{Buf, BufMut};
 /// RTCP packet types registered with IANA. See: <https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-4>
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum PacketType {
     #[default]
+    /// A packet type this crate does not model.
     Unsupported = 0,
-    SenderReport = 200,              // RFC 3550, 6.4.1
-    ReceiverReport = 201,            // RFC 3550, 6.4.2
-    SourceDescription = 202,         // RFC 3550, 6.5
-    Goodbye = 203,                   // RFC 3550, 6.6
-    ApplicationDefined = 204,        // RFC 3550, 6.7 (unimplemented)
+    /// Sender Report ([RFC 3550] §6.4.1): a sender's timing and packet counts.
+    SenderReport = 200, // RFC 3550, 6.4.1
+    /// Receiver Report ([RFC 3550] §6.4.2): reception quality from a receiver.
+    ReceiverReport = 201, // RFC 3550, 6.4.2
+    /// Source Description ([RFC 3550] §6.5): CNAME and other source metadata.
+    SourceDescription = 202, // RFC 3550, 6.5
+    /// BYE ([RFC 3550] §6.6): the source is leaving the session.
+    Goodbye = 203, // RFC 3550, 6.6
+    /// APP ([RFC 3550] §6.7): application-defined data. Not modelled by this crate.
+    ApplicationDefined = 204, // RFC 3550, 6.7 (unimplemented)
+    /// Transport-layer feedback ([RFC 4585]): NACK and transport-wide CC.
     TransportSpecificFeedback = 205, // RFC 4585, 6051
-    PayloadSpecificFeedback = 206,   // RFC 4585, 6.3
-    ExtendedReport = 207,            // RFC 3611
+    /// Payload-specific feedback ([RFC 4585] §6.3): PLI, FIR, SLI, REMB.
+    PayloadSpecificFeedback = 206, // RFC 4585, 6.3
+    /// Extended Report ([RFC 3611]).
+    ExtendedReport = 207, // RFC 3611
 }
 
 /// Transport and Payload specific feedback messages overload the count field to act as a message type. those are listed here
@@ -73,17 +91,28 @@ impl From<u8> for PacketType {
     }
 }
 
+/// The RTP/RTCP version this crate speaks.
 pub const RTP_VERSION: u8 = 2;
+/// Bit offset of the version field in the first header octet.
 pub const VERSION_SHIFT: u8 = 6;
+/// Bit mask of the version field once shifted.
 pub const VERSION_MASK: u8 = 0x3;
+/// Bit offset of the padding flag.
 pub const PADDING_SHIFT: u8 = 5;
+/// Bit mask of the padding flag once shifted.
 pub const PADDING_MASK: u8 = 0x1;
+/// Bit offset of the report/source count field.
 pub const COUNT_SHIFT: u8 = 0;
+/// Bit mask of the report/source count field.
 pub const COUNT_MASK: u8 = 0x1f;
 
+/// Length of the RTCP header in bytes.
 pub const HEADER_LENGTH: usize = 4;
+/// The largest report count the 5-bit field can hold.
 pub const COUNT_MAX: usize = (1 << 5) - 1;
+/// Length of an SSRC in bytes.
 pub const SSRC_LENGTH: usize = 4;
+/// The longest SDES item value, bounded by its one-byte length field.
 pub const SDES_MAX_OCTET_COUNT: usize = (1 << 8) - 1;
 
 // https://datatracker.ietf.org/doc/html/rfc5104#section-4.3.1
@@ -94,6 +123,7 @@ pub const SDES_MAX_OCTET_COUNT: usize = (1 << 8) - 1;
 //
 // The length of the FIR feedback message MUST be set to
 //    2+2*N, where N is the number of FCI entries.
+/// The smallest valid FIR packet, in bytes.
 pub const FIR_MIN_OCTET_COUNT: usize = 20;
 
 /// A Header is the common header shared by all RTCP packets

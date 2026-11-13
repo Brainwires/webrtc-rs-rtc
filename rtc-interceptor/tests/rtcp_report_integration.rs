@@ -7,8 +7,8 @@
 //! - Generates reports at configured intervals
 
 use rtc_interceptor::{
-    Interceptor, Packet, ReceiverReportBuilder, Registry, SenderReportBuilder, StreamInfo,
-    TaggedPacket,
+    AttributedPacket, Interceptor, Packet, ReceiverReportBuilder, Registry, SenderReportBuilder,
+    Slot, StreamInfo, TaggedPacket,
 };
 use sansio::Protocol;
 use shared::TransportContext;
@@ -25,7 +25,7 @@ fn create_rtp_packet(ssrc: u32, seq: u16, timestamp: u32, payload_len: usize) ->
     TaggedPacket {
         now: Instant::now(),
         transport: TransportContext::default(),
-        message: Packet::Rtp(rtp::Packet {
+        message: AttributedPacket::new(Packet::Rtp(rtp::Packet {
             header: rtp::header::Header {
                 ssrc,
                 sequence_number: seq,
@@ -34,7 +34,7 @@ fn create_rtp_packet(ssrc: u32, seq: u16, timestamp: u32, payload_len: usize) ->
             },
             payload: payload.into(),
             ..Default::default()
-        }),
+        })),
     }
 }
 
@@ -81,6 +81,7 @@ fn test_sender_report_interceptor_generates_sr_on_timeout() {
     // Build an interceptor chain with SenderReportInterceptor
     let mut chain = Registry::new()
         .with(
+            Slot::SenderReport,
             SenderReportBuilder::new()
                 .with_interval(Duration::from_millis(100))
                 .build(),
@@ -103,7 +104,7 @@ fn test_sender_report_interceptor_generates_sr_on_timeout() {
     // Poll all written packets (RTP passes through)
     let mut rtp_count = 0;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtp(_) = pkt.message {
+        if let Packet::Rtp(_) = pkt.message.packet {
             rtp_count += 1;
         }
     }
@@ -120,7 +121,7 @@ fn test_sender_report_interceptor_generates_sr_on_timeout() {
     // Poll for the generated RTCP Sender Report
     let mut sr_found = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if rtcp_pkt
                     .as_any()
@@ -139,6 +140,7 @@ fn test_sender_report_interceptor_generates_sr_on_timeout() {
 fn test_sender_report_tracks_packet_statistics() {
     let mut chain = Registry::new()
         .with(
+            Slot::SenderReport,
             SenderReportBuilder::new()
                 .with_interval(Duration::from_millis(50))
                 .build(),
@@ -167,7 +169,7 @@ fn test_sender_report_tracks_packet_statistics() {
 
     // Find the Sender Report and verify statistics
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(sr) = rtcp_pkt
                     .as_any()
@@ -192,6 +194,7 @@ fn test_sender_report_tracks_packet_statistics() {
 fn test_sender_report_multiple_streams() {
     let mut chain = Registry::new()
         .with(
+            Slot::SenderReport,
             SenderReportBuilder::new()
                 .with_interval(Duration::from_millis(50))
                 .build(),
@@ -232,7 +235,7 @@ fn test_sender_report_multiple_streams() {
     let mut audio_sr = false;
 
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(sr) = rtcp_pkt
                     .as_any()
@@ -262,6 +265,7 @@ fn test_sender_report_multiple_streams() {
 fn test_receiver_report_interceptor_generates_rr_on_timeout() {
     let mut chain = Registry::new()
         .with(
+            Slot::ReceiverReport,
             ReceiverReportBuilder::new()
                 .with_interval(Duration::from_millis(100))
                 .build(),
@@ -285,7 +289,7 @@ fn test_receiver_report_interceptor_generates_rr_on_timeout() {
     // Poll all read packets (RTP passes through)
     let mut rtp_count = 0;
     while let Some(pkt) = chain.poll_read() {
-        if let Packet::Rtp(_) = pkt.message {
+        if let Packet::Rtp(_) = pkt.message.packet {
             rtp_count += 1;
         }
     }
@@ -298,7 +302,7 @@ fn test_receiver_report_interceptor_generates_rr_on_timeout() {
     // Poll for the generated RTCP Receiver Report
     let mut rr_found = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if rtcp_pkt
                     .as_any()
@@ -317,6 +321,7 @@ fn test_receiver_report_interceptor_generates_rr_on_timeout() {
 fn test_receiver_report_tracks_sequence_numbers() {
     let mut chain = Registry::new()
         .with(
+            Slot::ReceiverReport,
             ReceiverReportBuilder::new()
                 .with_interval(Duration::from_millis(50))
                 .build(),
@@ -345,7 +350,7 @@ fn test_receiver_report_tracks_sequence_numbers() {
 
     // Verify Receiver Report contains correct sequence tracking
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(rr) = rtcp_pkt
                     .as_any()
@@ -373,6 +378,7 @@ fn test_receiver_report_tracks_sequence_numbers() {
 fn test_receiver_report_detects_packet_loss() {
     let mut chain = Registry::new()
         .with(
+            Slot::ReceiverReport,
             ReceiverReportBuilder::new()
                 .with_interval(Duration::from_millis(50))
                 .build(),
@@ -403,7 +409,7 @@ fn test_receiver_report_detects_packet_loss() {
 
     // Verify Receiver Report indicates packet loss
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(rr) = rtcp_pkt
                     .as_any()
@@ -435,11 +441,13 @@ fn test_combined_sender_and_receiver_interceptors() {
     // Build a chain with both interceptors
     let mut chain = Registry::new()
         .with(
+            Slot::ReceiverReport,
             ReceiverReportBuilder::new()
                 .with_interval(Duration::from_millis(100))
                 .build(),
         )
         .with(
+            Slot::SenderReport,
             SenderReportBuilder::new()
                 .with_interval(Duration::from_millis(100))
                 .build(),
@@ -481,7 +489,7 @@ fn test_combined_sender_and_receiver_interceptors() {
     let mut rr_found = false;
 
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(sr) = rtcp_pkt
                     .as_any()
@@ -517,11 +525,13 @@ fn test_combined_sender_and_receiver_interceptors() {
 fn test_interceptor_chain_unbind_streams() {
     let mut chain = Registry::new()
         .with(
+            Slot::ReceiverReport,
             ReceiverReportBuilder::new()
                 .with_interval(Duration::from_millis(50))
                 .build(),
         )
         .with(
+            Slot::SenderReport,
             SenderReportBuilder::new()
                 .with_interval(Duration::from_millis(50))
                 .build(),
@@ -563,7 +573,7 @@ fn test_interceptor_chain_unbind_streams() {
     // Verify no RTCP reports are generated
     let mut report_count = 0;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if rtcp_pkt
                     .as_any()
@@ -593,6 +603,7 @@ fn test_interceptor_chain_unbind_streams() {
 fn test_receiver_processes_sender_report() {
     let mut chain = Registry::new()
         .with(
+            Slot::ReceiverReport,
             ReceiverReportBuilder::new()
                 .with_interval(Duration::from_millis(100))
                 .build(),
@@ -623,7 +634,7 @@ fn test_receiver_processes_sender_report() {
     let sr_packet = TaggedPacket {
         now: base_time,
         transport: TransportContext::default(),
-        message: Packet::Rtcp(vec![Box::new(sr)]),
+        message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(sr)])),
     };
 
     // Process the incoming SR
@@ -639,7 +650,7 @@ fn test_receiver_processes_sender_report() {
 
     // The RR should have DLSR (delay since last SR) set
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(rr) = rtcp_pkt
                     .as_any()
@@ -669,7 +680,10 @@ fn test_report_interval_is_respected() {
     let interval = Duration::from_millis(200);
 
     let mut chain = Registry::new()
-        .with(SenderReportBuilder::new().with_interval(interval).build())
+        .with(
+            Slot::SenderReport,
+            SenderReportBuilder::new().with_interval(interval).build(),
+        )
         .build();
 
     let ssrc = 0x12121212;
@@ -686,7 +700,7 @@ fn test_report_interval_is_respected() {
     chain.handle_timeout(base_time + interval).unwrap();
     let mut first_sr = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(pkts) = &pkt.message {
+        if let Packet::Rtcp(pkts) = &pkt.message.packet {
             for p in pkts {
                 if p.as_any()
                     .downcast_ref::<rtcp::sender_report::SenderReport>()
@@ -705,7 +719,7 @@ fn test_report_interval_is_respected() {
         .unwrap();
     let mut second_sr = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(pkts) = &pkt.message {
+        if let Packet::Rtcp(pkts) = &pkt.message.packet {
             for p in pkts {
                 if p.as_any()
                     .downcast_ref::<rtcp::sender_report::SenderReport>()
@@ -724,7 +738,7 @@ fn test_report_interval_is_respected() {
         .unwrap();
     let mut third_sr = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(pkts) = &pkt.message {
+        if let Packet::Rtcp(pkts) = &pkt.message.packet {
             for p in pkts {
                 if p.as_any()
                     .downcast_ref::<rtcp::sender_report::SenderReport>()
@@ -745,11 +759,13 @@ fn test_poll_timeout_returns_earliest() {
 
     let mut chain = Registry::new()
         .with(
+            Slot::ReceiverReport,
             ReceiverReportBuilder::new()
                 .with_interval(rr_interval)
                 .build(),
         )
         .with(
+            Slot::SenderReport,
             SenderReportBuilder::new()
                 .with_interval(sr_interval)
                 .build(),
@@ -759,7 +775,27 @@ fn test_poll_timeout_returns_earliest() {
     chain.bind_local_stream(&video_stream_info(0x11111111));
     chain.bind_remote_stream(&video_stream_info(0x22222222));
 
-    // The timeout should be scheduled
-    let timeout = chain.poll_timeout();
-    assert!(timeout.is_some(), "Should have a scheduled timeout");
+    // Binding a stream alone schedules nothing: each report timer is armed from the instant of
+    // the first packet it actually sees, so a bound-but-silent stream asks for no wake-up.
+    assert_eq!(
+        chain.poll_timeout(),
+        None,
+        "no traffic yet, so nothing should be scheduled"
+    );
+
+    let base = Instant::now();
+    chain
+        .handle_write(create_rtp_packet_with_time(base, 0x11111111, 1, 3000, 100))
+        .unwrap();
+    chain
+        .handle_read(create_rtp_packet_with_time(base, 0x22222222, 1, 3000, 100))
+        .unwrap();
+
+    // Both are armed now, and the chain reports the earlier of the two — the sender report,
+    // whose interval is the shorter.
+    assert_eq!(
+        chain.poll_timeout(),
+        Some(base + sr_interval),
+        "poll_timeout must return the earliest of the chained timers"
+    );
 }

@@ -1,12 +1,23 @@
+//! Candidate pairs and their check state.
+//!
+//! ICE forms a pair from each compatible local/remote candidate combination and works through
+//! them in priority order. A pair's combined priority is computed from both sides' priorities with
+//! the controlling agent's dominating, so both agents derive the same ordering.
+//!
+//! [`CandidatePairState`](crate::candidate::candidate_pair::CandidatePairState) tracks how far a pair has got: waiting, in progress, succeeded or
+//! failed. The controlling agent nominates one of the succeeded pairs, and that pair carries the
+//! media.
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
 /// Represent the ICE candidate pair state.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CandidatePairState {
     #[default]
     #[serde(rename = "unspecified")]
+    /// No state was set.
     Unspecified = 0,
 
     /// Means a check has not been performed for this pair.
@@ -56,9 +67,13 @@ impl fmt::Display for CandidatePairState {
 /// Represents a combination of a local and remote candidate.
 #[derive(Clone, Copy)]
 pub struct CandidatePair {
+    /// Index of the local candidate in the agent's list.
     pub local_index: usize,
+    /// Index of the remote candidate in the agent's list.
     pub remote_index: usize,
+    /// The local candidate's priority.
     pub local_priority: u32,
+    /// The remote candidate's priority.
     pub remote_priority: u32,
     pub(crate) ice_role_controlling: bool,
     pub(crate) binding_request_count: u16,
@@ -120,6 +135,9 @@ impl PartialEq for CandidatePair {
 
 impl CandidatePair {
     #[must_use]
+    /// Forms a pair from a local and a remote candidate.
+    ///
+    /// `controlling` selects which priority dominates in the pair's combined priority.
     pub fn new(
         local_index: usize,
         remote_index: usize,

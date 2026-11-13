@@ -1,3 +1,19 @@
+//! The RTP header and its extensions.
+//!
+//! [`Header`](crate::header::Header) is the fixed 12-byte header plus the optional CSRC list and header-extension
+//! block. The `*_SHIFT`/`*_MASK` constants describe how the flag fields pack into the first two
+//! octets, and the `*_OFFSET`/`*_LENGTH` constants give the byte positions a caller can patch in
+//! place without re-encoding.
+//!
+//! Header extensions ([RFC 8285]) come in two forms, selected by
+//! [`Header::extension_profile`](crate::header::Header::extension_profile): one-byte ids ([`EXTENSION_PROFILE_ONE_BYTE`](crate::header::EXTENSION_PROFILE_ONE_BYTE)) or two-byte ids
+//! ([`EXTENSION_PROFILE_TWO_BYTE`](crate::header::EXTENSION_PROFILE_TWO_BYTE)) when an id above 14 is needed. Use
+//! [`Header::set_extension`](crate::header::Header::set_extension) and [`Header::get_extension`](crate::header::Header::get_extension) rather than touching
+//! [`Header::extensions`](crate::header::Header::extensions) directly — they keep [`Header::extensions_padding`](crate::header::Header::extensions_padding) and the extension
+//! flag consistent, which marshalling depends on.
+//!
+//! [RFC 8285]: https://datatracker.ietf.org/doc/html/rfc8285
+
 use shared::{
     error::{Error, Result},
     marshal::{Marshal, MarshalSize, Unmarshal},
@@ -5,32 +21,58 @@ use shared::{
 
 use bytes::{Buf, BufMut, Bytes};
 
+/// The length of the extension-profile and length fields that precede header extensions.
 pub const HEADER_LENGTH: usize = 4;
+/// Bit offset of the version field in the first header octet.
 pub const VERSION_SHIFT: u8 = 6;
+/// Bit mask of the version field once shifted.
 pub const VERSION_MASK: u8 = 0x3;
+/// Bit offset of the padding flag.
 pub const PADDING_SHIFT: u8 = 5;
+/// Bit mask of the padding flag once shifted.
 pub const PADDING_MASK: u8 = 0x1;
+/// Bit offset of the extension flag.
 pub const EXTENSION_SHIFT: u8 = 4;
+/// Bit mask of the extension flag once shifted.
 pub const EXTENSION_MASK: u8 = 0x1;
+/// Extension profile `0xBEDE`, which selects one-byte header extension ids ([RFC 8285]).
 pub const EXTENSION_PROFILE_ONE_BYTE: u16 = 0xBEDE;
+/// Extension profile `0x1000`, which selects two-byte header extension ids, allowing ids
+/// above 14.
 pub const EXTENSION_PROFILE_TWO_BYTE: u16 = 0x1000;
+/// Extension id 15, reserved by the RFC and never assigned.
 pub const EXTENSION_ID_RESERVED: u8 = 0xF;
+/// Bit mask of the CSRC count field.
 pub const CC_MASK: u8 = 0xF;
+/// Bit offset of the marker bit.
 pub const MARKER_SHIFT: u8 = 7;
+/// Bit mask of the marker bit once shifted.
 pub const MARKER_MASK: u8 = 0x1;
+/// Bit mask of the payload-type field.
 pub const PT_MASK: u8 = 0x7F;
+/// Byte offset of the sequence number within the header.
 pub const SEQ_NUM_OFFSET: usize = 2;
+/// Length of the sequence number in bytes.
 pub const SEQ_NUM_LENGTH: usize = 2;
+/// Byte offset of the timestamp within the header.
 pub const TIMESTAMP_OFFSET: usize = 4;
+/// Length of the timestamp in bytes.
 pub const TIMESTAMP_LENGTH: usize = 4;
+/// Byte offset of the SSRC within the header.
 pub const SSRC_OFFSET: usize = 8;
+/// Length of the SSRC in bytes.
 pub const SSRC_LENGTH: usize = 4;
+/// Byte offset of the first CSRC within the header.
 pub const CSRC_OFFSET: usize = 12;
+/// Length of each CSRC in bytes.
 pub const CSRC_LENGTH: usize = 4;
 
 #[derive(Debug, Eq, PartialEq, Default, Clone)]
+/// One RTP header extension: an id and its payload bytes.
 pub struct Extension {
+    /// The extension id, as negotiated by `a=extmap`.
     pub id: u8,
+    /// The extension's value.
     pub payload: Bytes,
 }
 
@@ -38,17 +80,30 @@ pub struct Extension {
 /// NOTE: PayloadOffset is populated by Marshal/Unmarshal and should not be modified
 #[derive(Debug, Eq, PartialEq, Default, Clone)]
 pub struct Header {
+    /// The RTP version, always 2.
     pub version: u8,
+    /// Whether the payload is followed by padding octets, the last giving the padding length.
     pub padding: bool,
+    /// Whether a header-extension block follows the fixed header.
     pub extension: bool,
+    /// The marker bit: the last packet of a video frame, or the start of a talk spurt for audio.
     pub marker: bool,
+    /// The payload type, which identifies the codec as negotiated in SDP.
     pub payload_type: u8,
+    /// Increments by one per packet sent; used to detect loss and restore order.
     pub sequence_number: u16,
+    /// The sampling instant of the first octet, in the codec's clock rate.
     pub timestamp: u32,
+    /// The synchronization source — the identifier of the stream this packet belongs to.
     pub ssrc: u32,
+    /// The contributing sources, listed when a mixer combined several streams.
     pub csrc: Vec<u32>,
+    /// Which header-extension form is in use: [`EXTENSION_PROFILE_ONE_BYTE`] or
+    /// [`EXTENSION_PROFILE_TWO_BYTE`].
     pub extension_profile: u16,
+    /// The header extensions present on this packet.
     pub extensions: Vec<Extension>,
+    /// Padding bytes appended to the extension block so it ends on a 32-bit boundary.
     pub extensions_padding: usize,
 }
 
@@ -216,16 +271,30 @@ impl Unmarshal for Header {
     }
 }
 
+impl Header {
+    /// Marshaled header size given an already-computed extension payload length
+    /// (see [`Header::get_extension_payload_len`]). Lets `marshal_to` size the
+    /// buffer and write the extension length field from a single scan of the
+    /// extensions instead of walking them via `marshal_size` and again directly.
+    fn marshal_size_for(&self, extension_payload_len: usize) -> usize {
+        let mut head_size = 12 + (self.csrc.len() * CSRC_LENGTH);
+        if self.extension {
+            let padded = extension_payload_len + self.extensions_padding;
+            head_size += 4 + padded.div_ceil(4) * 4;
+        }
+        head_size
+    }
+}
+
 impl MarshalSize for Header {
     /// MarshalSize returns the size of the packet once marshaled.
     fn marshal_size(&self) -> usize {
-        let mut head_size = 12 + (self.csrc.len() * CSRC_LENGTH);
-        if self.extension {
-            let extension_payload_len = self.get_extension_payload_len() + self.extensions_padding;
-            let extension_payload_size = extension_payload_len.div_ceil(4);
-            head_size += 4 + extension_payload_size * 4;
-        }
-        head_size
+        let extension_payload_len = if self.extension {
+            self.get_extension_payload_len()
+        } else {
+            0
+        };
+        self.marshal_size_for(extension_payload_len)
     }
 }
 
@@ -247,7 +316,15 @@ impl Marshal for Header {
          * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
          */
         let remaining_before = buf.remaining_mut();
-        if remaining_before < self.marshal_size() {
+        // Scan the extensions once here; reused for the bounds check, the
+        // extension length field, and the trailing padding below (previously
+        // walked three times: marshal_size() here plus twice in the body).
+        let extension_payload_len = if self.extension {
+            self.get_extension_payload_len()
+        } else {
+            0
+        };
+        if remaining_before < self.marshal_size_for(extension_payload_len) {
             return Err(Error::ErrBufferTooSmall);
         }
 
@@ -284,8 +361,8 @@ impl Marshal for Header {
         if self.extension {
             buf.put_u16(self.extension_profile);
 
-            // calculate extensions size and round to 4 bytes boundaries
-            let extension_payload_len = self.get_extension_payload_len();
+            // extension_payload_len computed once at the top of this function.
+            // It is narrowed to u16 below, so reject anything that would truncate.
             if extension_payload_len > u16::MAX as usize {
                 return Err(Error::ExtensionPayloadTotalOverflow(extension_payload_len));
             }
@@ -370,6 +447,7 @@ impl Marshal for Header {
 }
 
 impl Header {
+    /// The total encoded length of the extension payloads, padding excluded.
     pub fn get_extension_payload_len(&self) -> usize {
         let payload_len: usize = self
             .extensions

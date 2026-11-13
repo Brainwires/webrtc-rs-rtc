@@ -11,19 +11,30 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Exposes the internal `fuzzing` module (marshal/unmarshal shims) for
+# benchmarks and micro-benchmark harnesses without requiring the `--cfg fuzzing`
+# build flag used by cargo-fuzz.
+bench = []
+
 [dependencies]
 shared = { workspace = true, default-features = false, features = [] }
 
 bytes.workspace = true
 rand.workspace = true
 thiserror.workspace = true
-slab = "0.4.9"
+slab.workspace = true
 log.workspace = true
-crc = "3.2.1"
+crc32c.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
-assert_matches = "1.5.0"
-lazy_static = "1.4.0"
+assert_matches.workspace = true
+lazy_static.workspace = true
+
+[[example]]
+name = "sctp_micro"
+required-features = ["bench"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

@@ -1,7 +1,7 @@
 use super::{param_header::*, param_type::*, *};
 
 use bytes::{Bytes, BytesMut};
-use rand::Rng;
+use rand::RngExt;
 use std::fmt;
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -32,7 +32,7 @@ impl Param for ParamStateCookie {
 
     fn marshal_to(&self, buf: &mut BytesMut) -> Result<usize> {
         self.header().marshal_to(buf)?;
-        buf.extend(self.cookie.clone());
+        buf.extend_from_slice(&self.cookie);
         Ok(buf.len())
     }
 
@@ -51,6 +51,8 @@ impl Param for ParamStateCookie {
 
 impl ParamStateCookie {
     pub(crate) fn new() -> Self {
+        // This 256-bit value is an unpredictable challenge echoed by the peer. SCTP remains usable
+        // without an RTC crypto provider, so this deliberately uses `rand`'s thread-local CSPRNG.
         let mut cookie = BytesMut::new();
         cookie.resize(32, 0);
         rand::rng().fill(cookie.as_mut());
@@ -58,5 +60,23 @@ impl ParamStateCookie {
         ParamStateCookie {
             cookie: cookie.freeze(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_state_cookies_have_full_entropy_width() {
+        assert_eq!(ParamStateCookie::new().cookie.len(), 32);
+    }
+
+    #[test]
+    fn generated_state_cookies_are_distinct() {
+        assert_ne!(
+            ParamStateCookie::new().cookie,
+            ParamStateCookie::new().cookie
+        );
     }
 }

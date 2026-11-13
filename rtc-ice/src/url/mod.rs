@@ -9,6 +9,7 @@ use shared::error::*;
 
 /// The type of server used in the ice.URL structure.
 #[derive(Default, PartialEq, Eq, Debug, Copy, Clone)]
+#[non_exhaustive]
 pub enum SchemeType {
     /// The URL represents a STUN server.
     Stun,
@@ -24,6 +25,7 @@ pub enum SchemeType {
 
     #[default]
     /// Default public constant to use for "enum" like struct comparisons when no value was defined.
+    /// A scheme or transport this crate does not recognise.
     Unknown,
 }
 
@@ -56,6 +58,7 @@ impl fmt::Display for SchemeType {
 
 /// The transport protocol type that is used in the `ice::url::Url` structure.
 #[derive(Default, PartialEq, Eq, Debug, Copy, Clone)]
+#[non_exhaustive]
 pub enum ProtoType {
     /// The URL uses a UDP transport.
     #[default]
@@ -64,6 +67,7 @@ pub enum ProtoType {
     /// The URL uses a TCP transport.
     Tcp,
 
+    /// A transport this crate does not recognise.
     Unknown,
 }
 
@@ -95,11 +99,17 @@ impl fmt::Display for ProtoType {
 /// Represents a STUN (rfc7064) or TURN (rfc7065) URL.
 #[derive(Debug, Clone, Default)]
 pub struct Url {
+    /// The URL scheme: `stun`, `stuns`, `turn` or `turns`.
     pub scheme: SchemeType,
+    /// The server host name or address.
     pub host: String,
+    /// The server port; defaults to 3478, or 5349 for the secure schemes.
     pub port: u16,
+    /// The TURN username, for `turn:`/`turns:` URLs.
     pub username: String,
+    /// The TURN credential.
     pub password: String,
+    /// The transport to reach the server over, from the URL's `?transport=` parameter.
     pub proto: ProtoType,
 }
 

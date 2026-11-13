@@ -3,6 +3,7 @@ mod sample_builder_test;
 #[cfg(test)]
 mod sample_sequence_location_test;
 
+/// Tracks where a sample sits within the RTP sequence-number space.
 pub mod sample_sequence_location;
 
 use self::sample_sequence_location::{Comparison, SampleSequenceLocation};
@@ -10,8 +11,7 @@ use crate::Sample;
 use bytes::Bytes;
 use rtp::Packet;
 use rtp::packetizer::Depacketizer;
-use shared::time::SystemInstant;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// SampleBuilder buffers packets until media frames are complete.
 pub struct SampleBuilder<T: Depacketizer> {
@@ -69,6 +69,10 @@ impl<T: Depacketizer> SampleBuilder<T> {
         }
     }
 
+    /// Sets how long to wait for a missing packet before giving up on the sample it belongs to.
+    ///
+    /// Bounds head-of-line blocking: without it a single lost packet would stall reassembly
+    /// indefinitely.
     pub fn with_max_time_delay(mut self, max_late_duration: Duration) -> Self {
         self.max_late_timestamp =
             (self.sample_rate as u128 * max_late_duration.as_millis() / 1000) as u32;
@@ -158,7 +162,7 @@ impl<T: Depacketizer> SampleBuilder<T> {
 
     /// Flushes all buffers that are already consumed or those buffers
     /// that are too late to consume.
-    fn purge_buffers(&mut self) {
+    fn purge_buffers(&mut self, now: Instant) {
         self.purge_consumed_buffers();
 
         while (self.too_old(&self.filled) || (self.filled.count() > self.max_late))
@@ -172,7 +176,7 @@ impl<T: Depacketizer> SampleBuilder<T> {
             if self.active.has_data() && (self.active.head == self.filled.head) {
                 // attempt to force the active packet to be consumed even though
                 // outstanding data may be pending arrival
-                let err = match self.build_sample(true) {
+                let err = match self.build_sample(now, true) {
                     Ok(_) => continue,
                     Err(e) => e,
                 };
@@ -195,7 +199,7 @@ impl<T: Depacketizer> SampleBuilder<T> {
     ///
     /// Push does not copy the input. If you wish to reuse
     /// this memory make sure to copy before calling push
-    pub fn push(&mut self, p: Packet) {
+    pub fn push(&mut self, now: Instant, p: Packet) {
         let sequence_number = p.header.sequence_number;
         self.buffer[sequence_number as usize] = Some(p);
         match self.filled.compare(sequence_number) {
@@ -211,7 +215,7 @@ impl<T: Depacketizer> SampleBuilder<T> {
             }
             _ => {}
         }
-        self.purge_buffers();
+        self.purge_buffers(now);
     }
 
     /// Creates a sample from a valid collection of RTP Packets by
@@ -219,6 +223,7 @@ impl<T: Depacketizer> SampleBuilder<T> {
     /// update buffer+values
     fn build_sample(
         &mut self,
+        now: Instant,
         purging_buffers: bool,
     ) -> Result<SampleSequenceLocation, BuildError> {
         if self.active.empty() {
@@ -322,28 +327,44 @@ impl<T: Depacketizer> SampleBuilder<T> {
         // the head set of packets is now fully consumed
         self.active.head = consume.tail;
 
-        // merge all the buffers into a sample
-        let mut data: Vec<u8> = Vec::new();
-        let mut i = consume.head;
-        while i != consume.tail {
-            let payload = self.buffer[i as usize]
+        // Assemble the sample payload from the consumed packets. For the common
+        // single-packet sample (all audio, and any frame that fits one RTP
+        // packet) hand back the depacketized `Bytes` directly — it is
+        // refcounted, so no copy is needed. Only multi-packet samples require
+        // concatenation, and even then `Bytes::from(data)` reuses the `Vec`'s
+        // buffer instead of copying it a second time.
+        let sample_data: Bytes = if consume.count() == 1 {
+            let payload = self.buffer[consume.head as usize]
                 .as_ref()
                 .map(|p| &p.payload)
                 .ok_or(BuildError::GapInSegment)?;
-
-            let p = self
-                .depacketizer
+            self.depacketizer
                 .depacketize(payload)
-                .map_err(|_| BuildError::DepacketizerFailed)?;
+                .map_err(|_| BuildError::DepacketizerFailed)?
+        } else {
+            let mut data: Vec<u8> = Vec::new();
+            let mut i = consume.head;
+            while i != consume.tail {
+                let payload = self.buffer[i as usize]
+                    .as_ref()
+                    .map(|p| &p.payload)
+                    .ok_or(BuildError::GapInSegment)?;
 
-            data.extend_from_slice(&p);
-            i = i.wrapping_add(1);
-        }
+                let p = self
+                    .depacketizer
+                    .depacketize(payload)
+                    .map_err(|_| BuildError::DepacketizerFailed)?;
+
+                data.extend_from_slice(&p);
+                i = i.wrapping_add(1);
+            }
+            Bytes::from(data)
+        };
         let samples = after_timestamp.wrapping_sub(sample_timestamp);
 
         let sample = Sample {
-            data: Bytes::copy_from_slice(&data),
-            timestamp: SystemInstant::now(),
+            data: sample_data,
+            timestamp: now,
             duration: Duration::from_secs_f64((samples as f64) / (self.sample_rate as f64)),
             packet_timestamp: sample_timestamp,
             prev_dropped_packets: self.dropped_packets,
@@ -365,8 +386,8 @@ impl<T: Depacketizer> SampleBuilder<T> {
 
     /// Compiles pushed RTP packets into media samples and then
     /// returns the next valid sample (or None if no sample is compiled).
-    pub fn pop(&mut self) -> Option<Sample> {
-        let _ = self.build_sample(false);
+    pub fn pop(&mut self, now: Instant) -> Option<Sample> {
+        let _ = self.build_sample(now, false);
 
         if self.prepared.empty() {
             return None;
@@ -379,8 +400,8 @@ impl<T: Depacketizer> SampleBuilder<T> {
     /// Compiles pushed RTP packets into media samples and then
     /// returns the next valid sample with its associated RTP timestamp (or `None` if
     /// no sample is compiled).
-    pub fn pop_with_timestamp(&mut self) -> Option<(Sample, u32)> {
-        if let Some(sample) = self.pop() {
+    pub fn pop_with_timestamp(&mut self, now: Instant) -> Option<(Sample, u32)> {
+        if let Some(sample) = self.pop(now) {
             let timestamp = sample.packet_timestamp;
             Some((sample, timestamp))
         } else {

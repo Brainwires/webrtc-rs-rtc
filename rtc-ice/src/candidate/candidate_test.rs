@@ -1,5 +1,9 @@
 use super::*;
+use crate::candidate::candidate_host::CandidateHostConfig;
 use crate::candidate::candidate_pair::CandidatePairState;
+use crate::candidate::candidate_peer_reflexive::CandidatePeerReflexiveConfig;
+use crate::candidate::candidate_relay::CandidateRelayConfig;
+use crate::candidate::candidate_server_reflexive::CandidateServerReflexiveConfig;
 use crate::candidate::{Candidate, unmarshal_candidate};
 use std::time::Instant;
 
@@ -114,10 +118,15 @@ fn test_candidate_priority() -> Result<()> {
 #[test]
 fn test_candidate_last_sent() -> Result<()> {
     let mut candidate = Candidate::default();
+    assert_eq!(
+        candidate.last_sent(),
+        None,
+        "a fresh candidate has sent nothing"
+    );
 
     let now = Instant::now();
     candidate.set_last_sent(now);
-    assert_eq!(candidate.last_sent(), now);
+    assert_eq!(candidate.last_sent(), Some(now));
 
     Ok(())
 }
@@ -125,10 +134,15 @@ fn test_candidate_last_sent() -> Result<()> {
 #[test]
 fn test_candidate_last_received() -> Result<()> {
     let mut candidate = Candidate::default();
+    assert_eq!(
+        candidate.last_received(),
+        None,
+        "a fresh candidate has received nothing"
+    );
 
     let now = Instant::now();
     candidate.set_last_received(now);
-    assert_eq!(candidate.last_received(), now);
+    assert_eq!(candidate.last_received(), Some(now));
 
     Ok(())
 }
@@ -426,6 +440,101 @@ fn test_candidate_marshal() -> Result<()> {
             assert!(actual_candidate.is_err(), "expected error");
         }
     }
+
+    Ok(())
+}
+
+/// Regression test: a candidate's base address must be the local (bound)
+/// transport address. For server/peer-reflexive candidates that is the
+/// related address, not the NAT-mapped candidate address (RFC 8445 §5.1.1).
+#[test]
+fn test_candidate_base_addr() -> Result<()> {
+    let host = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: "192.168.0.2".to_owned(),
+            port: 5000,
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()?;
+    assert_eq!(host.base_addr(), host.addr(), "host base is itself");
+
+    let srflx = CandidateServerReflexiveConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: "10.79.12.1".to_owned(),
+            port: 60823,
+            component: 1,
+            ..Default::default()
+        },
+        rel_addr: "192.168.0.2".to_owned(),
+        rel_port: 5000,
+        ..Default::default()
+    }
+    .new_candidate_server_reflexive()?;
+    assert_eq!(
+        srflx.base_addr(),
+        "192.168.0.2:5000".parse().unwrap(),
+        "srflx base must be the related (host) address"
+    );
+    assert_ne!(srflx.base_addr(), srflx.addr());
+
+    let prflx = CandidatePeerReflexiveConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: "10.79.12.1".to_owned(),
+            port: 60824,
+            component: 1,
+            ..Default::default()
+        },
+        rel_addr: "192.168.0.2".to_owned(),
+        rel_port: 5000,
+        ..Default::default()
+    }
+    .new_candidate_peer_reflexive()?;
+    assert_eq!(
+        prflx.base_addr(),
+        "192.168.0.2:5000".parse().unwrap(),
+        "prflx base must be the related (host) address"
+    );
+
+    // Missing/unparseable related address falls back to the candidate address.
+    let prflx_no_rel = CandidatePeerReflexiveConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: "10.79.12.1".to_owned(),
+            port: 60825,
+            component: 1,
+            ..Default::default()
+        },
+        rel_addr: "".to_owned(),
+        rel_port: 0,
+        ..Default::default()
+    }
+    .new_candidate_peer_reflexive()?;
+    assert_eq!(prflx_no_rel.base_addr(), prflx_no_rel.addr());
+
+    let relay = CandidateRelayConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: "50.0.0.1".to_owned(),
+            port: 5000,
+            component: 1,
+            ..Default::default()
+        },
+        rel_addr: "192.168.0.2".to_owned(),
+        rel_port: 5001,
+        ..Default::default()
+    }
+    .new_candidate_relay()?;
+    assert_eq!(
+        relay.base_addr(),
+        relay.addr(),
+        "relay base is the relayed address itself"
+    );
 
     Ok(())
 }

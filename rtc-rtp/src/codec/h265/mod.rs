@@ -1,3 +1,15 @@
+//! H.265/HEVC RTP payload format ([RFC 7798]).
+//!
+//! HEVC differs from H.264 in ways that matter to packetization: NAL headers are two bytes
+//! rather than one, and there is an extra aggregation form (PACI) that can carry payload
+//! content information ahead of the NAL unit.
+//!
+//! This module provides the three packet shapes the RFC defines — single NAL unit,
+//! aggregation, and fragmentation unit — plus [`HevcPayloader`](crate::codec::h265::HevcPayloader), which picks between them
+//! based on the MTU, and the depacketizer that reverses the choice.
+//!
+//! [RFC 7798]: https://datatracker.ietf.org/doc/html/rfc7798
+
 use bytes::{BufMut, Bytes, BytesMut};
 
 use super::h264::ANNEXB_NALUSTART_CODE;
@@ -7,36 +19,69 @@ use shared::error::{Error, Result};
 #[cfg(test)]
 mod h265_test;
 
+/// The three-byte Annex B start code (`00 00 01`).
 pub static ANNEXB_3_NALUSTART_CODE: Bytes = Bytes::from_static(&[0x00, 0x00, 0x01]);
+/// Payload header for a single NAL unit packet.
 pub static SING_PAYLOAD_HDR: Bytes = Bytes::from_static(&[0x1C, 0x01]);
+/// Payload header for an aggregation packet.
 pub static AGGR_PAYLOAD_HDR: Bytes = Bytes::from_static(&[0x60, 0x01]);
+/// Payload header for a fragmentation unit.
 pub static FRAG_PAYLOAD_HDR: Bytes = Bytes::from_static(&[0x62, 0x01]);
+/// FU header for the first fragment of an IDR frame.
 pub static FU_HDR_IDR_S: u8 = 0x93;
+/// FU header for a middle fragment of an IDR frame.
 pub static FU_HDR_IDR_M: u8 = 0x13;
+/// FU header for the last fragment of an IDR frame.
 pub static FU_HDR_IDR_E: u8 = 0x53;
+/// FU header for the first fragment of a P frame.
 pub static FU_HDR_P_S: u8 = 0x81;
+/// FU header for a middle fragment of a P frame.
 pub static FU_HDR_P_M: u8 = 0x01;
+/// FU header for the last fragment of a P frame.
 pub static FU_HDR_P_E: u8 = 0x41;
+/// FU header for the first fragment of a B frame.
 pub static FU_HDR_B_S: u8 = 0x80;
+/// FU header for a middle fragment of a B frame.
 pub static FU_HDR_B_M: u8 = 0x00;
+/// FU header for the last fragment of a B frame.
 pub static FU_HDR_B_E: u8 = 0x40;
+/// The payload MTU this payloader targets, chosen to survive typical paths without IP
+/// fragmentation.
 pub const RTP_OUTBOUND_MTU: usize = 1200;
+/// Bytes of FU header following the payload header in a fragmentation unit.
 pub const H265FRAGMENTATION_UNIT_HEADER_SIZE: usize = 1;
+/// Bytes in an H.265 NAL header — two, unlike H.264's one.
 pub const NAL_HEADER_SIZE: usize = 2;
 
 #[derive(PartialEq, Hash, Debug, Copy, Clone)]
+/// The H.265 NAL unit types this payloader distinguishes.
+#[non_exhaustive]
 pub enum UnitType {
+    /// Video parameter set.
     VPS = 32,
+    /// Sequence parameter set.
     SPS = 33,
+    /// Picture parameter set.
     PPS = 34,
+    /// Clean random access picture — a keyframe that allows mid-stream tune-in.
     CRA = 21,
+    /// Supplemental enhancement information.
     SEI = 39,
+    /// Instantaneous decoder refresh picture — a keyframe.
     IDR = 19,
+    /// A predicted (P) frame.
     PFR = 1,
+    /// A bidirectionally predicted (B) frame.
     BFR = 0,
+    /// A unit type this payloader skips.
     IGNORE = -1,
 }
 impl UnitType {
+    /// Maps a raw NAL type id to a [`UnitType`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the id is not one this payloader handles.
     pub fn for_id(id: u8) -> Result<UnitType> {
         if id > 64 {
             Err(Error::ErrUnhandledNaluType)
@@ -58,6 +103,7 @@ impl UnitType {
 }
 
 #[derive(Default, Debug, Clone)]
+/// Packetizes H.265/HEVC NAL units into RTP payloads, fragmenting when needed.
 pub struct HevcPayloader;
 
 impl HevcPayloader {
@@ -104,6 +150,9 @@ impl HevcPayloader {
         header
     }
 
+    /// Locates the NAL unit boundaries in an Annex B buffer.
+    ///
+    /// Returns the offset of each start code and the length of the code that was matched.
     pub fn parse(nalu: &Bytes) -> (Vec<usize>, usize) {
         let finder = memchr::memmem::Finder::new(&ANNEXB_NALUSTART_CODE);
         let nals = finder.find_iter(nalu).collect::<Vec<usize>>();
@@ -319,6 +368,7 @@ const H265NALU_PACI_PACKET_TYPE: u8 = 50;
 pub struct H265NALUHeader(pub u16);
 
 impl H265NALUHeader {
+    /// Parses an H.265 NAL header from its two bytes.
     pub fn new(high_byte: u8, low_byte: u8) -> Self {
         H265NALUHeader(((high_byte as u16) << 8) | low_byte as u16)
     }
@@ -1013,10 +1063,15 @@ impl H265TSCI {
 /// H265 Payload Enum
 ///
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum H265Payload {
+    /// One NAL unit carried whole in a single packet.
     H265SingleNALUnitPacket(H265SingleNALUnitPacket),
+    /// One fragment of a NAL unit too large for the MTU.
     H265FragmentationUnitPacket(H265FragmentationUnitPacket),
+    /// Several small NAL units aggregated into one packet.
     H265AggregationPacket(H265AggregationPacket),
+    /// A PACI packet, which carries payload content information ahead of the NAL unit.
     H265PACIPacket(H265PACIPacket),
 }
 

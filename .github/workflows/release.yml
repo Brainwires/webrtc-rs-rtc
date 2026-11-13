@@ -24,14 +24,16 @@ jobs:
         uses: kenji-miyake/setup-git-cliff@v2
 
       - name: Generate changelog for this release
+        # The config is passed explicitly so the job does not depend on git-cliff's lookup
+        # order (it was `.cliff.toml`, which the release job never found).
         run: |
-          git cliff --current --output CHANGELOG.md
+          git cliff --config cliff.toml --current --output RELEASE_NOTES.md
 
       - name: Upload changelog artifact
         uses: actions/upload-artifact@v4
         with:
           name: changelog
-          path: CHANGELOG.md
+          path: RELEASE_NOTES.md
 
   release:
     name: Create GitHub Release
@@ -51,7 +53,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES.md
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # Uncomment and configure when ready to publish to crates.io:

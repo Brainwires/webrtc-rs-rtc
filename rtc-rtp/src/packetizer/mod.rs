@@ -10,12 +10,17 @@ use shared::{
 
 use bytes::{Bytes, BytesMut};
 use std::fmt;
-use std::sync::Arc;
 use std::time::Instant;
 
 /// Payloader payloads a byte array for use as rtp.Packet payloads
 pub trait Payloader: Send + Sync + fmt::Debug {
+    /// Splits one encoded frame into payloads no larger than `mtu`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the frame is malformed for this codec, or `mtu` is too small to make progress.
     fn payload(&mut self, mtu: usize, b: &Bytes) -> Result<Vec<Bytes>>;
+    /// Clones this payloader behind a trait object.
     fn clone_to(&self) -> Box<dyn Payloader>;
 }
 
@@ -27,9 +32,22 @@ impl Clone for Box<dyn Payloader> {
 
 /// Packetizer packetizes a payload
 pub trait Packetizer: Send + Sync + fmt::Debug {
+    /// Attaches the absolute-send-time header extension under id `value`.
     fn enable_abs_send_time(&mut self, value: u8);
-    fn packetize(&mut self, payload: &Bytes, samples: u32) -> Result<Vec<Packet>>;
+    /// Packetizes one frame, advancing the timestamp by `samples`.
+    ///
+    /// Assigns sequence numbers, sets the marker bit on the final packet, and applies any
+    /// enabled header extensions. `now` is the instant the frame is being sent at; it is what
+    /// the absolute-send-time extension is derived from, so the caller supplies it rather than
+    /// the packetizer sampling a clock of its own.
+    ///
+    /// # Errors
+    ///
+    /// Propagates payloader failures.
+    fn packetize(&mut self, now: Instant, payload: &Bytes, samples: u32) -> Result<Vec<Packet>>;
+    /// Advances the timestamp without sending anything, for dropped or silent frames.
     fn skip_samples(&mut self, skipped_samples: u32);
+    /// Clones this packetizer behind a trait object.
     fn clone_to(&self) -> Box<dyn Packetizer>;
 }
 
@@ -41,6 +59,11 @@ impl Clone for Box<dyn Packetizer> {
 
 /// Depacketizer depacketizes a RTP payload, removing any RTP specific data from the payload
 pub trait Depacketizer {
+    /// Reassembles a frame from one RTP payload, buffering fragments as needed.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the payload is malformed for this codec.
     fn depacketize(&mut self, b: &Bytes) -> Result<Bytes>;
 
     /// Checks if the packet is at the beginning of a partition.  This
@@ -53,9 +76,6 @@ pub trait Depacketizer {
     fn is_partition_tail(&self, marker: bool, payload: &Bytes) -> bool;
 }
 
-/// FnTimeGen provides current time (Instant)
-pub type FnTimeGen = Arc<dyn (Fn() -> Instant) + Send + Sync>;
-
 #[derive(Clone)]
 pub(crate) struct PacketizerImpl {
     pub(crate) mtu: usize,
@@ -66,8 +86,7 @@ pub(crate) struct PacketizerImpl {
     pub(crate) timestamp: u32,
     pub(crate) clock_rate: u32,
     pub(crate) abs_send_time_ext_id: u8, //http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
-    pub(crate) time_gen: Option<FnTimeGen>,
-    time_baseline: SystemInstant,
+    pub(crate) time_baseline: SystemInstant,
 }
 
 impl fmt::Debug for PacketizerImpl {
@@ -83,7 +102,12 @@ impl fmt::Debug for PacketizerImpl {
     }
 }
 
+/// Builds a packetizer for one outbound stream.
+///
+/// Ties together the codec's payloader, a sequencer, and the SSRC, payload type, MTU and clock
+/// rate the stream was negotiated with.
 pub fn new_packetizer(
+    now: Instant,
     mtu: usize,
     payload_type: u8,
     ssrc: u32,
@@ -100,8 +124,7 @@ pub fn new_packetizer(
         timestamp: rand::random::<u32>(),
         clock_rate,
         abs_send_time_ext_id: 0,
-        time_gen: None,
-        time_baseline: SystemInstant::now(),
+        time_baseline: SystemInstant::now(now),
     }
 }
 
@@ -110,7 +133,7 @@ impl Packetizer for PacketizerImpl {
         self.abs_send_time_ext_id = id
     }
 
-    fn packetize(&mut self, payload: &Bytes, samples: u32) -> Result<Vec<Packet>> {
+    fn packetize(&mut self, now: Instant, payload: &Bytes, samples: u32) -> Result<Vec<Packet>> {
         let payloads = self.payloader.payload(self.mtu - 12, payload)?;
         let payloads_len = payloads.len();
         let mut packets = Vec::with_capacity(payloads_len);
@@ -134,11 +157,6 @@ impl Packetizer for PacketizerImpl {
         self.timestamp = self.timestamp.wrapping_add(samples);
 
         if payloads_len != 0 && self.abs_send_time_ext_id != 0 {
-            let now = if let Some(fn_time_gen) = &self.time_gen {
-                fn_time_gen()
-            } else {
-                Instant::now()
-            };
             let send_time = AbsSendTimeExtension::new(self.time_baseline.ntp(now));
             //apply http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
             let mut raw = BytesMut::with_capacity(send_time.marshal_size());

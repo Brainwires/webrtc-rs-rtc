@@ -1,3 +1,12 @@
+//! Reading Opus audio from an Ogg container.
+//!
+//! An Ogg stream is a sequence of pages; the first two carry the Opus headers (`OpusHead`, then
+//! `OpusTags`), and the rest carry audio packets. [`OggReader`](crate::io::ogg_reader::OggReader) walks the pages and hands back
+//! one Opus packet at a time, which is exactly the unit RTP carries.
+//!
+//! The `OpusHead` fields worth noting are [`pre_skip`](crate::io::ogg_reader::OggHeader::pre_skip) — decoder warm-up
+//! samples to discard — and [`sample_rate`](crate::io::ogg_reader::OggHeader::sample_rate), which records the *original*
+//! input rate; Opus itself always decodes at 48 kHz.
 #[cfg(test)]
 mod ogg_reader_test;
 
@@ -9,18 +18,29 @@ use bytes::BytesMut;
 use crate::io::ResetFn;
 use shared::error::{Error, Result};
 
+/// Page header flag: this page continues a packet from the previous page.
 pub const PAGE_HEADER_TYPE_CONTINUATION_OF_STREAM: u8 = 0x00;
+/// Page header flag: the first page of a logical stream.
 pub const PAGE_HEADER_TYPE_BEGINNING_OF_STREAM: u8 = 0x02;
+/// Page header flag: the last page of a logical stream.
 pub const PAGE_HEADER_TYPE_END_OF_STREAM: u8 = 0x04;
+/// The recommended Opus pre-skip: 3840 samples (80 ms at 48 kHz) of decoder warm-up to
+/// discard.
 pub const DEFAULT_PRE_SKIP: u16 = 3840; // 3840 recommended in the RFC
+/// The four-byte signature that begins every Ogg page.
 pub const PAGE_HEADER_SIGNATURE: &[u8] = b"OggS";
+/// The signature of the Opus identification header.
 pub const ID_PAGE_SIGNATURE: &[u8] = b"OpusHead";
+/// The signature of the Opus comment header.
 pub const COMMENT_PAGE_SIGNATURE: &[u8] = b"OpusTags";
+/// The fixed part of an Ogg page header, in bytes, before the segment table.
 pub const PAGE_HEADER_SIZE: usize = 27;
+/// The size of the `OpusHead` payload in bytes.
 pub const ID_PAGE_PAYLOAD_SIZE: usize = 19;
 
 /// Header type classification for Opus pages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OggHeaderType {
     /// OpusHead - Opus ID page
     OpusHead,
@@ -41,14 +61,23 @@ pub struct OggReader<R: Read> {
 /// <https://tools.ietf.org/html/rfc7845.html#section-3>
 #[derive(Debug, Clone)]
 pub struct OggHeader {
+    /// The channel mapping family, which says how channels map to speakers.
     pub channel_map: u8,
+    /// The channel count.
     pub channels: u8,
+    /// A gain in Q7.8 dB to apply when decoding.
     pub output_gain: u16,
+    /// Samples to discard from the start of the stream — decoder warm-up.
     pub pre_skip: u16,
+    /// The original input sample rate. Opus always decodes at 48 kHz regardless.
     pub sample_rate: u32,
+    /// The `OpusHead` version, currently 1.
     pub version: u8,
+    /// The number of Opus streams, for mapping families above 0.
     pub stream_count: u8,
+    /// How many of those streams are coupled stereo pairs.
     pub coupled_count: u8,
+    /// Which stream channel feeds each output channel.
     pub channel_mapping: Vec<u8>,
 }
 
@@ -56,14 +85,18 @@ pub struct OggHeader {
 /// <https://www.xiph.org/vorbis/doc/v-comment.html>
 #[derive(Debug, Clone, Default)]
 pub struct OpusTags {
+    /// The encoder that produced the file.
     pub vendor: String,
+    /// Metadata tags from the `OpusTags` header.
     pub user_comments: Vec<UserComment>,
 }
 
 /// A key-value pair from Vorbis comments
 #[derive(Debug, Clone)]
 pub struct UserComment {
+    /// The tag name, such as `TITLE` or `ARTIST`.
     pub comment: String,
+    /// The tag value.
     pub value: String,
 }
 
@@ -72,6 +105,7 @@ pub struct UserComment {
 /// <https://tools.ietf.org/html/rfc7845.html#section-1>
 #[derive(Debug, Clone)]
 pub struct OggPageHeader {
+    /// The page's granule position: total decoded samples at 48 kHz through this page.
     pub granule_position: u64,
     /// Serial number of the logical bitstream (track)
     pub serial: u32,
@@ -306,6 +340,11 @@ impl<R: Read> OggReader<R> {
 
     // parse_next_page reads from stream and returns Ogg page payload, header,
     // and an error if there is incomplete page data.
+    /// Reads the next Ogg page, returning its payload and header.
+    ///
+    /// # Errors
+    ///
+    /// Fails on an I/O error, at end of stream, or if the page signature or checksum is wrong.
     pub fn parse_next_page(&mut self) -> Result<(BytesMut, OggPageHeader)> {
         let mut h = [0u8; PAGE_HEADER_SIZE];
         self.reader.read_exact(&mut h)?;

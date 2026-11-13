@@ -7,8 +7,8 @@
 //! - Properly tracks stream binding/unbinding
 
 use rtc_interceptor::{
-    Interceptor, NackGeneratorBuilder, NackResponderBuilder, Packet, RTCPFeedback, Registry,
-    StreamInfo, TaggedPacket,
+    AttributedPacket, Interceptor, NackGeneratorBuilder, NackResponderBuilder, Packet,
+    RTCPFeedback, Registry, Slot, StreamInfo, TaggedPacket,
 };
 use sansio::Protocol;
 use shared::TransportContext;
@@ -28,7 +28,7 @@ fn create_rtp_packet(ssrc: u32, seq: u16, timestamp: u32, payload_len: usize) ->
     TaggedPacket {
         now: Instant::now(),
         transport: TransportContext::default(),
-        message: Packet::Rtp(rtp::Packet {
+        message: AttributedPacket::new(Packet::Rtp(rtp::Packet {
             header: rtp::header::Header {
                 ssrc,
                 sequence_number: seq,
@@ -37,7 +37,7 @@ fn create_rtp_packet(ssrc: u32, seq: u16, timestamp: u32, payload_len: usize) ->
                 ..Default::default()
             },
             payload: payload.into(),
-        }),
+        })),
     }
 }
 
@@ -114,7 +114,7 @@ fn create_nack_packet(
     TaggedPacket {
         now,
         transport: TransportContext::default(),
-        message: Packet::Rtcp(vec![Box::new(nack)]),
+        message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(nack)])),
     }
 }
 
@@ -126,6 +126,7 @@ fn create_nack_packet(
 fn test_nack_generator_detects_packet_loss() {
     let mut chain = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
@@ -155,7 +156,7 @@ fn test_nack_generator_detects_packet_loss() {
     // Check for NACK in output
     let mut nack_found = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(nack) = rtcp_pkt
                     .as_any()
@@ -176,6 +177,7 @@ fn test_nack_generator_detects_packet_loss() {
 fn test_nack_generator_no_nack_for_sequential_packets() {
     let mut chain = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
@@ -205,7 +207,7 @@ fn test_nack_generator_no_nack_for_sequential_packets() {
     // Should not have any NACK
     let mut nack_found = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if rtcp_pkt
                     .as_any()
@@ -229,6 +231,7 @@ fn test_nack_generator_no_nack_for_sequential_packets() {
 fn test_nack_generator_ignores_streams_without_nack_support() {
     let mut chain = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
@@ -257,7 +260,7 @@ fn test_nack_generator_ignores_streams_without_nack_support() {
     // Should not generate NACK for unsupported stream
     let mut nack_found = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if rtcp_pkt
                     .as_any()
@@ -284,7 +287,10 @@ fn test_nack_generator_ignores_streams_without_nack_support() {
 #[test]
 fn test_nack_responder_retransmits_packet() {
     let mut chain = Registry::new()
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
 
     let ssrc = 0xABCDEF00;
@@ -301,7 +307,7 @@ fn test_nack_responder_retransmits_packet() {
     // Drain written RTP packets
     let mut sent_packets = Vec::new();
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtp(rtp) = &pkt.message {
+        if let Packet::Rtp(rtp) = &pkt.message.packet {
             sent_packets.push(rtp.header.sequence_number);
         }
     }
@@ -327,7 +333,7 @@ fn test_nack_responder_retransmits_packet() {
     // Check for retransmitted packets
     let mut retransmitted = Vec::new();
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtp(rtp) = &pkt.message {
+        if let Packet::Rtp(rtp) = &pkt.message.packet {
             retransmitted.push(rtp.header.sequence_number);
         }
     }
@@ -347,7 +353,10 @@ fn test_nack_responder_retransmits_packet() {
 #[test]
 fn test_nack_responder_rtx_retransmission() {
     let mut chain = Registry::new()
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
 
     let ssrc = 0xABCDEF00;
@@ -384,11 +393,16 @@ fn test_nack_responder_rtx_retransmission() {
     // Check for RTX retransmission
     let mut rtx_found = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtp(rtp) = &pkt.message
+        if let Packet::Rtp(rtp) = &pkt.message.packet
             && rtp.header.ssrc == rtx_ssrc
             && rtp.header.payload_type == rtx_pt
         {
             rtx_found = true;
+            // The first thing any receiver checks: a version != 2 packet is
+            // discarded before ssrc, payload type or payload are ever looked
+            // at, so an RTX packet built from a defaulted header (version 0)
+            // passes every assertion below while being useless on the wire.
+            assert_eq!(rtp.header.version, 2, "RTX packet must be RTP version 2");
             // RTX payload should contain original sequence number
             assert!(rtp.payload.len() >= 2);
             let original_seq = u16::from_be_bytes([rtp.payload[0], rtp.payload[1]]);
@@ -402,7 +416,10 @@ fn test_nack_responder_rtx_retransmission() {
 #[test]
 fn test_nack_responder_ignores_expired_packets() {
     let mut chain = Registry::new()
-        .with(NackResponderBuilder::new().with_size(4).build()) // Small buffer
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(4).build(),
+        ) // Small buffer
         .build();
 
     let ssrc = 0xABCDEF00;
@@ -435,7 +452,7 @@ fn test_nack_responder_ignores_expired_packets() {
     // Should not retransmit expired packet
     let mut retransmit_count = 0;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtp(rtp) = &pkt.message
+        if let Packet::Rtp(rtp) = &pkt.message.packet
             && rtp.header.sequence_number == 0
         {
             retransmit_count += 1;
@@ -457,12 +474,16 @@ fn test_combined_nack_generator_and_responder() {
     // Build chain with both generator (for receiving) and responder (for sending)
     let mut chain = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
                 .build(),
         )
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
 
     let local_ssrc = 0x11111111;
@@ -499,7 +520,7 @@ fn test_combined_nack_generator_and_responder() {
     // Should generate NACK for missing packets 3, 4 from remote
     let mut nack_generated = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(nack) = rtcp_pkt
                     .as_any()
@@ -534,7 +555,7 @@ fn test_combined_nack_generator_and_responder() {
     // Should retransmit local packet 2
     let mut retransmitted = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtp(rtp) = &pkt.message
+        if let Packet::Rtp(rtp) = &pkt.message.packet
             && rtp.header.ssrc == local_ssrc
             && rtp.header.sequence_number == 2
         {
@@ -552,12 +573,16 @@ fn test_combined_nack_generator_and_responder() {
 fn test_nack_unbind_stops_processing() {
     let mut chain = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
                 .build(),
         )
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
 
     let local_ssrc = 0x11111111;
@@ -600,7 +625,7 @@ fn test_nack_unbind_stops_processing() {
     // No NACK should be generated for unbound stream
     let mut nack_found = false;
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if rtcp_pkt
                     .as_any()
@@ -624,6 +649,7 @@ fn test_nack_unbind_stops_processing() {
 fn test_nack_multiple_streams() {
     let mut chain = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
@@ -664,7 +690,7 @@ fn test_nack_multiple_streams() {
     let mut audio_nack = false;
 
     while let Some(pkt) = chain.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(nack) = rtcp_pkt
                     .as_any()
@@ -712,7 +738,10 @@ fn test_nack_example_simulation() {
     // === SENDER SETUP ===
     // Sender uses NACK Responder to buffer packets and respond to NACKs
     let mut sender = Registry::new()
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
 
     sender.bind_local_stream(&nack_stream_info(SSRC));
@@ -721,6 +750,7 @@ fn test_nack_example_simulation() {
     // Receiver uses NACK Generator to detect packet loss and generate NACKs
     let mut receiver = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
@@ -741,7 +771,7 @@ fn test_nack_example_simulation() {
 
         // Collect sent packet sequence numbers
         while let Some(out_pkt) = sender.poll_write() {
-            if let Packet::Rtp(rtp) = &out_pkt.message {
+            if let Packet::Rtp(rtp) = &out_pkt.message.packet {
                 sent_seqs.push(rtp.header.sequence_number);
             }
         }
@@ -773,7 +803,7 @@ fn test_nack_example_simulation() {
     // Collect NACK packets from receiver
     let mut nack_packets = Vec::new();
     while let Some(pkt) = receiver.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(nack) = rtcp_pkt
                     .as_any()
@@ -819,7 +849,7 @@ fn test_nack_example_simulation() {
         let nack_pkt = TaggedPacket {
             now: base_time,
             transport: TransportContext::default(),
-            message: Packet::Rtcp(vec![Box::new(nack.clone())]),
+            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(nack.clone())])),
         };
         sender.handle_read(nack_pkt).unwrap();
     }
@@ -830,7 +860,7 @@ fn test_nack_example_simulation() {
     // Collect retransmitted packets from sender
     let mut retransmitted_seqs = Vec::new();
     while let Some(pkt) = sender.poll_write() {
-        if let Packet::Rtp(rtp) = &pkt.message {
+        if let Packet::Rtp(rtp) = &pkt.message.packet {
             retransmitted_seqs.push(rtp.header.sequence_number);
         }
     }
@@ -860,7 +890,10 @@ fn test_nack_example_with_rtx() {
 
     // === SENDER SETUP WITH RTX ===
     let mut sender = Registry::new()
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
 
     sender.bind_local_stream(&nack_rtx_stream_info(SSRC, RTX_SSRC, RTX_PT));
@@ -868,6 +901,7 @@ fn test_nack_example_with_rtx() {
     // === RECEIVER SETUP ===
     let mut receiver = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
@@ -906,7 +940,7 @@ fn test_nack_example_with_rtx() {
 
     let mut nack_packets = Vec::new();
     while let Some(pkt) = receiver.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = &pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = &pkt.message.packet {
             for rtcp_pkt in rtcp_packets {
                 if let Some(nack) = rtcp_pkt
                     .as_any()
@@ -924,7 +958,7 @@ fn test_nack_example_with_rtx() {
         let nack_pkt = TaggedPacket {
             now: base_time,
             transport: TransportContext::default(),
-            message: Packet::Rtcp(vec![Box::new(nack.clone())]),
+            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(nack.clone())])),
         };
         sender.handle_read(nack_pkt).unwrap();
     }
@@ -934,7 +968,7 @@ fn test_nack_example_with_rtx() {
     // Collect RTX retransmissions
     let mut rtx_packets = Vec::new();
     while let Some(pkt) = sender.poll_write() {
-        if let Packet::Rtp(rtp) = pkt.message {
+        if let Packet::Rtp(rtp) = pkt.message.packet {
             rtx_packets.push(rtp);
         }
     }
@@ -979,12 +1013,16 @@ fn test_continuous_stream_with_nack_recovery() {
     const TOTAL_PACKETS: u16 = 100;
 
     let mut sender = Registry::new()
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
     sender.bind_local_stream(&nack_stream_info(SSRC));
 
     let mut receiver = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(20))
@@ -1033,19 +1071,19 @@ fn test_continuous_stream_with_nack_recovery() {
 
             // Collect NACKs from receiver and forward to sender
             while let Some(nack_pkt) = receiver.poll_write() {
-                if let Packet::Rtcp(rtcp_packets) = nack_pkt.message {
+                if let Packet::Rtcp(rtcp_packets) = nack_pkt.message.packet {
                     // Forward NACK to sender
                     let sender_nack = TaggedPacket {
                         now: pkt_time,
                         transport: TransportContext::default(),
-                        message: Packet::Rtcp(rtcp_packets),
+                        message: AttributedPacket::new(Packet::Rtcp(rtcp_packets)),
                     };
                     sender.handle_read(sender_nack).unwrap();
                     while sender.poll_read().is_some() {}
 
                     // Collect retransmissions from sender
                     while let Some(retrans_pkt) = sender.poll_write() {
-                        if let Packet::Rtp(rtp) = &retrans_pkt.message {
+                        if let Packet::Rtp(rtp) = &retrans_pkt.message.packet {
                             // Mark as received via retransmission
                             received_seqs.insert(rtp.header.sequence_number);
                         }
@@ -1060,17 +1098,17 @@ fn test_continuous_stream_with_nack_recovery() {
     receiver.handle_timeout(final_time).unwrap();
 
     while let Some(nack_pkt) = receiver.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = nack_pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = nack_pkt.message.packet {
             let sender_nack = TaggedPacket {
                 now: final_time,
                 transport: TransportContext::default(),
-                message: Packet::Rtcp(rtcp_packets),
+                message: AttributedPacket::new(Packet::Rtcp(rtcp_packets)),
             };
             sender.handle_read(sender_nack).unwrap();
             while sender.poll_read().is_some() {}
 
             while let Some(retrans_pkt) = sender.poll_write() {
-                if let Packet::Rtp(rtp) = &retrans_pkt.message {
+                if let Packet::Rtp(rtp) = &retrans_pkt.message.packet {
                     received_seqs.insert(rtp.header.sequence_number);
                 }
             }
@@ -1111,12 +1149,16 @@ fn test_nack_sequence_wraparound() {
     const SSRC: u32 = 5000;
 
     let mut sender = Registry::new()
-        .with(NackResponderBuilder::new().with_size(512).build())
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
         .build();
     sender.bind_local_stream(&nack_stream_info(SSRC));
 
     let mut receiver = Registry::new()
         .with(
+            Slot::NackGenerator,
             NackGeneratorBuilder::new()
                 .with_size(512)
                 .with_interval(Duration::from_millis(50))
@@ -1157,7 +1199,7 @@ fn test_nack_sequence_wraparound() {
 
     let mut nacked_seqs = Vec::new();
     while let Some(pkt) = receiver.poll_write() {
-        if let Packet::Rtcp(rtcp_packets) = pkt.message {
+        if let Packet::Rtcp(rtcp_packets) = pkt.message.packet {
             for rtcp_pkt in &rtcp_packets {
                 if let Some(nack) = rtcp_pkt
                     .as_any()
@@ -1180,7 +1222,7 @@ fn test_nack_sequence_wraparound() {
             let nack_pkt = TaggedPacket {
                 now: base_time,
                 transport: TransportContext::default(),
-                message: Packet::Rtcp(rtcp_packets),
+                message: AttributedPacket::new(Packet::Rtcp(rtcp_packets)),
             };
             sender.handle_read(nack_pkt).unwrap();
         }
@@ -1191,7 +1233,7 @@ fn test_nack_sequence_wraparound() {
     // Collect retransmissions
     let mut retransmitted = Vec::new();
     while let Some(pkt) = sender.poll_write() {
-        if let Packet::Rtp(rtp) = &pkt.message {
+        if let Packet::Rtp(rtp) = &pkt.message.packet {
             retransmitted.push(rtp.header.sequence_number);
         }
     }
@@ -1213,5 +1255,71 @@ fn test_nack_sequence_wraparound() {
     println!(
         "Wraparound test successful: lost {:?}, nacked {:?}, retransmitted {:?}",
         lost_seqs, nacked_seqs, retransmitted
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// CC-PRE-02 — retransmissions are tagged
+// ---------------------------------------------------------------------------------------
+
+/// A retransmission is a *separate transmission* consuming separate bandwidth, and a send history
+/// has to count it as such. Without the tag the history cannot tell one from an original, and an
+/// estimator that under-counts bytes during loss infers headroom and raises the target — a positive
+/// feedback loop that is hard to diagnose, because the estimator's own accounting stays internally
+/// consistent the whole way down.
+///
+/// This asserts the retransmission carries [`Attribute::Retransmission`] and the original does not.
+#[test]
+fn a_retransmission_is_tagged_and_an_original_is_not() {
+    use rtc_interceptor::Attribute;
+
+    const SSRC: u32 = 0x8899_AABB;
+    let epoch = Instant::now();
+
+    let mut chain = Registry::new()
+        .with(Slot::NackResponder, NackResponderBuilder::new().build())
+        .build();
+    chain.bind_local_stream(&nack_stream_info(SSRC));
+
+    // Send one packet, so the responder has something buffered to retransmit.
+    chain
+        .handle_write(create_rtp_packet_with_time(epoch, SSRC, 1, 1000, 100))
+        .expect("write");
+    let original = chain.poll_write().expect("the original goes out");
+    assert!(
+        !original.message.has(&Attribute::Retransmission),
+        "a first transmission must not be tagged as a retransmission"
+    );
+    while chain.poll_write().is_some() {}
+
+    // Ask for it back.
+    chain
+        .handle_read(create_nack_packet(
+            epoch,
+            0,
+            SSRC,
+            vec![rtcp::transport_feedbacks::transport_layer_nack::NackPair {
+                packet_id: 1,
+                lost_packets: 0,
+            }],
+        ))
+        .expect("read");
+    while chain.poll_read().is_some() {}
+
+    let mut retransmissions = 0;
+    while let Some(packet) = chain.poll_write() {
+        if let Packet::Rtp(ref rtp) = packet.message.packet {
+            assert_eq!(1, rtp.header.sequence_number);
+            assert!(
+                packet.message.has(&Attribute::Retransmission),
+                "a packet sent in answer to a NACK must carry Attribute::Retransmission, or a \
+                 send history counts it as an original and under-reports the bytes on the wire"
+            );
+            retransmissions += 1;
+        }
+    }
+    assert_eq!(
+        1, retransmissions,
+        "the responder should have retransmitted exactly the packet that was asked for"
     );
 }

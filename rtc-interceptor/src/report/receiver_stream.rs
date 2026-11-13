@@ -19,12 +19,15 @@ pub(crate) struct ReceiverStream {
     /// With size=128, total capacity is 128 * 64 = 8192 packets.
     packets: Vec<u64>,
     size: usize,
-    started: bool,
+    /// `size * PACKETS_PER_ENTRY - 1`. The bitmap capacity is a power of two, so
+    /// packets are indexed with `& index_mask` instead of `% (size * ...)`, which
+    /// the compiler would otherwise lower to a hardware division on every packet.
+    index_mask: usize,
     seq_num_cycles: u16,
     last_seq_num: u16,
     last_report_seq_num: u16,
     last_rtp_time_rtp: u32,
-    last_rtp_time_time: Instant,
+    last_rtp_time_time: Option<Instant>,
     jitter: f64,
     last_sender_report: u32,
     last_sender_report_time: Option<Instant>,
@@ -41,12 +44,12 @@ impl ReceiverStream {
 
             packets: vec![0u64; DEFAULT_SIZE],
             size: DEFAULT_SIZE,
-            started: false,
+            index_mask: DEFAULT_SIZE * PACKETS_PER_ENTRY - 1,
             seq_num_cycles: 0,
             last_seq_num: 0,
             last_report_seq_num: 0,
             last_rtp_time_rtp: 0,
-            last_rtp_time_time: Instant::now(),
+            last_rtp_time_time: None,
             jitter: 0.0,
             last_sender_report: 0,
             last_sender_report_time: None,
@@ -55,32 +58,24 @@ impl ReceiverStream {
     }
 
     fn set_received(&mut self, seq: u16) {
-        let pos = (seq as usize) % (self.size * PACKETS_PER_ENTRY);
+        let pos = (seq as usize) & self.index_mask;
         self.packets[pos / PACKETS_PER_ENTRY] |= 1 << (pos % PACKETS_PER_ENTRY);
     }
 
     fn del_received(&mut self, seq: u16) {
-        let pos = (seq as usize) % (self.size * PACKETS_PER_ENTRY);
+        let pos = (seq as usize) & self.index_mask;
         self.packets[pos / PACKETS_PER_ENTRY] &= !(1u64 << (pos % PACKETS_PER_ENTRY));
     }
 
     fn get_received(&self, seq: u16) -> bool {
-        let pos = (seq as usize) % (self.size * PACKETS_PER_ENTRY);
+        let pos = (seq as usize) & self.index_mask;
         (self.packets[pos / PACKETS_PER_ENTRY] & (1 << (pos % PACKETS_PER_ENTRY))) != 0
     }
 
     pub(crate) fn process_rtp(&mut self, now: Instant, pkt: &rtp::packet::Packet) {
         let seq = pkt.header.sequence_number;
 
-        if !self.started {
-            // first frame
-            self.started = true;
-            self.set_received(seq);
-            self.last_seq_num = seq;
-            self.last_report_seq_num = seq.wrapping_sub(1);
-            self.last_rtp_time_rtp = pkt.header.timestamp;
-            self.last_rtp_time_time = now;
-        } else {
+        if let Some(last_rtp_time_time) = self.last_rtp_time_time {
             // following frames
             self.set_received(seq);
 
@@ -105,13 +100,19 @@ impl ReceiverStream {
 
             // compute jitter
             // https://tools.ietf.org/html/rfc3550#page-39
-            let d = now.duration_since(self.last_rtp_time_time).as_secs_f64() * self.clock_rate
-                - (pkt.header.timestamp as f64 - self.last_rtp_time_rtp as f64);
+            // u32 ts wraps: signed diff, not a ~2^32 jump
+            let d = now.duration_since(last_rtp_time_time).as_secs_f64() * self.clock_rate
+                - pkt.header.timestamp.wrapping_sub(self.last_rtp_time_rtp) as i32 as f64;
             self.jitter += (d.abs() - self.jitter) / 16.0;
-
-            self.last_rtp_time_rtp = pkt.header.timestamp;
-            self.last_rtp_time_time = now;
+        } else {
+            // first frame
+            self.set_received(seq);
+            self.last_seq_num = seq;
+            self.last_report_seq_num = seq.wrapping_sub(1);
         }
+
+        self.last_rtp_time_rtp = pkt.header.timestamp;
+        self.last_rtp_time_time = Some(now);
     }
 
     pub(crate) fn process_sender_report(
@@ -278,6 +279,31 @@ mod tests {
         assert_eq!(rr.reports[0].total_lost, 0);
         assert_eq!(rr.reports[0].delay, 0);
         assert_eq!(rr.reports[0].jitter, 0);
+    }
+
+    #[test]
+    fn test_receiver_stream_jitter_ts_wrap() {
+        // steady 20 ms at 48 khz across u32::MAX: was ~2^32 / 16
+        let mut stream = ReceiverStream::new(123456, 48000);
+        let now = Instant::now();
+        for i in 0..4u16 {
+            let ts = (u32::MAX - 1919).wrapping_add(960 * i as u32);
+            stream.process_rtp(
+                now + Duration::from_millis(20 * i as u64),
+                &make_rtp_packet(i, ts),
+            );
+        }
+        assert_eq!(stream.generate_report(now).reports[0].jitter, 0);
+    }
+
+    #[test]
+    fn test_receiver_stream_jitter_delay_across_ts_wrap() {
+        // 100 ms late right after the wrap: d = 4800, jitter = 4800 / 16
+        let mut stream = ReceiverStream::new(123456, 48000);
+        let now = Instant::now();
+        stream.process_rtp(now, &make_rtp_packet(1, u32::MAX - 959));
+        stream.process_rtp(now + Duration::from_millis(120), &make_rtp_packet(2, 0));
+        assert_eq!(stream.generate_report(now).reports[0].jitter, 300);
     }
 
     #[test]

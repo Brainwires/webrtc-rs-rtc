@@ -1,17 +1,39 @@
+//! TURN's STUN attributes and ChannelData framing.
+//!
+//! TURN is defined as a set of STUN methods and attributes, so these build on
+//! [`rtc-stun`](https://docs.rs/rtc-stun). The attributes name the relay's parts:
+//! [`relayaddr`](crate::proto::relayaddr) the allocated public address, [`peeraddr`](crate::proto::peeraddr) the far end, [`lifetime`](crate::proto::lifetime) the
+//! allocation's expiry, [`data`](crate::proto::data) the relayed payload.
+//!
+//! [`chandata`](crate::proto::chandata) is the exception — a ChannelData message is not STUN at all, but a compact
+//! four-byte framing that replaces the 36-byte Send/Data indication header once a channel is
+//! bound. Its [`channum`](crate::proto::channum) range is chosen so the two can be told apart on a shared port.
 #[cfg(test)]
 mod proto_test;
 
+/// Address helpers and the five-tuple that identifies an allocation.
 pub mod addr;
+/// ChannelData messages — the compact 4-byte framing for relayed data.
 pub mod chandata;
+/// The `CHANNEL-NUMBER` attribute.
 pub mod channum;
+/// The `DATA` attribute, which carries relayed payloads in Send/Data indications.
 pub mod data;
+/// The `DONT-FRAGMENT` attribute, asking the server to set DF on relayed packets.
 pub mod dontfrag;
+/// The `EVEN-PORT` attribute, requesting an even relayed port (for RTP/RTCP pairs).
 pub mod evenport;
+/// The `LIFETIME` attribute, which sets and reports allocation expiry.
 pub mod lifetime;
+/// The `XOR-PEER-ADDRESS` attribute, naming the peer in permission and data messages.
 pub mod peeraddr;
+/// The `XOR-RELAYED-ADDRESS` attribute, which reports the allocated public address.
 pub mod relayaddr;
+/// The `REQUESTED-ADDRESS-FAMILY` attribute, for asking for an IPv4 or IPv6 allocation.
 pub mod reqfamily;
+/// The `REQUESTED-TRANSPORT` attribute, which selects the relay's transport to peers.
 pub mod reqtrans;
+/// The `RESERVATION-TOKEN` attribute, used to claim a previously reserved port.
 pub mod rsrvtoken;
 
 use std::fmt;

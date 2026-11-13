@@ -7,6 +7,7 @@ use rtc_ice::agent::Agent;
 use rtc_ice::agent::agent_config::AgentConfig;
 use rtc_ice::candidate::candidate_host::CandidateHostConfig;
 use rtc_ice::candidate::*;
+use rtc_ice::crypto;
 use rtc_ice::state::*;
 use rtc_ice::{Credentials, Event};
 use sansio::Protocol;
@@ -163,11 +164,15 @@ async fn main() -> Result<(), Error> {
 
     let port = if cli.controlling { 4000 } else { 4001 };
     let udp_socket = UdpSocket::bind(("0.0.0.0", port)).await?;
-    let mut ice_agent = Agent::new(Arc::new(AgentConfig {
-        disconnected_timeout: Some(Duration::from_secs(5)),
-        failed_timeout: Some(Duration::from_secs(5)),
-        ..Default::default()
-    }))?;
+    let mut ice_agent = Agent::new(
+        Instant::now(),
+        Arc::new(AgentConfig {
+            disconnected_timeout: Some(Duration::from_secs(5)),
+            failed_timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        }),
+        crypto::default_provider().map_err(|e| Error::Other(e.to_string()))?,
+    )?;
 
     let client = Arc::new(Client::new());
 
@@ -263,7 +268,12 @@ async fn main() -> Result<(), Error> {
     let peer_addr = remote_candidate.addr();
     ice_agent.add_remote_candidate(remote_candidate)?;
 
-    ice_agent.start_connectivity_checks(cli.controlling, remote_ufrag, remote_pwd)?;
+    ice_agent.start_connectivity_checks(
+        Instant::now(),
+        cli.controlling,
+        remote_ufrag,
+        remote_pwd,
+    )?;
 
     println!("Enter bye to stop");
     let (mut tx, mut rx) = futures::channel::mpsc::channel(8);
@@ -296,7 +306,7 @@ async fn main() -> Result<(), Error> {
         }
         let mut is_failed = false;
         while let Some(event) = ice_agent.poll_event() {
-            match event {
+            match event.event {
                 Event::ConnectionStateChange(cs) => {
                     println!("ConnectionStateChange with {}", cs);
                     match cs {

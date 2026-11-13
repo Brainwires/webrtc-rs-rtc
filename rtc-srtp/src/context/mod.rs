@@ -7,8 +7,7 @@ mod srtp_test;
 
 use std::collections::HashMap;
 
-use aes::Aes128;
-use aes::Aes256;
+use crypto::RTCCrypto;
 use shared::replay_detector::*;
 
 use crate::cipher::cipher_aead_aes_gcm::*;
@@ -18,7 +17,9 @@ use crate::option::*;
 use crate::protection_profile::*;
 use shared::error::{Error, Result};
 
+/// SRTCP protection and unprotection.
 pub mod srtcp;
+/// SRTP protection and unprotection.
 pub mod srtp;
 
 const MAX_ROC: u32 = u32::MAX;
@@ -103,13 +104,18 @@ pub struct Context {
 }
 
 impl Context {
-    /// CreateContext creates a new SRTP Context
+    /// Creates an SRTP context.
+    ///
+    /// The crypto implementation is supplied by the caller; this crate never resolves a default.
+    /// Borrowed, not owned: it is only needed to build the keyed cipher/MAC objects below, which
+    /// are what the context retains.
     pub fn new(
         master_key: &[u8],
         master_salt: &[u8],
         profile: ProtectionProfile,
         srtp_ctx_opt: Option<ContextOption>,
         srtcp_ctx_opt: Option<ContextOption>,
+        crypto: &dyn RTCCrypto,
     ) -> Result<Context> {
         let key_len = profile.key_len();
         let salt_len = profile.salt_len();
@@ -119,26 +125,29 @@ impl Context {
         } else if master_salt.len() != salt_len {
             return Err(Error::SrtpSaltLength(salt_len, master_salt.len()));
         }
+        profile.ensure_crypto_supported(crypto)?;
 
         let cipher: Box<dyn Cipher> = match profile {
             ProtectionProfile::Aes128CmHmacSha1_32
             | ProtectionProfile::Aes128CmHmacSha1_80
             | ProtectionProfile::Aes256CmHmacSha1_80
-            | ProtectionProfile::Aes256CmHmacSha1_32 => {
-                Box::new(CipherAesCmHmacSha1::new(profile, master_key, master_salt)?)
+            | ProtectionProfile::Aes256CmHmacSha1_32 => Box::new(CipherAesCmHmacSha1::new(
+                profile,
+                master_key,
+                master_salt,
+                crypto,
+            )?),
+
+            ProtectionProfile::AeadAes128Gcm | ProtectionProfile::AeadAes256Gcm => {
+                // `CipherAeadAesGcm::new` selects AES-128 vs AES-256 from the
+                // profile itself, so both GCM profiles share one arm.
+                Box::new(CipherAeadAesGcm::new(
+                    profile,
+                    master_key,
+                    master_salt,
+                    crypto,
+                )?)
             }
-
-            ProtectionProfile::AeadAes128Gcm => Box::new(CipherAeadAesGcm::<Aes128>::new(
-                profile,
-                master_key,
-                master_salt,
-            )?),
-
-            ProtectionProfile::AeadAes256Gcm => Box::new(CipherAeadAesGcm::<Aes256>::new(
-                profile,
-                master_key,
-                master_salt,
-            )?),
         };
 
         let srtp_ctx_opt = if let Some(ctx_opt) = srtp_ctx_opt {
@@ -163,22 +172,29 @@ impl Context {
     }
 
     fn get_srtp_ssrc_state(&mut self, ssrc: u32) -> &mut SrtpSsrcState {
-        let s = SrtpSsrcState {
-            ssrc,
-            replay_detector: Some((self.new_srtp_replay_detector)()),
-            ..Default::default()
-        };
-
-        self.srtp_ssrc_states.entry(ssrc).or_insert(s)
+        // `or_insert_with` so the replay detector (a boxed sliding-window
+        // detector backed by a heap-allocated bit buffer) is only constructed on
+        // the first packet for a given SSRC. `or_insert` would build — and then
+        // immediately drop — a fresh detector on every decrypted packet.
+        let new_srtp_replay_detector = &self.new_srtp_replay_detector;
+        self.srtp_ssrc_states
+            .entry(ssrc)
+            .or_insert_with(|| SrtpSsrcState {
+                ssrc,
+                replay_detector: Some(new_srtp_replay_detector()),
+                ..Default::default()
+            })
     }
 
     fn get_srtcp_ssrc_state(&mut self, ssrc: u32) -> &mut SrtcpSsrcState {
-        let s = SrtcpSsrcState {
-            ssrc,
-            replay_detector: Some((self.new_srtcp_replay_detector)()),
-            ..Default::default()
-        };
-        self.srtcp_ssrc_states.entry(ssrc).or_insert(s)
+        let new_srtcp_replay_detector = &self.new_srtcp_replay_detector;
+        self.srtcp_ssrc_states
+            .entry(ssrc)
+            .or_insert_with(|| SrtcpSsrcState {
+                ssrc,
+                replay_detector: Some(new_srtcp_replay_detector()),
+                ..Default::default()
+            })
     }
 
     /// roc returns SRTP rollover counter value of specified SSRC.

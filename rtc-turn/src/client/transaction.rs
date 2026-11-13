@@ -13,6 +13,20 @@ use stun::textattrs::TextAttribute;
 
 const MAX_RTX_INTERVAL_IN_MS: u64 = 1600;
 const MAX_RTX_COUNT: u16 = 7; // total 7 requests (Rc)
+/// Ti (RFC 8489 §6.2.2): over a reliable transport a request is sent once, and
+/// this is how long the client waits for its answer.
+const RELIABLE_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(39_500);
+
+/// The id the authenticated retry of an Allocate uses: the anonymous request's, one on.
+///
+/// [`Client::allocate`](crate::client::Client::allocate) hands this one to its caller,
+/// because the anonymous request is answered with 401 and it is the retry that carries the
+/// allocation. Everything the caller is told about that allocation names it.
+pub(crate) fn authenticated_allocate_id(attempt: TransactionId) -> TransactionId {
+    let mut tid = attempt;
+    tid.0[TRANSACTION_ID_SIZE - 1] = tid.0[TRANSACTION_ID_SIZE - 1].wrapping_add(1);
+    tid
+}
 
 pub(crate) enum TransactionType {
     BindingRequest,
@@ -25,6 +39,8 @@ pub(crate) enum TransactionType {
 
 // TransactionConfig is a set of config params used by NewTransaction
 pub(crate) struct TransactionConfig {
+    /// The instant the transaction starts, from which its first retransmit deadline is computed.
+    pub(crate) now: Instant,
     pub(crate) transaction_id: TransactionId,
     pub(crate) transaction_type: TransactionType,
     pub(crate) raw: BytesMut,
@@ -60,7 +76,11 @@ impl Transaction {
             transport_protocol: config.transport_protocol,
             n_rtx: 0,
             interval: config.interval,
-            timeout: Instant::now().add(Duration::from_millis(config.interval)),
+            timeout: if is_reliable(config.transport_protocol) {
+                config.now.add(RELIABLE_TRANSACTION_TIMEOUT)
+            } else {
+                config.now.add(Duration::from_millis(config.interval))
+            },
             transmits: VecDeque::new(),
         }
     }
@@ -75,6 +95,13 @@ impl Transaction {
 
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
         if self.retries() < MAX_RTX_COUNT && self.timeout <= now {
+            if is_reliable(self.transport_protocol) {
+                // One deadline and no retransmission: TCP already retransmits, and
+                // repeating the request over it only sends the server duplicates.
+                // Passing Ti exhausts the transaction, which reports the timeout.
+                self.n_rtx = MAX_RTX_COUNT;
+                return;
+            }
             self.n_rtx += 1;
             self.interval *= 2;
             if self.interval > MAX_RTX_INTERVAL_IN_MS {
@@ -119,6 +146,12 @@ impl Transaction {
     }
 }
 
+/// Whether the transport delivers reliably on its own, so a request must not be
+/// retransmitted over it. Anything that is not UDP is a stream.
+fn is_reliable(transport_protocol: TransportProtocol) -> bool {
+    transport_protocol != TransportProtocol::UDP
+}
+
 // TransactionMap is a thread-safe transaction map
 #[derive(Default)]
 pub(crate) struct TransactionMap {
@@ -159,8 +192,18 @@ impl TransactionMap {
         }
 
         for key in keys {
-            self.tr_map.remove(&key);
-            self.events.push_back(Event::TransactionTimeout(key));
+            let exhausted = self.tr_map.remove(&key);
+            // An Allocate nobody answers is the one case where the request on the wire and
+            // the allocation its caller knows have different ids.
+            let timed_out = if matches!(
+                exhausted.as_ref().map(|tr| &tr.transaction_type),
+                Some(TransactionType::AllocateAttempt)
+            ) {
+                authenticated_allocate_id(key)
+            } else {
+                key
+            };
+            self.events.push_back(Event::TransactionTimeout(timed_out));
         }
     }
 

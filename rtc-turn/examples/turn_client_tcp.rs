@@ -4,7 +4,7 @@ use log::trace;
 use rtc_turn::client::*;
 use sansio::Protocol;
 use shared::error::{Error, Result};
-use shared::tcp_framing::{TcpFrameDecoder, frame_packet};
+use shared::turn_framing::TurnStreamDecoder;
 use shared::{TransportContext, TransportMessage, TransportProtocol};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
@@ -97,12 +97,15 @@ fn main() -> Result<()> {
         realm: realm.to_string(),
         software: String::new(),
         rto_in_ms: 0,
+        allocation_refresh_interval_cap: None,
     };
 
-    let mut client = Client::new(cfg)?;
+    let crypto_provider = crypto::default_provider()
+        .map_err(|e| Error::Other(format!("no built-in crypto provider: {e}")))?;
+    let mut client = Client::new(cfg, crypto_provider)?;
 
     // Allocate a relay socket on the TURN server (over TCP).
-    let allocate_tid = client.allocate()?;
+    let allocate_tid = client.allocate(Instant::now())?;
     let mut relayed_addr = None;
 
     let (stop_tx, stop_rx) = crossbeam_channel::unbounded::<()>();
@@ -112,8 +115,9 @@ fn main() -> Result<()> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    // RFC 4571 decoder for inbound TCP frames.
-    let mut decoder = TcpFrameDecoder::new();
+    // TURN over TCP carries its messages back to back with no extra framing
+    // (RFC 8656 §12.5): split the byte stream into STUN / ChannelData messages.
+    let mut decoder = TurnStreamDecoder::new();
     let mut buf = vec![0u8; 4096];
 
     loop {
@@ -126,10 +130,10 @@ fn main() -> Result<()> {
             }
         };
 
-        // Flush outbound TURN messages (each wrapped in a 2-byte length prefix per RFC 4571).
+        // Flush outbound TURN messages. They are self-delimiting, so they go on the
+        // stream as they are (no RFC 4571 length prefix: that is ICE-TCP's framing, not TURN's).
         while let Some(transmit) = client.poll_write() {
-            let framed = frame_packet(&transmit.message);
-            stream_write.write_all(&framed)?;
+            stream_write.write_all(&transmit.message)?;
             trace!(
                 "tcp.sent {} bytes to {}",
                 transmit.message.len(),
@@ -168,9 +172,10 @@ fn main() -> Result<()> {
                     println!("relay read: {:?} from {}", &data[..], from);
                     // Echo back
                     if let Some(&relay_addr) = relayed_addr.as_ref() {
-                        client.relay(relay_addr)?.send_to(&data[..], from)?;
+                        client.relay(relay_addr)?.send_to(Instant::now(), &data[..], from)?;
                     }
                 }
+                _ => {}
             }
         }
 
@@ -185,8 +190,7 @@ fn main() -> Result<()> {
             .checked_duration_since(Instant::now())
             .unwrap_or(Duration::from_secs(0));
 
-        // Non-blocking read from TCP socket.
-        // RFC 4571: each TURN message is prefixed with a 2-byte big-endian length.
+        // Non-blocking read from TCP socket, split into whole TURN messages.
         match read_tcp_input(&mut stream, &mut buf, &mut decoder) {
             Ok(Some(data)) => {
                 trace!("tcp.recv {} bytes from {}", data.len(), peer_addr);
@@ -221,13 +225,13 @@ fn main() -> Result<()> {
     client.close()
 }
 
-/// Read from a non-blocking TCP stream, decode RFC 4571 frames.
+/// Read from a non-blocking TCP stream and split it into TURN messages (RFC 8656 §12.5).
 /// Returns `Ok(Some(data))` with the next complete TURN message payload,
 /// `Ok(None)` if no complete frame is available yet, or `Err` on EOF / fatal error.
 fn read_tcp_input(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
-    decoder: &mut TcpFrameDecoder,
+    decoder: &mut TurnStreamDecoder,
 ) -> std::result::Result<Option<Vec<u8>>, std::io::Error> {
     // Drain available bytes into the decoder.
     loop {
@@ -243,5 +247,7 @@ fn read_tcp_input(
             Err(e) => return Err(e),
         }
     }
-    Ok(decoder.next_packet())
+    decoder
+        .next_message()
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e.to_string()))
 }

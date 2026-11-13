@@ -6,22 +6,24 @@ use crate::checks::*;
 use crate::message::*;
 use shared::error::*;
 
-use crc::{CRC_32_ISO_HDLC, Crc};
+use crc::{CRC_32_ISO_HDLC, Crc, Table};
 
-// FingerprintAttr represents FINGERPRINT attribute.
-//
-// RFC 5389 Section 15.5
+/// FINGERPRINT attribute.
+///
+/// RFC 5389 Section 15.5.
 pub struct FingerprintAttr;
 
-// FINGERPRINT is shorthand for FingerprintAttr.
-//
-// Example:
-//
-//  m := New()
-//  FINGERPRINT.add_to(m)
+/// Shorthand for FingerprintAttr.
+///
+/// Example:
+///
+///  m := New()
+///  FINGERPRINT.add_to(m).
 pub const FINGERPRINT: FingerprintAttr = FingerprintAttr {};
 
+/// The value the CRC-32 is XORed with, `0x5354554e` — ASCII `STUN`.
 pub const FINGERPRINT_XOR_VALUE: u32 = 0x5354554e;
+/// The attribute's value length in bytes.
 pub const FINGERPRINT_SIZE: usize = 4; // 32 bit
 
 // FingerprintValue returns CRC-32 of b XOR-ed by 0x5354554e.
@@ -30,8 +32,16 @@ pub const FINGERPRINT_SIZE: usize = 4; // 32 bit
 // up to (but excluding) the FINGERPRINT attribute itself, XOR'ed with
 // the 32-bit value 0x5354554e (the XOR helps in cases where an
 // application packet is also using CRC-32 in it).
+/// CRC-32 (ISO-HDLC) engine, built once at compile time.
+///
+/// `Crc::new` computes the lookup table; doing that per call made the table
+/// build cost more than the checksum itself for typical ~100-byte STUN
+/// messages (one fingerprint per ICE connectivity check / consent probe).
+static CRC_32: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISO_HDLC);
+
+/// Computes the `FINGERPRINT` value over `b`: CRC-32 XORed with [`FINGERPRINT_XOR_VALUE`].
 pub fn fingerprint_value(b: &[u8]) -> u32 {
-    let checksum = Crc::<u32>::new(&CRC_32_ISO_HDLC).checksum(b);
+    let checksum = CRC_32.checksum(b);
     checksum ^ FINGERPRINT_XOR_VALUE // XOR
 }
 
@@ -51,8 +61,8 @@ impl Setter for FingerprintAttr {
 }
 
 impl FingerprintAttr {
-    // Check reads fingerprint value from m and checks it, returning error if any.
-    // Can return *AttrLengthErr, ErrAttributeNotFound, and *CRCMismatch.
+    /// Check reads fingerprint value from m and checks it, returning error if any.
+    /// Can return *AttrLengthErr, ErrAttributeNotFound, and *CRCMismatch.
     pub fn check(&self, m: &Message) -> Result<()> {
         let b = m.get(ATTR_FINGERPRINT)?;
         check_size(ATTR_FINGERPRINT, b.len(), FINGERPRINT_SIZE)?;

@@ -1,4 +1,5 @@
 #![warn(rust_2018_idioms)]
+#![warn(missing_docs)]
 #![allow(dead_code)]
 
 //! Package rtcp implements encoding and decoding of RTCP packets according to RFCs 3550 and 5506.
@@ -14,44 +15,75 @@
 //! in a streaming multimedia session. An application may use this information to control quality of
 //! service parameters, perhaps by limiting flow, or using a different codec.
 //!
-//! Decoding RTCP packets:
-//!```nobuild
-//!     let pkt = rtcp::unmarshal(&rtcp_data).unwrap();
+//! # Decoding RTCP packets
 //!
-//!     if let Some(e) = pkt
-//!          .as_any()
-//!          .downcast_ref::<PictureLossIndication>()
-//!      {
+//! One datagram may hold several packets — RTCP is compound — so [`packet::unmarshal`]
+//! consumes the buffer and returns them all. Recover each concrete type by downcasting:
 //!
-//!      }
-//!     else if let Some(e) = packet
-//!          .as_any()
-//!          .downcast_ref::<Goodbye>(){}
-//!     ....
-//!```
+//! ```
+//! use bytes::Bytes;
+//! use rtc_rtcp::goodbye::Goodbye;
+//! use rtc_rtcp::packet::unmarshal;
+//! use rtc_rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 //!
-//! Encoding RTCP packets:
-//!```nobuild
-//!     let pkt = PictureLossIndication{
-//!         sender_ssrc: sender_ssrc,
-//!         media_ssrc: media_ssrc
-//!     };
+//! # fn example(rtcp_data: Bytes) -> Result<(), Box<dyn std::error::Error>> {
+//! let mut buf = rtcp_data;
+//! for packet in unmarshal(&mut buf)? {
+//!     if let Some(pli) = packet.as_any().downcast_ref::<PictureLossIndication>() {
+//!         println!("keyframe requested for ssrc {}", pli.media_ssrc);
+//!     } else if let Some(bye) = packet.as_any().downcast_ref::<Goodbye>() {
+//!         println!("{:?} left the session", bye.sources);
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
 //!
-//!     let pli_data = pkt.marshal().unwrap();
-//!     // ...
-//!```
+//! # Encoding RTCP packets
+//!
+//! Every packet type implements [`Marshal`](shared::marshal::Marshal), so that trait must be
+//! in scope:
+//!
+//! ```
+//! use rtc_rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+//! use shared::marshal::Marshal;
+//!
+//! # fn example(sender_ssrc: u32, media_ssrc: u32) -> Result<(), Box<dyn std::error::Error>> {
+//! let pli = PictureLossIndication {
+//!     sender_ssrc,
+//!     media_ssrc,
+//! };
+//! let pli_data = pli.marshal()?;
+//! # Ok(())
+//! # }
+//! ```
 
+/// Compound RTCP packets — the several reports that share one datagram.
 pub mod compound_packet;
+/// Extended reports (XR, [RFC 3611]): loss/discard run lengths, receipt times and per-block
+/// statistics.
+///
+/// [RFC 3611]: https://datatracker.ietf.org/doc/html/rfc3611
 pub mod extended_report;
+/// The BYE packet, by which a source announces it is leaving.
 pub mod goodbye;
+/// The four-byte header common to every RTCP packet.
 pub mod header;
+/// The [`Packet`] trait every RTCP packet type implements.
 pub mod packet;
+/// Payload-specific feedback (PT 206): PLI, FIR, SLI and REMB.
 pub mod payload_feedbacks;
+/// An unparsed packet, used for types this crate does not model.
 pub mod raw_packet;
+/// The Receiver Report (RR), which reports reception quality back to a sender.
 pub mod receiver_report;
+/// The reception report block carried inside SR and RR packets.
 pub mod reception_report;
+/// The Sender Report (SR), which carries a sender's timing and packet counts.
 pub mod sender_report;
+/// The SDES packet, which carries CNAME and other source metadata.
 pub mod source_description;
+/// Transport-specific feedback (PT 205): NACK and transport-wide congestion control.
 pub mod transport_feedbacks;
 mod util;
 

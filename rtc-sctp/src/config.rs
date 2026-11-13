@@ -6,12 +6,62 @@ use std::sync::Arc;
 
 /// MTU for inbound packet (from DTLS)
 pub(crate) const RECEIVE_MTU: usize = 8192;
-/// initial MTU for outgoing packets (to DTLS)
-pub(crate) const INITIAL_MTU: u32 = 1228;
+/// Initial MTU for outgoing packets (to DTLS): bounds the assembled SCTP
+/// packet (common header + bundled chunks). Each SCTP packet becomes one
+/// DTLS record carried in one UDP datagram, so the wire size is roughly
+/// `INITIAL_MTU` + ~37 bytes of DTLS record overhead + 48 bytes of IPv6/UDP
+/// headers. 1191 keeps that within the 1280-byte IPv6 minimum MTU advertised
+/// by common tunnel paths (WireGuard, Tailscale); the previous 1228
+/// overflowed it (~1313 wire bytes), and because retransmissions re-bundle
+/// to the same oversized packet, a dropped flight stalled forever with no
+/// surfaced error. 1191 is the exact TURN-relayed IPv6 budget
+/// (1280 - 40 IPv6 - 8 UDP - 4 TURN ChannelData - 37 DTLS), the derivation
+/// from pion/sctp#476, adopted by webrtc-rs/webrtc#807 (webrtc v0.17.2).
+pub(crate) const INITIAL_MTU: u32 = 1191;
 pub(crate) const INITIAL_RECV_BUF_SIZE: u32 = 1024 * 1024;
 pub(crate) const COMMON_HEADER_SIZE: u32 = 12;
 pub(crate) const DATA_CHUNK_HEADER_SIZE: u32 = 16;
+/// Floor for [`max_payload_size_for_mtu`]: the smallest representable padded
+/// DATA packet — the 12-byte common header, the 16-byte DATA chunk header, and
+/// a 1..=4-byte payload padded to the 4-byte chunk boundary.
+pub const MIN_DATA_PACKET_MTU: u32 = COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE + 4;
+
+/// Derive an [`EndpointConfig::max_payload_size`] value from an outbound
+/// DATA-packet budget: the largest DATA packet (common header plus bundled
+/// DATA chunks) associations may emit, in bytes. Control packets (INIT,
+/// INIT ACK, SACK, RECONFIG, FORWARD TSN, shutdown) marshal without
+/// consulting this value.
+///
+/// This is the inverse of the default derivation: `mtu` minus the two fixed
+/// headers, rounded down to the SCTP 4-byte chunk-padding boundary, so a
+/// single maximum-size DATA chunk always marshals to at most `mtu` bytes —
+/// exactly as the default budget does for `INITIAL_MTU` (1191, the
+/// TURN-relayed IPv6 minimum-MTU budget). Budgets below
+/// [`MIN_DATA_PACKET_MTU`] cannot satisfy that promise and are raised to it
+/// with a warning.
+pub fn max_payload_size_for_mtu(mtu: u32) -> u32 {
+    if mtu < MIN_DATA_PACKET_MTU {
+        log::warn!(
+            "sctp mtu {mtu} is below the smallest representable DATA packet; raising to \
+             {MIN_DATA_PACKET_MTU} bytes"
+        );
+    }
+    let mtu = mtu.max(MIN_DATA_PACKET_MTU);
+    (mtu - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE)) & !3
+}
 pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 262144;
+
+/// How an association picks the stream whose message it sends next.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamScheduler {
+    /// One queue in the order messages were written, unordered messages first.
+    #[default]
+    FirstComeFirstServed,
+    /// Each stream gets a share of the bytes sent in proportion to its weight, a whole message
+    /// at a time (RFC 8260 section 3.6, which RFC 8831 section 6.4 asks of WebRTC).
+    WeightedFairQueueing,
+}
 
 /// Config collects the arguments to create_association construction into
 /// a single structure
@@ -23,6 +73,7 @@ pub struct TransportConfig {
     max_num_outbound_streams: u16,
     max_num_inbound_streams: u16,
     timer_config: TimerConfig,
+    stream_scheduler: StreamScheduler,
 }
 
 impl Default for TransportConfig {
@@ -34,63 +85,88 @@ impl Default for TransportConfig {
             max_num_outbound_streams: u16::MAX,
             max_num_inbound_streams: u16::MAX,
             timer_config: TimerConfig::default(),
+            stream_scheduler: StreamScheduler::default(),
         }
     }
 }
 
 impl TransportConfig {
+    /// Sets the SCTP port. WebRTC always uses 5000.
     pub fn with_sctp_port(mut self, value: u16) -> Self {
         self.sctp_port = value;
         self
     }
 
+    /// Sets the advertised receive window (a_rwnd), bounding how much unacknowledged data a peer
+    /// may have in flight toward this endpoint.
     pub fn with_max_receive_buffer_size(mut self, value: u32) -> Self {
         self.max_receive_buffer_size = value;
         self
     }
 
+    /// Sets the largest message this endpoint will accept.
     pub fn with_max_message_size(mut self, value: u32) -> Self {
         self.max_message_size = value;
         self
     }
 
+    /// Sets how many outbound streams to request during the handshake.
     pub fn with_max_num_outbound_streams(mut self, value: u16) -> Self {
         self.max_num_outbound_streams = value;
         self
     }
 
+    /// Sets how many inbound streams this endpoint will accept.
     pub fn with_max_num_inbound_streams(mut self, value: u16) -> Self {
         self.max_num_inbound_streams = value;
         self
     }
 
+    /// Overrides the retransmission limits; see [`TimerConfig`].
     pub fn with_timer_config(mut self, value: TimerConfig) -> Self {
         self.timer_config = value;
         self
     }
 
+    /// Chooses how the next message to send is picked among the streams.
+    pub fn with_stream_scheduler(mut self, value: StreamScheduler) -> Self {
+        self.stream_scheduler = value;
+        self
+    }
+
+    /// The configured SCTP port.
     pub fn sctp_port(&self) -> u16 {
         self.sctp_port
     }
 
+    /// The configured receive window in bytes.
     pub fn max_receive_buffer_size(&self) -> u32 {
         self.max_receive_buffer_size
     }
 
+    /// The configured maximum message size in bytes.
     pub fn max_message_size(&self) -> u32 {
         self.max_message_size
     }
 
+    /// The configured outbound stream count.
     pub fn max_num_outbound_streams(&self) -> u16 {
         self.max_num_outbound_streams
     }
 
+    /// The configured inbound stream count.
     pub fn max_num_inbound_streams(&self) -> u16 {
         self.max_num_inbound_streams
     }
 
+    /// The configured retransmission limits.
     pub fn timer_config(&self) -> TimerConfig {
         self.timer_config
+    }
+
+    /// The configured stream scheduler.
+    pub fn stream_scheduler(&self) -> StreamScheduler {
+        self.stream_scheduler
     }
 }
 
@@ -120,7 +196,7 @@ impl EndpointConfig {
         let aid_factory: fn() -> Box<dyn AssociationIdGenerator + Send> =
             || Box::<RandomAssociationIdGenerator>::default();
         Self {
-            max_payload_size: INITIAL_MTU - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE),
+            max_payload_size: max_payload_size_for_mtu(INITIAL_MTU),
             aid_generator_factory: Arc::new(aid_factory),
         }
     }
@@ -230,5 +306,57 @@ impl ClientConfig {
         ClientConfig {
             transport: Arc::new(transport),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_max_payload_size_fits_ipv6_min_mtu() {
+        // INITIAL_MTU bounds the assembled SCTP packet. The default is the
+        // exact TURN-relayed IPv6 budget (pion/sctp#476, webrtc-rs/webrtc#807):
+        // the 1280-byte IPv6 minimum MTU (RFC 8200) minus IPv6, UDP, and TURN
+        // ChannelData headers and DTLS record overhead.
+        assert_eq!(INITIAL_MTU, 1280 - 40 - 8 - 4 - 37);
+        let config = EndpointConfig::default();
+        assert_eq!(
+            config.get_max_payload_size(),
+            (INITIAL_MTU - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE)) & !3
+        );
+        // A single maximum-size DATA chunk must marshal within INITIAL_MTU:
+        // common header + the chunk header and payload, padded to 4 bytes.
+        let padded_chunk =
+            (DATA_CHUNK_HEADER_SIZE + config.get_max_payload_size()).next_multiple_of(4);
+        assert!(COMMON_HEADER_SIZE + padded_chunk <= INITIAL_MTU);
+    }
+
+    #[test]
+    fn max_payload_size_for_mtu_derives_the_payload_budget() {
+        // `max_payload_size_for_mtu(INITIAL_MTU)` must reproduce the default
+        // payload budget exactly.
+        assert_eq!(
+            max_payload_size_for_mtu(INITIAL_MTU),
+            EndpointConfig::default().get_max_payload_size()
+        );
+
+        // Rounded down to the 4-byte padding boundary: the last MTU of one
+        // padding window and the first of the next straddle a 4-byte step.
+        assert_eq!(max_payload_size_for_mtu(1203), 1172);
+        assert_eq!(max_payload_size_for_mtu(1204), 1176);
+
+        // Values below MIN_DATA_PACKET_MTU behave exactly as the 32-byte
+        // floor: the smallest representable padded DATA packet, a 4-byte
+        // payload budget.
+        for mtu in [0, 31, 32] {
+            assert_eq!(max_payload_size_for_mtu(mtu), 4, "mtu {mtu}");
+        }
+
+        // Upper edge: the derivation must not overflow.
+        assert_eq!(
+            max_payload_size_for_mtu(u32::MAX),
+            (u32::MAX - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE)) & !3
+        );
     }
 }

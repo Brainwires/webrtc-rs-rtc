@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rtc_stun::addr::{AlternateServer, MappedAddress};
 use rtc_stun::attributes::{
     ATTR_CHANNEL_NUMBER, ATTR_DONT_FRAGMENT, ATTR_ERROR_CODE, ATTR_MESSAGE_INTEGRITY, ATTR_NONCE,
@@ -25,6 +25,12 @@ use base64::prelude::*;
 // AGENT_COLLECT_CAP is initial capacity for Agent.Collect slices,
 // sufficient to make function zero-alloc in most cases.
 // const AGENT_COLLECT_CAP: usize = 100;
+
+/// The built-in provider used by these benchmarks. Provider selection is explicit since the
+/// default-resolving constructors were removed before 1.0.
+fn bench_provider() -> std::sync::Arc<dyn crypto::RTCCryptoProvider> {
+    crypto::default_provider().expect("a built-in crypto provider must be enabled")
+}
 
 fn benchmark_addr(c: &mut Criterion) {
     let mut m = Message::new();
@@ -232,9 +238,13 @@ fn benchmark_message_build_overhead(c: &mut Criterion) {
 }
 
 fn benchmark_message_integrity(c: &mut Criterion) {
+    let provider = bench_provider();
     {
         let mut m = Message::new();
-        let integrity = MessageIntegrity::new_short_term_integrity("password".to_owned());
+        let integrity = MessageIntegrity::new_short_term_integrity_with_provider(
+            "password".to_owned(),
+            provider.crypto(),
+        );
         m.write_header();
         c.bench_function("BenchmarkMessageIntegrity_AddTo", |b| {
             b.iter(|| {
@@ -250,19 +260,24 @@ fn benchmark_message_integrity(c: &mut Criterion) {
         m.raw = Vec::with_capacity(1024);
         let software = Software::new(ATTR_SOFTWARE, "software".to_owned());
         let _ = software.add_to(&mut m);
-        let integrity = MessageIntegrity::new_short_term_integrity("password".to_owned());
+        let integrity = MessageIntegrity::new_short_term_integrity_with_provider(
+            "password".to_owned(),
+            provider.crypto(),
+        );
         m.write_header();
         integrity.add_to(&mut m).unwrap();
         m.write_header();
         c.bench_function("BenchmarkMessageIntegrity_Check", |b| {
             b.iter(|| {
-                integrity.check(&mut m).unwrap();
+                MessageIntegrity::<'_>::check(&mut m, "password".as_bytes(), provider.crypto())
+                    .unwrap();
             })
         });
     }
 }
 
 fn benchmark_message(c: &mut Criterion) {
+    let provider = bench_provider();
     {
         let mut m = Message::new();
         c.bench_function("BenchmarkMessage_Write", |b| {
@@ -449,11 +464,15 @@ fn benchmark_message(c: &mut Criterion) {
             Box::new(BINDING_REQUEST),
             Box::new(TransactionId([1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2])),
             Box::new(Software::new(ATTR_SOFTWARE, "webrtc-rs/stun".to_owned())),
-            Box::new(MessageIntegrity::new_long_term_integrity(
-                "username".to_owned(),
-                "realm".to_owned(),
-                "password".to_owned(),
-            )),
+            Box::new(
+                MessageIntegrity::new_long_term_integrity_with_provider(
+                    "username".to_owned(),
+                    "realm".to_owned(),
+                    "password".to_owned(),
+                    provider.crypto(),
+                )
+                .unwrap(),
+            ),
             Box::new(FINGERPRINT),
         ])
         .unwrap();

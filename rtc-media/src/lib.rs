@@ -1,13 +1,57 @@
 #![warn(rust_2018_idioms)]
+#![warn(missing_docs)]
 #![allow(dead_code)]
 
+//! Media samples and container I/O.
+//!
+//! The bridge between encoded media and RTP: a codec-agnostic [`Sample`] type, and readers
+//! and writers for the container formats the examples and tests use.
+//!
+//! # Structure
+//!
+//! * [`Sample`] — one encoded unit of media (a video frame, an audio frame) with its
+//!   duration, timestamp and packet metadata. Hand these to a sample-based local track and
+//!   the RTP packetizer does the rest.
+//! * [`io`] — the [`Writer`](io::Writer) trait plus concrete readers and writers for IVF
+//!   (VP8/VP9), Ogg (Opus) and H.264/H.265 Annex B — [`IVFReader`](io::ivf_reader::IVFReader),
+//!   [`OggReader`](io::ogg_reader::OggReader) and friends — enough to play media from disk or
+//!   record it to disk. [`SampleBuilder`](io::sample_builder::SampleBuilder) goes the other
+//!   way, reassembling inbound RTP into [`Sample`]s.
+//! * [`audio`], [`video`] — per-codec helpers, including audio buffering and frame
+//!   inspection.
+//!
+//! # Example
+//!
+//! ```
+//! use bytes::Bytes;
+//! use rtc_media::Sample;
+//! use std::time::{Duration, Instant};
+//!
+//! // The caller supplies the instant; `Sample` resolves no clock of its own.
+//! let now = Instant::now();
+//!
+//! // One encoded frame, ready to hand to a sample-based local track.
+//! let sample = Sample {
+//!     data: Bytes::from_static(&[0u8; 128]),
+//!     timestamp: now,
+//!     duration: Duration::from_millis(33), // ~30 fps
+//!     ..Sample::new(now)
+//! };
+//! assert_eq!(sample.data.len(), 128);
+//! ```
+//!
+//! Most applications do not depend on this crate directly — the
+//! [`rtc`](https://docs.rs/rtc) crate re-exports it as `rtc::media`.
+
+/// Audio sample types and multi-channel buffers.
 pub mod audio;
+/// Container readers and writers, plus RTP sample reassembly.
 pub mod io;
+/// Video frame helpers.
 pub mod video;
 
 use bytes::Bytes;
-use shared::time::SystemInstant;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A Sample contains encoded media and timing information
 #[derive(Debug)]
@@ -20,8 +64,8 @@ pub struct Sample {
     /// See: [`rtp::packetizer::Depacketizer`] and implementations of it for more details.
     pub data: Bytes,
 
-    /// The wallclock time when this sample was generated.
-    pub timestamp: SystemInstant,
+    /// The time when this sample was generated.
+    pub timestamp: Instant,
 
     /// The duration of this sample
     pub duration: Duration,
@@ -49,12 +93,11 @@ pub struct Sample {
     ///
     /// ```rust
     /// # use bytes::Bytes;
-    /// # use std::time::{SystemTime, Duration};
+    /// # use std::time::{Instant, Duration};
     /// # use rtc_media::Sample;
-    /// use shared::time::SystemInstant;
     /// # let sample = Sample {
     /// #   data: Bytes::new(),
-    /// #   timestamp: SystemInstant::now(),
+    /// #   timestamp: Instant::now(),
     /// #   duration: Duration::from_secs(0),
     /// #   packet_timestamp: 0,
     /// #   prev_dropped_packets: 10,
@@ -67,11 +110,15 @@ pub struct Sample {
     pub prev_padding_packets: u16,
 }
 
-impl Default for Sample {
-    fn default() -> Self {
+impl Sample {
+    /// An empty sample stamped at `now`.
+    ///
+    /// This replaces `Default`: the timestamp is a real-world observation the caller supplies,
+    /// not something the constructor may reach for.
+    pub fn new(now: Instant) -> Self {
         Sample {
             data: Bytes::new(),
-            timestamp: SystemInstant::now(),
+            timestamp: now,
             duration: Duration::from_secs(0),
             packet_timestamp: 0,
             prev_dropped_packets: 0,
@@ -86,9 +133,7 @@ impl PartialEq for Sample {
         if self.data != other.data {
             equal = false;
         }
-        if self.timestamp.duration_since_unix_epoch().as_secs()
-            != other.timestamp.duration_since_unix_epoch().as_secs()
-        {
+        if self.timestamp != other.timestamp {
             equal = false;
         }
         if self.duration != other.duration {

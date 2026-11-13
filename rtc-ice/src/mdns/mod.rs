@@ -4,13 +4,14 @@
 use mdns::Mdns;
 use mdns::MdnsConfig;
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use shared::error::Result;
 
 /// Represents the different Multicast modes that ICE can run.
 #[derive(Default, PartialEq, Eq, Debug, Copy, Clone)]
+#[non_exhaustive]
 pub enum MulticastDnsMode {
     /// Means remote mDNS candidates will be discarded, and local host candidates will use IPs.
     Disabled,
@@ -26,11 +27,14 @@ pub enum MulticastDnsMode {
 pub(crate) fn generate_multicast_dns_name() -> String {
     // https://tools.ietf.org/id/draft-ietf-rtcweb-mdns-ice-candidates-02.html#gathering
     // The unique name MUST consist of a version 4 UUID as defined in [RFC4122], followed by “.local”.
+    // This is a short-lived privacy alias, not a credential. `Uuid::new_v4` obtains randomness
+    // from the UUID crate's secure random source without forcing provider ownership into mDNS.
     let u = Uuid::new_v4();
     format!("{u}.local")
 }
 
 pub(crate) fn create_multicast_dns(
+    now: Instant,
     mdns_mode: MulticastDnsMode,
     mdns_local_name: &str,
     mdns_local_ip: &Option<IpAddr>,
@@ -59,7 +63,7 @@ pub(crate) fn create_multicast_dns(
         config = config.with_query_timeout(*query_timeout);
     }
 
-    let mdns_server = Mdns::new(config);
+    let mdns_server = Mdns::new(now, config);
 
     Ok(Some(mdns_server))
 }

@@ -3,7 +3,7 @@ use crate::{
     payload_feedbacks::picture_loss_indication::*,
     payload_feedbacks::receiver_estimated_maximum_bitrate::*,
     payload_feedbacks::slice_loss_indication::*, raw_packet::*, receiver_report::*,
-    sender_report::*, source_description::*,
+    sender_report::*, source_description::*, transport_feedbacks::cc_feedback_report::*,
     transport_feedbacks::rapid_resynchronization_request::*,
     transport_feedbacks::transport_layer_cc::*, transport_feedbacks::transport_layer_nack::*,
 };
@@ -13,18 +13,27 @@ use shared::{
 };
 
 use crate::extended_report::ExtendedReport;
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use std::any::Any;
 use std::fmt;
 
 /// Packet represents an RTCP packet, a protocol used for out-of-band statistics and
 /// control information for an RTP session
 pub trait Packet: Send + Sync + Marshal + Unmarshal + fmt::Display + fmt::Debug {
+    /// This packet's RTCP header.
     fn header(&self) -> Header;
+    /// The SSRCs this packet is about.
+    ///
+    /// Used to route feedback: a report's destination SSRCs identify the streams it concerns,
+    /// which is how an SFU decides where to forward it.
     fn destination_ssrc(&self) -> Vec<u32>;
+    /// The encoded size in bytes, header and padding included.
     fn raw_size(&self) -> usize;
+    /// Downcasting hook, so a caller holding `Box<dyn Packet>` can recover the concrete type.
     fn as_any(&self) -> &dyn Any;
+    /// Compares against another packet, since `PartialEq` is not object safe.
     fn equal(&self, other: &dyn Packet) -> bool;
+    /// Clones this packet behind a trait object, since `Clone` is not object safe.
     fn cloned(&self) -> Box<dyn Packet>;
 }
 
@@ -42,10 +51,15 @@ impl Clone for Box<dyn Packet> {
 
 /// marshal takes an array of Packets and serializes them to a single buffer
 pub fn marshal(packets: &[Box<dyn Packet>]) -> Result<BytesMut> {
+    // Size the compound packet up front and marshal each sub-packet straight
+    // into it, instead of allocating a fresh BytesMut per sub-packet
+    // (p.marshal()) and copying it in.
+    let total: usize = packets.iter().map(|p| p.marshal_size()).sum();
     let mut out = BytesMut::new();
+    out.resize(total, 0);
+    let mut offset = 0;
     for p in packets {
-        let data = p.marshal()?;
-        out.put(data);
+        offset += p.marshal_to(&mut out[offset..])?;
     }
     Ok(out)
 }
@@ -89,7 +103,13 @@ where
         return Err(Error::PacketTooShort);
     }
 
-    let mut in_packet = h.marshal()?.chain(raw_data.take(length));
+    // Re-serialize the just-parsed header into a stack buffer rather than a fresh
+    // heap `BytesMut` (`h.marshal()`), then chain it with the body so the
+    // sub-packet unmarshaller re-reads the same bytes -- one fewer heap
+    // allocation per RTCP sub-packet on the receive path.
+    let mut header_buf = [0u8; HEADER_LENGTH];
+    h.marshal_to(&mut header_buf[..])?;
+    let mut in_packet = header_buf.as_slice().chain(raw_data.take(length));
 
     let p: Box<dyn Packet> = match h.packet_type {
         PacketType::SenderReport => Box::new(SenderReport::unmarshal(&mut in_packet)?),
@@ -101,6 +121,7 @@ where
             FORMAT_TLN => Box::new(TransportLayerNack::unmarshal(&mut in_packet)?),
             FORMAT_RRR => Box::new(RapidResynchronizationRequest::unmarshal(&mut in_packet)?),
             FORMAT_TCC => Box::new(TransportLayerCc::unmarshal(&mut in_packet)?),
+            FORMAT_CCFB => Box::new(CcFeedbackReport::unmarshal(&mut in_packet)?),
             _ => Box::new(RawPacket::unmarshal(&mut in_packet)?),
         },
         PacketType::PayloadSpecificFeedback => match h.count {
@@ -266,6 +287,41 @@ mod test {
         for mut test in tests {
             unmarshal(&mut test)?;
         }
+
+        Ok(())
+    }
+
+    // Round-trips a compound through packet::marshal -> packet::unmarshal ->
+    // packet::marshal and asserts byte-stability, covering the in-place compound
+    // marshal and the sub-packet unmarshaller.
+    #[test]
+    fn test_marshal_compound_roundtrip() -> Result<()> {
+        use crate::reception_report::ReceptionReport;
+
+        let rr = ReceiverReport {
+            ssrc: 0x902f9e2e,
+            reports: vec![ReceptionReport {
+                ssrc: 0xbc5e9a40,
+                fraction_lost: 0,
+                total_lost: 0,
+                last_sequence_number: 0x46e1,
+                jitter: 273,
+                last_sender_report: 0x9f36432,
+                delay: 150137,
+            }],
+            ..Default::default()
+        };
+        let pli = PictureLossIndication {
+            sender_ssrc: 0x902f9e2e,
+            media_ssrc: 0x902f9e2e,
+        };
+        let packets: Vec<Box<dyn Packet>> = vec![Box::new(rr), Box::new(pli)];
+
+        let raw1 = marshal(&packets)?;
+        let out = unmarshal(&mut raw1.clone().freeze())?;
+        assert_eq!(out.len(), 2, "expected two sub-packets");
+        let raw2 = marshal(&out)?;
+        assert_eq!(raw1, raw2, "compound marshal/unmarshal round-trip mismatch");
 
         Ok(())
     }
