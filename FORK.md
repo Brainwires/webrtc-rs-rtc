@@ -69,6 +69,18 @@ with a stale-nonce error and replace the allocation's nonce; the server's own 43
 request restores it. Only a sender that passes the server-address filter can do this, and it
 cannot release the allocation or forge any other response.
 
+### Dependency audit (fork only)
+
+`.github/workflows/audit.yml` resolves dependencies afresh and runs `cargo deny check advisories`
+on every PR: first on the library's own graph with `.github/deny-library.toml` (normal and build
+dependencies, all features, no ignores), then on the whole workspace with `deny.toml`. Ignores are
+allowed only in `deny.toml`, only for advisories that cannot reach the library, each with its
+reason. Today there is one:
+
+| Advisory | Crate | Why it is ignored |
+| --- | --- | --- |
+| RUSTSEC-2026-0441 (unmaintained, no vulnerability) | `pin-utils` 0.1.1 | Dev-dependency only, interop tests: `webrtc` 0.17.3 -> `webrtc-util` -> `nix` 0.26. `webrtc` 0.17.3 is the last release of the independent implementation the interop tests exercise; 0.20+ is built on the upstream `rtc` crates. |
+
 ### Upstream changes not taken (reverted inside the merge)
 
 | Upstream commit | What it removed or narrowed | What the fork does instead |

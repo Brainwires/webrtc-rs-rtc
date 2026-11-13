@@ -1,0 +1,13 @@
+# cargo-deny: security advisories for the whole workspace graph, dev-dependencies and examples
+# included. Run by .github/workflows/audit.yml after `cargo generate-lockfile`, so it sees what a
+# fresh build would resolve today.
+#
+# The library's own graph (normal and build dependencies, every feature) is checked separately
+# against .github/deny-library.toml, which ignores nothing: an advisory there always fails CI.
+# Every ignore below must say why it cannot reach the library.
+
+[advisories]
+version = 2
+ignore = [
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils is unmaintained (no vulnerability). Dev-dependency only, interop tests: webrtc 0.17.3 -> webrtc-util -> nix 0.26; not in the library's dependency graph." },
+]

@@ -1,0 +1,11 @@
+# cargo-deny: security advisories for the library's dependency graph only: normal and build
+# dependencies of the workspace crates, every feature, no dev-dependencies (so no interop tests or
+# examples). Nothing is ignored here, by design: an advisory reachable from the library fails CI.
+# See deny.toml for the whole-workspace check and its documented dev-only exceptions.
+
+[graph]
+all-features = true
+exclude-dev = true
+
+[advisories]
+version = 2

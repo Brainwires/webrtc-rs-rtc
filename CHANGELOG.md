@@ -79,6 +79,14 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
 - Fuzzing CI fails on crashes again (`set -o pipefail`), runs with debug assertions and overflow
   checks, and gains stateful SCTP targets (checksum-fixed packet parsing, a server endpoint and
   association driven by datagram sequences).
+- Dependency audit: a new `audit` workflow runs `cargo generate-lockfile` and `cargo deny check
+  advisories` on every pull request, twice: on the library's graph (normal and build
+  dependencies, all features), where nothing is ignored, and on the whole workspace. The interop
+  dev-dependency moves from `webrtc` 0.14 to 0.17.3, the last release of that independent
+  implementation, whose DTLS uses `p256` 0.14 (`crypto-bigint` 0.7.11, past RUSTSEC-2026-0387)
+  and no `bincode` (RUSTSEC-2025-0141). The examples' signaling, `rtc-signal` and the `rtc-ice`
+  ping-pong example move from `hyper` 0.14 to `hyper` 1 (HTTP/1 only), so `h2` 0.3
+  (RUSTSEC-2026-0258) is gone. None of these reached the library's own dependency graph.
 
 ### Fork features kept across the sync
 
