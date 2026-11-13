@@ -3762,3 +3762,108 @@ fn test_remote_candidates_are_capped() -> Result<()> {
     assert_eq!(a.remote_candidates.len(), MAX_REMOTE_CANDIDATES);
     Ok(())
 }
+
+/// The `.local` name of the candidate the mDNS tests resolve.
+const MDNS_TEST_NAME: &str = "61b445d2-6503-41ac-96ce-ee3edac00e9f.local";
+
+/// A QueryOnly agent that has issued the query for `MDNS_TEST_NAME`, and the answer a responder
+/// for that name (at 10.0.0.9) sends to it.
+fn agent_with_answered_mdns_query(base: Instant) -> Result<(Agent, TaggedBytesMut)> {
+    let mut agent = Agent::new(
+        base,
+        Arc::new(AgentConfig {
+            multicast_dns_mode: crate::mdns::MulticastDnsMode::QueryOnly,
+            ..Default::default()
+        }),
+        test_crypto_provider(),
+    )?;
+    agent.add_remote_candidate(unmarshal_candidate(&format!(
+        "1 1 udp 2113939711 {MDNS_TEST_NAME} 61163 typ host"
+    ))?)?;
+    agent.handle_timeout(base)?;
+    let query = agent.poll_write().expect("the agent queries the name");
+
+    let mut responder = mdns::Mdns::new(
+        base,
+        mdns::MdnsConfig::default()
+            .with_local_names(vec![MDNS_TEST_NAME.to_owned()])
+            .with_local_ip("10.0.0.9".parse().unwrap()),
+    );
+    sansio::Protocol::handle_read(
+        &mut responder,
+        TaggedBytesMut {
+            now: base,
+            transport: TransportContext {
+                local_addr: "0.0.0.0:5353".parse().unwrap(),
+                peer_addr: "192.168.1.2:5353".parse().unwrap(),
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: query.message,
+        },
+    )?;
+    let answer = sansio::Protocol::poll_write(&mut responder).expect("the responder answers");
+    Ok((agent, answer))
+}
+
+/// mDNS answers are taken only from the mDNS socket. One sent from port 5353 to an ICE socket
+/// used to be parsed as an answer too, letting anyone who learned the peer's `.local` name
+/// point its candidate at an address of their choosing.
+#[test]
+fn test_mdns_answer_is_taken_only_from_the_mdns_socket() -> Result<()> {
+    let base = Instant::now();
+    let deliver = |agent: &mut Agent, answer: &TaggedBytesMut, local: &str| {
+        let _ = agent.handle_read(TaggedBytesMut {
+            now: base,
+            transport: TransportContext {
+                local_addr: local.parse().unwrap(),
+                peer_addr: "10.0.0.9:5353".parse().unwrap(),
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: answer.message.clone(),
+        });
+    };
+
+    let (mut agent, answer) = agent_with_answered_mdns_query(base)?;
+    deliver(&mut agent, &answer, "192.168.1.2:50000");
+    assert!(
+        agent.remote_candidates.is_empty(),
+        "an answer that reached an ICE socket resolved a candidate"
+    );
+    assert_eq!(agent.mdns_queries.len(), 1, "the query is still pending");
+
+    deliver(&mut agent, &answer, "0.0.0.0:5353");
+    assert_eq!(agent.remote_candidates.len(), 1);
+    assert_eq!(
+        agent.remote_candidates[0].addr().ip(),
+        "10.0.0.9".parse::<IpAddr>().unwrap()
+    );
+    Ok(())
+}
+
+/// mDNS-resolved candidates count against `MAX_REMOTE_CANDIDATES` like any other: they used to
+/// be added past it.
+#[test]
+fn test_mdns_resolved_candidates_respect_the_remote_candidate_cap() -> Result<()> {
+    let base = Instant::now();
+    let (mut agent, answer) = agent_with_answered_mdns_query(base)?;
+    for i in 0..MAX_REMOTE_CANDIDATES {
+        let port = 10_000 + i;
+        assert!(agent.add_remote_candidate(unmarshal_candidate(&format!(
+            "1 1 udp 2113939711 10.1.0.1 {port} typ host"
+        ))?)?);
+    }
+    agent.handle_read(TaggedBytesMut {
+        now: base,
+        transport: TransportContext {
+            local_addr: "0.0.0.0:5353".parse().unwrap(),
+            peer_addr: "10.0.0.9:5353".parse().unwrap(),
+            transport_protocol: TransportProtocol::UDP,
+            ecn: None,
+        },
+        message: answer.message,
+    })?;
+    assert_eq!(agent.remote_candidates.len(), MAX_REMOTE_CANDIDATES);
+    Ok(())
+}

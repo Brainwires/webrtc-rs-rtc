@@ -9,8 +9,14 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
     type Time = Instant;
 
     fn handle_read(&mut self, msg: TaggedBytesMut) -> Result<()> {
-        // demuxing mDNS packet from STUN packet whether peer addr port is MDNS_PORT
-        if msg.transport.peer_addr.port() == MDNS_PORT {
+        // mDNS arrives on the host's mDNS socket, the one bound to MDNS_PORT that this
+        // agent's queries leave from. A source port says nothing: anyone can send from 5353 to
+        // an ICE socket, and an answer taken from there could point a `.local` candidate at an
+        // address of the sender's choosing. Datagrams on ICE sockets are ICE traffic, whatever
+        // their source port.
+        if msg.transport.local_addr.port() == MDNS_PORT
+            && msg.transport.peer_addr.port() == MDNS_PORT
+        {
             let remote_candidates = if let Some(mdns_conn) = &mut self.mdns {
                 mdns_conn.handle_read(msg)?;
 

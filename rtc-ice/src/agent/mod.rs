@@ -529,6 +529,17 @@ impl Agent {
 
     fn trigger_request_connectivity_check(&mut self, remote_candidates: Vec<Candidate>) {
         for c in remote_candidates {
+            // Every path that adds a remote candidate comes through here, mDNS-resolved ones
+            // included (their query was capped, not the candidate list).
+            if self.remote_candidates.len() >= MAX_REMOTE_CANDIDATES {
+                warn!(
+                    "[{}]: ignoring remote candidate {}: already holding {} (the cap)",
+                    self.get_name(),
+                    c.address(),
+                    MAX_REMOTE_CANDIDATES
+                );
+                continue;
+            }
             if !self.remote_candidates.iter().any(|cand| cand.equal(&c)) {
                 self.remote_candidates.push(c);
                 let remote_index = self.remote_candidates.len() - 1;
