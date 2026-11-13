@@ -1,0 +1,25 @@
+[package]
+name = "rtc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rtc]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "data_channel_handle_dcep"
+path = "fuzz_targets/data_channel_handle_dcep.rs"
+test = false
+doc = false
+bench = false

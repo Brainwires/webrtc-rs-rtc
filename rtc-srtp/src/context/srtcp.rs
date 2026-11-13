@@ -1,4 +1,5 @@
 use super::*;
+use crate::key_derivation::SRTCP_INDEX_SIZE;
 use shared::{error::Result, marshal::Unmarshal};
 
 use bytes::BytesMut;
@@ -6,13 +7,31 @@ use bytes::BytesMut;
 impl Context {
     /// DecryptRTCP decrypts a RTCP packet with an encrypted payload
     pub fn decrypt_rtcp(&mut self, encrypted: &[u8]) -> Result<BytesMut> {
+        // A received SRTCP packet must be at least the minimum valid size for the
+        // negotiated profile: the RTCP header through the SSRC (read at bytes
+        // 4..8), the trailing SRTCP index, and the auth tag that `get_rtcp_index`
+        // and the cipher read from the end (the HMAC tag for AES-CM, the AEAD tag
+        // for GCM). A shorter packet from the network would otherwise index out
+        // of bounds and panic (a remotely triggerable DoS). This is self-
+        // contained: it does not rely on the individual ciphers' own guards.
+        let min_len = 8
+            + SRTCP_INDEX_SIZE
+            + self.cipher.rtcp_auth_tag_len()
+            + self.cipher.aead_auth_tag_len();
+        if encrypted.len() < min_len {
+            return Err(Error::ErrTooShortRtcp);
+        }
+
         let mut buf = encrypted;
         rtcp::Header::unmarshal(&mut buf)?;
 
         let index = self.cipher.get_rtcp_index(encrypted);
         let ssrc = u32::from_be_bytes([encrypted[4], encrypted[5], encrypted[6], encrypted[7]]);
 
-        if let Some(replay_detector) = &mut self.get_srtcp_ssrc_state(ssrc).replay_detector
+        // Per-SSRC state is created only once a packet for that SSRC authenticates, so packets
+        // under made-up SSRCs cannot grow the state map.
+        if let Some(state) = self.srtcp_ssrc_states.get_mut(&ssrc)
+            && let Some(replay_detector) = &mut state.replay_detector
             && !replay_detector.check(index as u64)
         {
             return Err(Error::SrtcpSsrcDuplicated(ssrc, index));
@@ -20,8 +39,12 @@ impl Context {
 
         let dst = self.cipher.decrypt_rtcp(encrypted, index, ssrc)?;
 
+        let is_new = !self.srtcp_ssrc_states.contains_key(&ssrc);
         if let Some(replay_detector) = &mut self.get_srtcp_ssrc_state(ssrc).replay_detector {
-            replay_detector.accept();
+            // A new SSRC's detector has not seen this index yet: check, then accept.
+            if !is_new || replay_detector.check(index as u64) {
+                replay_detector.accept();
+            }
         }
 
         Ok(dst)

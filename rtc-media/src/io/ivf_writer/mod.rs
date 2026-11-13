@@ -10,14 +10,18 @@ use rtp::packetizer::Depacketizer;
 
 use crate::io::Writer;
 use crate::io::ivf_reader::IVFFileHeader;
-use shared::error::Result;
+use shared::error::{Error, Result};
 
 /// Codec type for IVF writer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum IvfCodec {
     #[default]
+    /// VP8, written with the `VP80` FourCC.
     Vp8,
+    /// VP9, written with the `VP90` FourCC.
     Vp9,
+    /// AV1, written with the `AV01` FourCC.
     Av1,
 }
 
@@ -41,6 +45,10 @@ impl IvfCodec {
         }
     }
 }
+
+/// Largest frame assembled from RTP packets. Far above any real VP8/VP9/AV1 frame; a peer that
+/// never sets the marker bit must not grow the frame buffer without limit.
+pub const MAX_IVF_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// IVFWriter is used to take RTP packets and write them to an IVF on disk
 pub struct IVFWriter<W: Write + Seek> {
@@ -105,7 +113,7 @@ impl<W: Write + Seek> IVFWriter<W> {
         }
 
         self.seen_key_frame = true;
-        self.append_to_frame(payload);
+        self.append_to_frame(payload)?;
 
         if !packet.header.marker {
             return Ok(());
@@ -130,7 +138,7 @@ impl<W: Write + Seek> IVFWriter<W> {
         }
 
         self.seen_key_frame = true;
-        self.append_to_frame(payload);
+        self.append_to_frame(payload)?;
 
         if !packet.header.marker {
             return Ok(());
@@ -160,7 +168,7 @@ impl<W: Write + Seek> IVFWriter<W> {
             self.seen_key_frame = true;
         }
 
-        self.append_to_frame(payload);
+        self.append_to_frame(payload)?;
 
         if !packet.header.marker {
             return Ok(());
@@ -181,14 +189,18 @@ impl<W: Write + Seek> IVFWriter<W> {
     }
 
     /// Append payload to current frame
-    fn append_to_frame(&mut self, payload: Bytes) {
-        if let Some(current_frame) = &mut self.current_frame {
-            current_frame.extend(payload);
-        } else {
-            let mut current_frame = BytesMut::new();
-            current_frame.extend(payload);
-            self.current_frame = Some(current_frame);
+    fn append_to_frame(&mut self, payload: Bytes) -> Result<()> {
+        if self.current_frame_len() + payload.len() > MAX_IVF_FRAME_SIZE {
+            // Drop the partial frame; the next partition head starts a new one.
+            self.current_frame = None;
+            return Err(Error::ErrPacketTooBig);
         }
+        // `extend_from_slice` bulk-copies; `BytesMut`'s `Extend` impl resolves to
+        // `Extend<u8>` for `Bytes`, which would copy one byte at a time.
+        self.current_frame
+            .get_or_insert_with(BytesMut::new)
+            .extend_from_slice(&payload);
+        Ok(())
     }
 
     /// Get current frame length

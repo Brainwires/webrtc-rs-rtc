@@ -14,12 +14,16 @@ categories.workspace = true
 [dependencies]
 shared = { workspace = true, default-features = false, features = [] }
 sansio.workspace = true
-interceptor-derive.workspace = true
 
 rtp.workspace = true
 rtcp.workspace = true
 rand.workspace = true
 log.workspace = true
+interceptor-derive.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+
+[[bench]]
+name = "congestion_control"
+harness = false

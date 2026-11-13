@@ -1,6 +1,12 @@
 use super::*;
 use crate::key_derivation::*;
 
+/// The built-in provider, for tests only. Library code never resolves a default: every public
+/// constructor takes the provider from its caller.
+fn test_crypto_provider() -> std::sync::Arc<dyn crypto::RTCCryptoProvider> {
+    crypto::default_provider().expect("a built-in crypto provider must be enabled for tests")
+}
+
 use bytes::{Buf, Bytes, BytesMut};
 use lazy_static::lazy_static;
 
@@ -101,6 +107,7 @@ fn test_rtcp_lifecycle() -> Result<()> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         None,
+        test_crypto_provider().crypto(),
     )?;
     let mut decrypt_context = Context::new(
         &RTCP_TEST_MASTER_KEY,
@@ -108,6 +115,7 @@ fn test_rtcp_lifecycle() -> Result<()> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         None,
+        test_crypto_provider().crypto(),
     )?;
 
     for test_case in &*RTCP_TEST_CASES {
@@ -138,6 +146,7 @@ fn test_rtcp_invalid_auth_tag() -> Result<()> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         None,
+        test_crypto_provider().crypto(),
     )?;
 
     let decrypt_result = decrypt_context.decrypt_rtcp(&RTCP_TEST_CASES[0].encrypted)?;
@@ -169,6 +178,7 @@ fn test_rtcp_replay_detector_separation() -> Result<()> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         Some(srtcp_replay_protection(10)),
+        test_crypto_provider().crypto(),
     )?;
 
     let rtcp_packet1 = RTCP_TEST_CASES[0].encrypted.clone();
@@ -215,6 +225,7 @@ fn test_encrypt_rtcp_separation() -> Result<()> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         None,
+        test_crypto_provider().crypto(),
     )?;
 
     let auth_tag_len = ProtectionProfile::Aes128CmHmacSha1_80.rtcp_auth_tag_len();
@@ -225,6 +236,7 @@ fn test_encrypt_rtcp_separation() -> Result<()> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         Some(srtcp_replay_protection(10)),
+        test_crypto_provider().crypto(),
     )?;
 
     let inputs = vec![
@@ -253,5 +265,101 @@ fn test_encrypt_rtcp_separation() -> Result<()> {
         assert_eq!(inputs[i], decrypted);
     }
 
+    Ok(())
+}
+
+/// Short SRTCP packets — anything below the minimum size (RTCP header through
+/// the SSRC + trailing SRTCP index + auth tag) — must error, not panic. Before
+/// the length guard, `get_rtcp_index` and the `encrypted[4..8]` SSRC read
+/// indexed unconditionally, so a short packet from the network triggered an
+/// index-out-of-bounds panic (a remotely triggerable DoS on the media path).
+#[test]
+fn test_rtcp_short_packet_errors() -> Result<()> {
+    // Cover both cipher families end-to-end through `Context::decrypt_rtcp`.
+    // AEAD-128-GCM takes a 12-byte salt vs 14 for AES-CM.
+    let cases: [(ProtectionProfile, &[u8]); 2] = [
+        (
+            ProtectionProfile::Aes128CmHmacSha1_80,
+            &RTCP_TEST_MASTER_SALT[..],
+        ),
+        (
+            ProtectionProfile::AeadAes128Gcm,
+            &RTCP_TEST_MASTER_SALT[..12],
+        ),
+    ];
+
+    for (profile, salt) in cases {
+        let mut ctx = Context::new(
+            &RTCP_TEST_MASTER_KEY,
+            salt,
+            profile,
+            None,
+            None,
+            test_crypto_provider().crypto(),
+        )?;
+
+        // Slices of a real packet (its first 4 bytes are a valid RTCP header, so
+        // the header parse succeeds and pre-fix execution reached the
+        // out-of-bounds indexing). Every length below the minimum valid SRTCP
+        // size for the profile must be rejected, not panic.
+        let min_len =
+            8 + SRTCP_INDEX_SIZE + profile.rtcp_auth_tag_len() + profile.aead_auth_tag_len();
+        for len in 0..min_len {
+            let short = RTCP_TEST_CASES[0].encrypted.slice(0..len);
+            assert!(
+                ctx.decrypt_rtcp(&short).is_err(),
+                "decrypt_rtcp must reject a {len}-byte packet (profile min {min_len}), not panic"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// SRTCP packets that fail authentication must not create per-SSRC state.
+#[test]
+fn test_unauthenticated_srtcp_packets_do_not_create_ssrc_state() -> Result<()> {
+    let mut ctx = Context::new(
+        &RTCP_TEST_MASTER_KEY,
+        &RTCP_TEST_MASTER_SALT,
+        ProtectionProfile::Aes128CmHmacSha1_80,
+        None,
+        None,
+        test_crypto_provider().crypto(),
+    )?;
+    for ssrc in 0..1000u32 {
+        // RTCP receiver report header (V=2, PT=201, length=1) + SSRC + E|index + bogus tag.
+        let mut raw = vec![0x80, 0xc9, 0x00, 0x01];
+        raw.extend_from_slice(&ssrc.to_be_bytes());
+        raw.extend_from_slice(&[0x80, 0x00, 0x00, 0x01]);
+        raw.extend_from_slice(&[0u8; 10]);
+        assert!(ctx.decrypt_rtcp(&raw).is_err());
+    }
+    assert!(
+        ctx.srtcp_ssrc_states.is_empty(),
+        "{} SSRC states were created by unauthenticated packets",
+        ctx.srtcp_ssrc_states.len()
+    );
+    Ok(())
+}
+
+/// An SRTCP packet with the E flag clear is authenticated like any other: a forged one creates
+/// no per-SSRC state and is not accepted. It used to be returned as plaintext unchecked.
+#[test]
+fn test_unencrypted_srtcp_with_a_forged_tag_is_rejected() -> Result<()> {
+    let mut ctx = Context::new(
+        &RTCP_TEST_MASTER_KEY,
+        &RTCP_TEST_MASTER_SALT,
+        ProtectionProfile::Aes128CmHmacSha1_80,
+        None,
+        Some(srtcp_replay_protection(64)),
+        test_crypto_provider().crypto(),
+    )?;
+    // BYE for SSRC 0x11111111, E=0, index 0x7ffffff0 (far ahead), bogus tag.
+    let mut raw = vec![0x81, 0xcb, 0x00, 0x01, 0x11, 0x11, 0x11, 0x11];
+    raw.extend_from_slice(&[0x7f, 0xff, 0xff, 0xf0]);
+    raw.extend_from_slice(&[0u8; 10]);
+    assert!(ctx.decrypt_rtcp(&raw).is_err());
+    assert!(ctx.srtcp_ssrc_states.is_empty());
     Ok(())
 }

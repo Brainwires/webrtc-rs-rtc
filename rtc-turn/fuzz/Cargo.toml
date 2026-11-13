@@ -1,0 +1,25 @@
+[package]
+name = "rtc-turn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rtc-turn]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "client_handle_inbound"
+path = "fuzz_targets/client_handle_inbound.rs"
+test = false
+doc = false
+bench = false

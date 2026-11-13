@@ -1,0 +1,398 @@
+use byteorder::{BigEndian, ByteOrder};
+use bytes::{BufMut, BytesMut};
+use crypto::{
+    HmacAlgorithm, Mac, RTCCrypto, SecretVec, StreamCipher, StreamCipherAlgorithm, constant_time_eq,
+};
+use rtcp::header::{HEADER_LENGTH, SSRC_LENGTH};
+use shared::marshal::*;
+
+use super::{Cipher, Kdf, crypto_error};
+use crate::key_derivation::*;
+use crate::protection_profile::*;
+use shared::error::{Error, Result};
+
+pub const CIPHER_AES_CM_HMAC_SHA1AUTH_TAG_LEN: usize = 10;
+
+pub(crate) struct CipherAesCmHmacSha1 {
+    profile: ProtectionProfile,
+    srtp_session_salt: Vec<u8>,
+    /// Pre-keyed HMAC-SHA1, built once here rather than per packet. Deriving the key schedule on
+    /// every packet measured ~3x slower on the SRTP path; see `benches/README.md`.
+    srtp_session_auth: Box<dyn Mac>,
+    srtcp_session_salt: Vec<u8>,
+    srtcp_session_auth: Box<dyn Mac>,
+    srtp_cipher: Box<dyn StreamCipher>,
+    srtcp_cipher: Box<dyn StreamCipher>,
+}
+
+impl CipherAesCmHmacSha1 {
+    pub fn new(
+        profile: ProtectionProfile,
+        master_key: &[u8],
+        master_salt: &[u8],
+        crypto: &dyn RTCCrypto,
+    ) -> Result<Self> {
+        let (kdf, algorithm): (Kdf, StreamCipherAlgorithm) = match profile {
+            ProtectionProfile::Aes128CmHmacSha1_32 | ProtectionProfile::Aes128CmHmacSha1_80 => {
+                (aes_cm_key_derivation, StreamCipherAlgorithm::Aes128Ctr)
+            }
+            ProtectionProfile::Aes256CmHmacSha1_80 | ProtectionProfile::Aes256CmHmacSha1_32 => {
+                (aes_256_cm_key_derivation, StreamCipherAlgorithm::Aes256Ctr)
+            }
+            _ => {
+                return Err(Error::Other(String::from(
+                    "no AES protection profile passed to CipherAesCmHmacSha1",
+                )));
+            }
+        };
+        let srtp_session_key = SecretVec::new(kdf(
+            crypto,
+            LABEL_SRTP_ENCRYPTION,
+            master_key,
+            master_salt,
+            0,
+            master_key.len(),
+        )?);
+        let srtcp_session_key = SecretVec::new(kdf(
+            crypto,
+            LABEL_SRTCP_ENCRYPTION,
+            master_key,
+            master_salt,
+            0,
+            master_key.len(),
+        )?);
+
+        // With the `openssl` feature (kept by the Brainwires fork) the AES-CTR keystream comes
+        // from OpenSSL; otherwise from the selected provider.
+        #[cfg(feature = "openssl")]
+        let new_stream_cipher = |key: &[u8]| -> Result<Box<dyn StreamCipher>> {
+            crypto::openssl_aes_ctr(algorithm, key).map_err(crypto_error)
+        };
+        #[cfg(not(feature = "openssl"))]
+        let new_stream_cipher = |key: &[u8]| -> Result<Box<dyn StreamCipher>> {
+            crypto
+                .new_stream_cipher(algorithm, key)
+                .map_err(crypto_error)
+        };
+        let srtp_cipher = new_stream_cipher(srtp_session_key.as_ref())?;
+        let srtcp_cipher = new_stream_cipher(srtcp_session_key.as_ref())?;
+        let srtp_session_salt = kdf(
+            crypto,
+            LABEL_SRTP_SALT,
+            master_key,
+            master_salt,
+            0,
+            master_salt.len(),
+        )?;
+        let srtcp_session_salt = kdf(
+            crypto,
+            LABEL_SRTCP_SALT,
+            master_key,
+            master_salt,
+            0,
+            master_salt.len(),
+        )?;
+        let auth_key_len = profile.auth_key_len();
+        let srtp_session_auth = SecretVec::new(kdf(
+            crypto,
+            LABEL_SRTP_AUTHENTICATION_TAG,
+            master_key,
+            master_salt,
+            0,
+            auth_key_len,
+        )?);
+        let srtcp_session_auth = SecretVec::new(kdf(
+            crypto,
+            LABEL_SRTCP_AUTHENTICATION_TAG,
+            master_key,
+            master_salt,
+            0,
+            auth_key_len,
+        )?);
+
+        // Key the MACs once per context. Everything above is per-context setup; the auth tag on
+        // each packet then costs only the message pass.
+        let srtp_session_auth = crypto
+            .new_hmac(HmacAlgorithm::Sha1, srtp_session_auth.as_ref())
+            .map_err(crypto_error)?;
+        let srtcp_session_auth = crypto
+            .new_hmac(HmacAlgorithm::Sha1, srtcp_session_auth.as_ref())
+            .map_err(crypto_error)?;
+
+        Ok(Self {
+            profile,
+            srtp_session_salt,
+            srtp_session_auth,
+            srtcp_session_salt,
+            srtcp_session_auth,
+            srtp_cipher,
+            srtcp_cipher,
+        })
+    }
+
+    /// Generate the SRTP HMAC-SHA1 authentication tag described by RFC 3711, section 4.2.
+    ///
+    /// Takes `&mut self` so the pre-keyed [`Mac`] can be used directly; the key schedule was
+    /// derived once in [`new`](Self::new).
+    fn generate_srtp_auth_tag(&mut self, buf: &[u8], roc: u32) -> Result<[u8; 20]> {
+        let mut tag = [0; 20];
+        self.srtp_session_auth
+            .sign(&[buf, &roc.to_be_bytes()], &mut tag)
+            .map_err(crypto_error)?;
+        Ok(tag)
+    }
+
+    /// Generate the SRTCP HMAC-SHA1 authentication tag described by RFC 3711, section 4.2.
+    fn generate_srtcp_auth_tag(&mut self, buf: &[u8]) -> Result<[u8; 20]> {
+        let mut tag = [0; 20];
+        self.srtcp_session_auth
+            .sign(&[buf], &mut tag)
+            .map_err(crypto_error)?;
+        Ok(tag)
+    }
+}
+
+impl Cipher for CipherAesCmHmacSha1 {
+    /// Get RTP authenticated tag length.
+    fn rtp_auth_tag_len(&self) -> usize {
+        self.profile.rtp_auth_tag_len()
+    }
+
+    /// Get RTCP authenticated tag length.
+    fn rtcp_auth_tag_len(&self) -> usize {
+        self.profile.rtcp_auth_tag_len()
+    }
+
+    /// Get AEAD auth key length of the cipher.
+    fn aead_auth_tag_len(&self) -> usize {
+        self.profile.aead_auth_tag_len()
+    }
+
+    fn get_rtcp_index(&self, input: &[u8]) -> usize {
+        let tail_offset = input.len() - (self.profile.rtcp_auth_tag_len() + SRTCP_INDEX_SIZE);
+        (BigEndian::read_u32(&input[tail_offset..tail_offset + SRTCP_INDEX_SIZE]) & !(1 << 31))
+            as usize
+    }
+
+    fn encrypt_rtp(
+        &mut self,
+        plaintext: &[u8],
+        header: &rtp::Header,
+        roc: u32,
+    ) -> Result<BytesMut> {
+        let mut writer = BytesMut::with_capacity(plaintext.len() + self.rtp_auth_tag_len());
+
+        // Write the plaintext to the destination buffer.
+        writer.extend_from_slice(plaintext);
+
+        // Encrypt the payload
+        let counter = generate_counter(
+            header.sequence_number,
+            roc,
+            header.ssrc,
+            &self.srtp_session_salt,
+        );
+
+        self.srtp_cipher
+            .apply_keystream(&counter, &mut writer[header.marshal_size()..])
+            .map_err(crypto_error)?;
+
+        // Generate the auth tag.
+        let full_auth_tag = self.generate_srtp_auth_tag(&writer, roc)?;
+        let auth_tag = &full_auth_tag[..self.rtp_auth_tag_len()];
+        writer.extend_from_slice(auth_tag);
+
+        Ok(writer)
+    }
+
+    fn decrypt_rtp(
+        &mut self,
+        encrypted: &[u8],
+        header: &rtp::Header,
+        roc: u32,
+    ) -> Result<BytesMut> {
+        let encrypted_len = encrypted.len();
+        if encrypted_len < self.rtp_auth_tag_len() {
+            return Err(Error::SrtpTooSmall(encrypted_len, self.rtp_auth_tag_len()));
+        }
+
+        let mut writer = BytesMut::with_capacity(encrypted_len - self.rtp_auth_tag_len());
+
+        // Split the auth tag and the cipher text into two parts.
+        let actual_tag = &encrypted[encrypted_len - self.rtp_auth_tag_len()..];
+        let cipher_text = &encrypted[..encrypted_len - self.rtp_auth_tag_len()];
+
+        // Generate the auth tag we expect to see from the ciphertext.
+        let full_expected_tag = self.generate_srtp_auth_tag(cipher_text, roc)?;
+        let expected_tag = &full_expected_tag[..self.rtp_auth_tag_len()];
+
+        // See if the auth tag actually matches.
+        // We use a constant time comparison to prevent timing attacks.
+        if !constant_time_eq(actual_tag, expected_tag) {
+            return Err(Error::RtpFailedToVerifyAuthTag);
+        }
+
+        // Write cipher_text to the destination buffer.
+        writer.extend_from_slice(cipher_text);
+
+        // Decrypt the ciphertext for the payload.
+        let counter = generate_counter(
+            header.sequence_number,
+            roc,
+            header.ssrc,
+            &self.srtp_session_salt,
+        );
+
+        self.srtp_cipher
+            .apply_keystream(&counter, &mut writer[header.marshal_size()..])
+            .map_err(crypto_error)?;
+
+        Ok(writer)
+    }
+
+    fn encrypt_rtcp(
+        &mut self,
+        decrypted: &[u8],
+        srtcp_index: usize,
+        ssrc: u32,
+    ) -> Result<BytesMut> {
+        let mut writer =
+            BytesMut::with_capacity(decrypted.len() + SRTCP_INDEX_SIZE + self.rtcp_auth_tag_len());
+
+        // Write the decrypted to the destination buffer.
+        writer.extend_from_slice(decrypted);
+
+        // Encrypt everything after header
+        let counter = generate_counter(
+            (srtcp_index & 0xFFFF) as u16,
+            (srtcp_index >> 16) as u32,
+            ssrc,
+            &self.srtcp_session_salt,
+        );
+
+        self.srtcp_cipher
+            .apply_keystream(&counter, &mut writer[HEADER_LENGTH + SSRC_LENGTH..])
+            .map_err(crypto_error)?;
+
+        // Add SRTCP index and set Encryption bit
+        writer.put_u32(srtcp_index as u32 | (1u32 << 31));
+
+        // Generate the auth tag.
+        let full_auth_tag = self.generate_srtcp_auth_tag(&writer)?;
+        let auth_tag = &full_auth_tag[..self.rtcp_auth_tag_len()];
+        writer.extend_from_slice(auth_tag);
+
+        Ok(writer)
+    }
+
+    fn decrypt_rtcp(
+        &mut self,
+        encrypted: &[u8],
+        srtcp_index: usize,
+        ssrc: u32,
+    ) -> Result<BytesMut> {
+        let encrypted_len = encrypted.len();
+        if encrypted_len < self.rtcp_auth_tag_len() + SRTCP_INDEX_SIZE {
+            return Err(Error::SrtcpTooSmall(
+                encrypted_len,
+                self.rtcp_auth_tag_len() + SRTCP_INDEX_SIZE,
+            ));
+        }
+
+        let tail_offset = encrypted_len - (self.rtcp_auth_tag_len() + SRTCP_INDEX_SIZE);
+        if tail_offset < 8 {
+            return Err(Error::ErrTooShortRtcp);
+        }
+
+        let mut writer = BytesMut::with_capacity(tail_offset);
+
+        writer.extend_from_slice(&encrypted[0..tail_offset]);
+
+        // Split the auth tag and the cipher text into two parts.
+        let actual_tag = &encrypted[encrypted_len - self.rtcp_auth_tag_len()..];
+        if actual_tag.len() != self.rtcp_auth_tag_len() {
+            return Err(Error::RtcpInvalidLengthAuthTag(
+                actual_tag.len(),
+                self.rtcp_auth_tag_len(),
+            ));
+        }
+
+        let cipher_text = &encrypted[..encrypted_len - self.rtcp_auth_tag_len()];
+
+        // Generate the auth tag we expect to see from the ciphertext.
+        let full_expected_tag = self.generate_srtcp_auth_tag(cipher_text)?;
+        let expected_tag = &full_expected_tag[..self.rtcp_auth_tag_len()];
+
+        // See if the auth tag actually matches.
+        // We use a constant time comparison to prevent timing attacks.
+        if !constant_time_eq(actual_tag, expected_tag) {
+            return Err(Error::RtcpFailedToVerifyAuthTag);
+        }
+
+        // RFC 3711 §3.4: SRTCP is authenticated whether or not it is encrypted, so the E flag
+        // (which the tag covers) is read only once the tag has verified.
+        let is_encrypted = encrypted[tail_offset] >> 7;
+        if is_encrypted == 0 {
+            return Ok(writer);
+        }
+
+        let counter = generate_counter(
+            (srtcp_index & 0xFFFF) as u16,
+            (srtcp_index >> 16) as u32,
+            ssrc,
+            &self.srtcp_session_salt,
+        );
+
+        self.srtcp_cipher
+            .apply_keystream(&counter, &mut writer[HEADER_LENGTH + SSRC_LENGTH..])
+            .map_err(crypto_error)?;
+
+        Ok(writer)
+    }
+}
+
+#[cfg(test)]
+mod srtcp_unencrypted_test {
+    use super::*;
+
+    fn cipher() -> CipherAesCmHmacSha1 {
+        let provider = crypto::default_provider()
+            .expect("a built-in crypto provider must be enabled for tests");
+        CipherAesCmHmacSha1::new(
+            ProtectionProfile::Aes128CmHmacSha1_80,
+            &[0x11; 16],
+            &[0x22; 14],
+            provider.crypto(),
+        )
+        .unwrap()
+    }
+
+    /// A receiver report with the E flag clear and index 1, before its tag.
+    fn unencrypted_rtcp() -> Vec<u8> {
+        let mut raw = vec![0x80, 0xc9, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef];
+        raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        raw
+    }
+
+    /// RFC 3711 §3.4: SRTCP is authenticated even when the E flag says it is not encrypted. A
+    /// packet with E clear and a made-up tag was accepted without any check, so anyone could
+    /// inject RTCP with no keys.
+    #[test]
+    fn unencrypted_srtcp_with_a_bad_tag_is_rejected() {
+        let mut c = cipher();
+        let mut raw = unencrypted_rtcp();
+        raw.extend_from_slice(&[0u8; 10]);
+        assert!(c.decrypt_rtcp(&raw, 1, 0xdeadbeef).is_err());
+    }
+
+    /// A correctly signed unencrypted SRTCP packet is still accepted, unchanged.
+    #[test]
+    fn unencrypted_srtcp_with_a_valid_tag_is_accepted() {
+        let mut c = cipher();
+        let mut raw = unencrypted_rtcp();
+        let tag = c.generate_srtcp_auth_tag(&raw).unwrap();
+        raw.extend_from_slice(&tag[..c.rtcp_auth_tag_len()]);
+        let plain = c.decrypt_rtcp(&raw, 1, 0xdeadbeef).unwrap();
+        assert_eq!(&plain[..], &unencrypted_rtcp()[..8]);
+    }
+}

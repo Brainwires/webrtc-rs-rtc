@@ -12,29 +12,31 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-openssl = ["dep:openssl"]
-vendored-openssl = ["openssl/vendored"]
+default = ["crypto-ring"]
+crypto-ring = ["crypto/crypto-ring"]
+crypto-aws-lc-rs = ["crypto/crypto-aws-lc-rs"]
+# Kept by the Brainwires fork (upstream removed them): AES-CM keystream from OpenSSL.
+openssl = ["crypto/openssl"]
+vendored-openssl = ["crypto/vendored-openssl"]
 
 [dependencies]
-shared = { workspace = true, default-features = false, features = ["crypto", "marshal", "replay"] }
+shared = { workspace = true, default-features = false, features = ["marshal", "replay"] }
 rtp.workspace = true
 rtcp.workspace = true
+crypto.workspace = true
 
 byteorder.workspace = true
 bytes.workspace = true
-hmac = { version = "0.12.1", features = ["std", "reset"] }
-sha1 = "0.10.6"
-ctr = "0.9.2"
-aes = "0.8.4"
-subtle = "2.5.0"
-aead = { version = "0.5.2", features = ["std"] }
-aes-gcm = { version = "0.10.3", features = ["std"] }
-openssl = { version = "0.10.72", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
-lazy_static = "1.4.0"
+lazy_static.workspace = true
 
 [[bench]]
 name = "bench"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

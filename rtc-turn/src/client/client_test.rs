@@ -6,35 +6,48 @@ use std::net::UdpSocket;
 fn create_test_client_with_turn_server() -> Result<(UdpSocket, Client)> {
     let udp_socket = UdpSocket::bind("127.0.0.1:0")?;
 
-    let client = Client::new(ClientConfig {
-        stun_serv_addr: String::new(),
-        turn_serv_addr: format!("127.0.0.1:{}", udp_socket.local_addr()?.port()),
-        local_addr: udp_socket.local_addr()?,
-        transport_protocol: TransportProtocol::UDP,
-        username: "user".to_string(),
-        password: "pass".to_string(),
-        realm: "test".to_string(),
-        software: "TEST SOFTWARE".to_owned(),
-        rto_in_ms: 0,
-    })?;
+    let client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: format!("127.0.0.1:{}", udp_socket.local_addr()?.port()),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            realm: "test".to_string(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
 
     Ok((udp_socket, client))
+}
+
+/// Tests may resolve the built-in provider; library code never does.
+fn test_crypto_provider() -> std::sync::Arc<dyn crypto::RTCCryptoProvider> {
+    crypto::default_provider().expect("a built-in crypto provider must be enabled for tests")
 }
 
 fn create_listening_test_client(rto_in_ms: u64) -> Result<(UdpSocket, Client)> {
     let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
 
-    let client = Client::new(ClientConfig {
-        stun_serv_addr: String::new(),
-        turn_serv_addr: String::new(),
-        local_addr: udp_socket.local_addr()?,
-        transport_protocol: TransportProtocol::UDP,
-        username: String::new(),
-        password: String::new(),
-        realm: String::new(),
-        software: "TEST SOFTWARE".to_owned(),
-        rto_in_ms,
-    })?;
+    let client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: String::new(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: String::new(),
+            password: String::new(),
+            realm: String::new(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
 
     Ok((udp_socket, client))
 }
@@ -42,19 +55,50 @@ fn create_listening_test_client(rto_in_ms: u64) -> Result<(UdpSocket, Client)> {
 fn create_listening_test_client_with_stun_serv() -> Result<(UdpSocket, Client)> {
     let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
 
-    let client = Client::new(ClientConfig {
-        stun_serv_addr: "stun1.l.google.com:19302".to_owned(),
-        turn_serv_addr: String::new(),
-        local_addr: udp_socket.local_addr()?,
-        transport_protocol: TransportProtocol::UDP,
-        username: String::new(),
-        password: String::new(),
-        realm: String::new(),
-        software: "TEST SOFTWARE".to_owned(),
-        rto_in_ms: 0,
-    })?;
+    let client = Client::new(
+        ClientConfig {
+            stun_serv_addr: "stun1.l.google.com:19302".to_owned(),
+            turn_serv_addr: String::new(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: String::new(),
+            password: String::new(),
+            realm: String::new(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
 
     Ok((udp_socket, client))
+}
+
+/// A host demultiplexing STUN on a socket it shares — a STUN gatherer and this client pointed at
+/// one server address — routes a response by transaction id, because nothing else identifies its
+/// owner. See webrtc-rs/webrtc#890.
+#[test]
+fn test_has_transaction_reports_outstanding_requests() -> Result<()> {
+    let (_conn, mut client) = create_listening_test_client(0)?;
+    let server = "127.0.0.1:3478".parse::<std::net::SocketAddr>().unwrap();
+
+    let unknown = TransactionId::new();
+    assert!(
+        !client.has_transaction(&unknown),
+        "a fresh client is waiting on nothing"
+    );
+
+    let tid = client.send_binding_request_to(Instant::now(), server)?;
+    assert!(
+        client.has_transaction(&tid),
+        "the transaction just started is outstanding"
+    );
+    assert!(
+        !client.has_transaction(&unknown),
+        "an id this client never sent is not its own"
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -64,7 +108,7 @@ fn test_client_with_stun_send_binding_request() -> Result<()> {
     let (conn, mut client) = create_listening_test_client_with_stun_serv()?;
     let local_addr = conn.local_addr()?;
 
-    let tid = client.send_binding_request()?;
+    let tid = client.send_binding_request(Instant::now())?;
 
     while let Some(transmit) = client.poll_write() {
         conn.send_to(&transmit.message, transmit.transport.peer_addr)?;
@@ -109,8 +153,8 @@ fn test_client_with_stun_send_binding_request_to_parallel() -> Result<()> {
 
     let to = lookup_host(true, "stun1.l.google.com:19302")?;
 
-    let tid1 = client.send_binding_request_to(to)?;
-    let tid2 = client.send_binding_request_to(to)?;
+    let tid1 = client.send_binding_request_to(Instant::now(), to)?;
+    let tid2 = client.send_binding_request_to(Instant::now(), to)?;
     while let Some(transmit) = client.poll_write() {
         conn.send_to(&transmit.message, transmit.transport.peer_addr)?;
     }
@@ -156,7 +200,7 @@ fn test_client_with_stun_send_binding_request_to_timeout() -> Result<()> {
 
     let to = lookup_host(true, "127.0.0.1:9")?;
 
-    let tid = client.send_binding_request_to(to)?;
+    let tid = client.send_binding_request_to(Instant::now(), to)?;
     while let Some(transmit) = client.poll_write() {
         conn.send_to(&transmit.message, transmit.transport.peer_addr)?;
     }
@@ -235,4 +279,1088 @@ fn test_local_addr_returns_bound_address() -> Result<()> {
         "local_addr should match the configured address"
     );
     client.close()
+}
+/// The allocation-refresh timer is seeded from the instant passed to `RelayState::new` and
+/// compared against the instant passed to `handle_timeout`, so a refresh can be observed by
+/// arithmetic on a base instant with no wall-clock time passing and no sleeping.
+#[test]
+fn test_relay_refresh_timers_run_on_injected_time() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
+
+    // Stand in for a granted allocation, seeded at t(0) with a 10-minute lifetime.
+    let lifetime = Duration::from_secs(600);
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            lifetime,
+            None,
+        ),
+    );
+
+    // The allocation is refreshed at half its lifetime; permissions sooner, at 120s.
+    assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(120)));
+
+    // One second before the allocation deadline nothing is sent for it. (The permission
+    // refresh at t(120) has already fired by then, so drain whatever it queued first.)
+    client.relay(relayed_addr)?.handle_timeout(t(120));
+    while client.poll_write().is_some() {}
+    client.relay(relayed_addr)?.handle_timeout(t(299));
+    assert!(
+        client.poll_write().is_none(),
+        "no refresh is due one second before the deadline"
+    );
+
+    // At the deadline the Refresh request goes out, stamped with the caller's instant.
+    client.relay(relayed_addr)?.handle_timeout(t(300));
+    let transmit = client
+        .poll_write()
+        .expect("the allocation must be refreshed at half its lifetime");
+    assert_eq!(
+        transmit.now,
+        t(300),
+        "the request carries the instant the caller supplied, not an ambient reading"
+    );
+
+    let mut msg = Message::new();
+    msg.raw = transmit.message.to_vec();
+    msg.decode()?;
+    assert_eq!(msg.typ.method, METHOD_REFRESH);
+
+    // The late permission refresh at t(299) is rescheduled from the time it was handled, so its
+    // next deadline is t(419). The allocation remains due at t(600).
+    assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(419)));
+
+    client.relay(relayed_addr)?.handle_timeout(t(600));
+    let transmit = client
+        .poll_write()
+        .expect("the allocation must be refreshed again a half-lifetime later");
+    assert_eq!(transmit.now, t(600));
+
+    client.close()
+}
+
+/// Applications may refresh an otherwise idle allocation more frequently than half its server
+/// lifetime so the client-to-server NAT mapping does not sit idle for several minutes.
+#[test]
+fn test_allocation_refresh_interval_cap_is_applied() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: Some(Duration::from_secs(30)),
+        },
+        test_crypto_provider(),
+    )?;
+
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    let mut response = Message::new();
+    response.build(&[
+        Box::new(TransactionId::new()),
+        Box::new(MessageType::new(METHOD_ALLOCATE, CLASS_SUCCESS_RESPONSE)),
+        Box::new(RelayedAddress {
+            ip: relayed_addr.ip(),
+            port: relayed_addr.port(),
+        }),
+        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(600))),
+    ])?;
+    client.handle_allocate_response(
+        base,
+        response,
+        TransactionType::AllocateRequest(Nonce::new(ATTR_NONCE, "nonce".to_owned())),
+    )?;
+
+    for expected_secs in [30, 60, 90, 120, 150, 180] {
+        assert_eq!(
+            client.relay(relayed_addr)?.poll_timeout(),
+            Some(t(expected_secs))
+        );
+        client.relay(relayed_addr)?.handle_timeout(t(expected_secs));
+
+        let transmit = client
+            .poll_write()
+            .expect("the configured cadence must emit an allocation Refresh");
+        let mut message = Message::new();
+        message.raw = transmit.message.to_vec();
+        message.decode()?;
+        assert_eq!(message.typ.method, METHOD_REFRESH);
+    }
+
+    assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(210)));
+
+    client.close()
+}
+
+/// Handling an overdue relay timer once must put every refreshed deadline back in the future.
+/// A runtime may be suspended for longer than several refresh intervals on a mobile platform;
+/// replaying each missed interval makes a Sans-I/O driver spin through historical deadlines.
+#[test]
+fn test_overdue_relay_refreshes_are_rescheduled_from_now() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
+
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+
+    let resumed_at = t(1000);
+    client.relay(relayed_addr)?.handle_timeout(resumed_at);
+
+    assert_eq!(
+        client.relay(relayed_addr)?.poll_timeout(),
+        Some(t(1120)),
+        "one timeout pass must move the permission and allocation deadlines past now"
+    );
+
+    client.close()
+}
+
+/// A relay whose lifetime has gone to zero must not hand the caller a deadline that never
+/// advances.
+///
+/// This is the root cause behind [webrtc#862](https://github.com/webrtc-rs/webrtc/issues/862).
+/// `Relay::handle_timeout` advances the allocation timer by adding to the timer's **own**
+/// previous value rather than to `now`:
+///
+/// ```ignore
+/// relay.refresh_alloc_timer = relay.refresh_alloc_timer.add(relay.lifetime / 2);
+/// ```
+///
+/// so the step size is `lifetime / 2`. `lifetime` is assigned straight from the server's
+/// LIFETIME attribute on every refresh response, with no floor — and `Relay::close` refreshes
+/// with `LIFETIME=0`, which is how RFC 5766 deallocates. Once the server echoes that back the
+/// step becomes zero, the timer is frozen, and because nothing ever removes the entry from
+/// `client.relays` the relay keeps reporting it forever.
+///
+/// The peer-connection driver treats an expired deadline as "handle it and loop again", so a
+/// frozen expired deadline is an unbounded hot loop — starving the very `Close` that triggered
+/// it. That matches the report: cleanup never completes and the process will not exit.
+#[test]
+fn test_zero_lifetime_relay_does_not_freeze_its_deadline() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
+
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+
+    // What the server's response to `close()`'s LIFETIME=0 refresh does.
+    client.relays.get_mut(&relayed_addr).unwrap().lifetime = Duration::from_secs(0);
+
+    // Drive past both timers, exactly as the driver does: read the deadline, handle it,
+    // read again. The deadline must move, or the caller is told to act on the same instant
+    // forever.
+    let mut previous = client.relay(relayed_addr)?.poll_timeout();
+    for iteration in 0..10 {
+        let now = t(1000 + iteration);
+        client.relay(relayed_addr)?.handle_timeout(now);
+        let next = client.relay(relayed_addr)?.poll_timeout();
+
+        assert!(
+            next != previous || next.is_none(),
+            "iteration {iteration}: deadline did not advance ({previous:?} -> {next:?}) while \
+             `now` is {:?} past it. The driver reads this as a zero delay, calls handle_timeout \
+             and loops — forever.",
+            now.saturating_duration_since(previous.unwrap_or(now)),
+        );
+        previous = next;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_refresh_response_reschedules_shorter_lifetime_from_response_time() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+    assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(120)));
+
+    let mut response = Message::new();
+    response.build(&[
+        Box::new(TransactionId::new()),
+        Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
+        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(60))),
+    ])?;
+    client
+        .relay(relayed_addr)?
+        .handle_refresh_allocation_response(t(30), response)?;
+
+    assert_eq!(
+        client.relay(relayed_addr)?.poll_timeout(),
+        Some(t(60)),
+        "a shorter server lifetime must move the allocation refresh deadline earlier"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_refresh_response_reschedule_applies_interval_cap() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: Some(Duration::from_secs(20)),
+        },
+        test_crypto_provider(),
+    )?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            Duration::from_secs(600),
+            Some(Duration::from_secs(20)),
+        ),
+    );
+
+    let mut response = Message::new();
+    response.build(&[
+        Box::new(TransactionId::new()),
+        Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
+        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(60))),
+    ])?;
+    client
+        .relay(relayed_addr)?
+        .handle_refresh_allocation_response(t(30), response)?;
+
+    assert_eq!(client.relay(relayed_addr)?.poll_timeout(), Some(t(50)));
+    Ok(())
+}
+
+/// A server confirming deallocation must leave no relay behind.
+///
+/// `close()` refreshes the allocation with `LIFETIME=0`; the server echoes that back to confirm
+/// the allocation is gone. Before the fix for
+/// [webrtc#862](https://github.com/webrtc-rs/webrtc/issues/862) the response handler stored the
+/// zero and nothing else — the entry stayed in `client.relays` forever, still reporting refresh
+/// deadlines for an allocation that no longer existed, and still trying to refresh it.
+///
+/// Flooring the refresh step stops the *hot loop*; only removing the relay stops the dead
+/// allocation. Both are needed, and this covers the second.
+#[test]
+fn test_zero_lifetime_response_drops_the_relay() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
+
+    let relayed_addr: RelayedAddr = "127.0.0.1:50000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            t(0),
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+    assert!(client.relay(relayed_addr)?.poll_timeout().is_some());
+
+    // What the TURN server sends back when it honours `close()`'s LIFETIME=0 refresh.
+    let mut res = Message::new();
+    res.build(&[
+        Box::new(TransactionId::new()),
+        Box::new(MessageType::new(METHOD_REFRESH, CLASS_SUCCESS_RESPONSE)),
+        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(0))),
+    ])?;
+
+    client
+        .relay(relayed_addr)?
+        .handle_refresh_allocation_response(t(1), res)?;
+
+    assert!(
+        !client.relays.contains_key(&relayed_addr),
+        "a deallocated allocation must not stay in the relay map — it would keep reporting \
+         refresh deadlines and keep trying to refresh something that no longer exists"
+    );
+
+    Ok(())
+}
+
+/// An Allocate success response carrying `LIFETIME=0` is rejected, not accepted as a
+/// degenerate allocation.
+///
+/// RFC 5766 §6.2 has the server take `min(client proposed, server maximum)` and fall back to
+/// the *default* lifetime (600 s) whenever that does not exceed it, so a successful Allocate
+/// never returns a lifetime below the default — zero is a protocol violation. Zero is
+/// meaningful only on the Refresh path (§7), where it means the allocation was deleted.
+///
+/// Accepting it would insert a `RelayState` whose `refresh_alloc_timer` is `now.add(0)` —
+/// already expired at construction — for an allocation that does not exist. That relay then
+/// reports an expired refresh deadline forever, which is the hot loop in
+/// [webrtc#862](https://github.com/webrtc-rs/webrtc/issues/862), reached here without any
+/// close being involved.
+#[test]
+fn test_zero_lifetime_allocate_response_is_an_error() -> Result<()> {
+    let base = Instant::now();
+    let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
+    let mut client = Client::new(
+        ClientConfig {
+            stun_serv_addr: String::new(),
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: udp_socket.local_addr()?,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            realm: "realm".to_owned(),
+            software: "TEST SOFTWARE".to_owned(),
+            rto_in_ms: 0,
+            allocation_refresh_interval_cap: None,
+        },
+        test_crypto_provider(),
+    )?;
+
+    let mut res = Message::new();
+    res.build(&[
+        Box::new(TransactionId::new()),
+        Box::new(MessageType::new(METHOD_ALLOCATE, CLASS_SUCCESS_RESPONSE)),
+        Box::new(RelayedAddress {
+            ip: "127.0.0.1".parse().unwrap(),
+            port: 50000,
+        }),
+        Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(0))),
+    ])?;
+
+    client.handle_allocate_response(
+        base,
+        res,
+        TransactionType::AllocateRequest(Nonce::new(ATTR_NONCE, "nonce".to_owned())),
+    )?;
+
+    assert!(
+        client.relays.is_empty(),
+        "a zero-lifetime Allocate response must not create a relay — the allocation does not \
+         exist, and the relay would report an already-expired refresh deadline forever"
+    );
+
+    match client.poll_event() {
+        Some(Event::AllocateError(_, _)) => Ok(()),
+        other => {
+            panic!("expected AllocateError for a zero-lifetime Allocate response, got {other:?}")
+        }
+    }
+}
+
+/// Over a TCP connection to the server the relay is still UDP: `REQUESTED-TRANSPORT` names what
+/// the allocation relays, not how the client reaches the server (RFC 8656 §7.1). Deriving it from
+/// the control transport asks a TCP client's server for an RFC 6062 TCP allocation instead.
+#[test]
+fn test_allocate_over_tcp_requests_a_udp_relay() -> Result<()> {
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: "127.0.0.1:50000".parse().unwrap(),
+            transport_protocol: TransportProtocol::TCP,
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    client.allocate(Instant::now())?;
+
+    let transmit = client.poll_write().expect("an Allocate request");
+    assert_eq!(
+        transmit.transport.transport_protocol,
+        TransportProtocol::TCP,
+        "the request itself still travels over TCP"
+    );
+    let mut msg = Message::new();
+    msg.raw = transmit.message.to_vec();
+    msg.decode()?;
+    let mut requested = RequestedTransport::default();
+    requested.get_from(&msg)?;
+    assert_eq!(requested.protocol, PROTO_UDP, "the relay is UDP");
+    Ok(())
+}
+
+/// Over a reliable transport a request is sent once and answered or timed out as a whole: TCP
+/// already retransmits, and repeating the request on top of it only sends the server duplicates
+/// (RFC 8489 §6.2.2). The wait is Ti, 39.5 seconds, not the UDP schedule's ~8.
+#[test]
+fn test_a_request_over_tcp_is_sent_once_and_times_out_at_ti() -> Result<()> {
+    let start = Instant::now();
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: "127.0.0.1:50000".parse().unwrap(),
+            transport_protocol: TransportProtocol::TCP,
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    let tid = client.allocate(start)?;
+    assert!(client.poll_write().is_some(), "the request goes out once");
+
+    // Walk every deadline the client asks for, up to just short of Ti.
+    let ti = Duration::from_millis(39_500);
+    let mut sends = 0;
+    while let Some(deadline) = client.poll_timeout() {
+        if deadline >= start + ti {
+            break;
+        }
+        client.handle_timeout(deadline)?;
+        while client.poll_write().is_some() {
+            sends += 1;
+        }
+    }
+    assert_eq!(sends, 0, "nothing is retransmitted over TCP");
+    assert!(
+        client.poll_event().is_none(),
+        "no timeout before Ti has passed"
+    );
+
+    client.handle_timeout(start + ti)?;
+    assert!(client.poll_write().is_none(), "not even at the deadline");
+    assert!(
+        matches!(client.poll_event(), Some(Event::TransactionTimeout(id)) if id == tid),
+        "at Ti the request has timed out, under the id allocate() handed out"
+    );
+    Ok(())
+}
+
+/// UDP keeps its schedule: the first retransmission is due one RTO after the request.
+#[test]
+fn test_a_request_over_udp_is_still_retransmitted() -> Result<()> {
+    let start = Instant::now();
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: "127.0.0.1:3478".to_owned(),
+            local_addr: "127.0.0.1:50000".parse().unwrap(),
+            transport_protocol: TransportProtocol::UDP,
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    client.allocate(start)?;
+    assert!(client.poll_write().is_some());
+    let first = client.poll_timeout().expect("a retransmit deadline");
+    assert!(
+        first < start + Duration::from_secs(1),
+        "{:?}",
+        first - start
+    );
+    client.handle_timeout(first)?;
+    assert!(client.poll_write().is_some(), "UDP retransmits");
+    Ok(())
+}
+
+/// A timed-out Allocate is reported under the id [`Client::allocate`] returned — the one the
+/// caller has to match it with. An anonymous Allocate goes out under the id before it, so a
+/// caller that only knows what `allocate()` told it would never recognise the timeout and
+/// could wait on that allocation for ever; the responses already follow this convention.
+#[test]
+fn test_an_allocate_that_is_never_answered_times_out_under_the_id_allocate_returned() -> Result<()>
+{
+    for transport_protocol in [TransportProtocol::UDP, TransportProtocol::TCP] {
+        let start = Instant::now();
+        let mut client = Client::new(
+            ClientConfig {
+                turn_serv_addr: "127.0.0.1:3478".to_owned(),
+                local_addr: "127.0.0.1:50000".parse().unwrap(),
+                transport_protocol,
+                ..Default::default()
+            },
+            test_crypto_provider(),
+        )?;
+        let tid = client.allocate(start)?;
+        while client.poll_write().is_some() {}
+
+        // Every deadline the client asks for, until it has nothing left to wait on.
+        let mut timeout = None;
+        while let Some(deadline) = client.poll_timeout() {
+            client.handle_timeout(deadline)?;
+            while client.poll_write().is_some() {}
+            while let Some(event) = client.poll_event() {
+                if let Event::TransactionTimeout(id) = event {
+                    timeout = Some((id, deadline));
+                }
+            }
+        }
+        let (id, at) = timeout.expect("a server that never answers times the request out");
+        assert_eq!(
+            id, tid,
+            "{transport_protocol:?}: the timeout must name the allocation its caller knows"
+        );
+        assert!(
+            at <= start + Duration::from_millis(39_500),
+            "{transport_protocol:?}: timed out at {:?}",
+            at - start
+        );
+    }
+    Ok(())
+}
+
+/// An error reply to the anonymous Allocate that carries no NONCE, or no REALM — a 400, a 403,
+/// a 486, or a server that simply left the attribute out — is reported as an
+/// [`Event::AllocateError`], and that too has to name the allocation its caller knows: the id
+/// [`Client::allocate`] returned, as a response and now a timeout do. It named the anonymous
+/// request instead, so a caller matching on what `allocate()` told it never saw the error,
+/// and waited on the allocation for ever.
+#[test]
+fn test_an_error_reply_without_a_nonce_is_reported_under_the_id_allocate_returned() -> Result<()> {
+    use stun::error_code::{CODE_BAD_REQUEST, CODE_UNAUTHORIZED, ErrorCode};
+
+    // Neither attribute, and a 401 that remembered the nonce but not the realm.
+    let replies: [(ErrorCode, Option<Nonce>); 2] = [
+        (CODE_BAD_REQUEST, None),
+        (
+            CODE_UNAUTHORIZED,
+            Some(Nonce::new(ATTR_NONCE, "nonce".to_owned())),
+        ),
+    ];
+    for (code, nonce) in replies {
+        let start = Instant::now();
+        let local_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+        let mut client = Client::new(
+            ClientConfig {
+                turn_serv_addr: server_addr.to_string(),
+                local_addr,
+                transport_protocol: TransportProtocol::UDP,
+                ..Default::default()
+            },
+            test_crypto_provider(),
+        )?;
+        let tid = client.allocate(start)?;
+        let request = client
+            .poll_write()
+            .expect("the anonymous Allocate goes out");
+        let mut sent = Message::new();
+        sent.raw = request.message.to_vec();
+        sent.decode()?;
+
+        let mut attributes: Vec<Box<dyn Setter>> = vec![
+            Box::new(sent.transaction_id),
+            Box::new(MessageType::new(METHOD_ALLOCATE, CLASS_ERROR_RESPONSE)),
+            Box::new(ErrorCodeAttribute {
+                code,
+                reason: b"no".to_vec(),
+            }),
+        ];
+        if let Some(nonce) = nonce {
+            attributes.push(Box::new(nonce));
+        }
+        attributes.push(Box::new(FINGERPRINT));
+        let mut reply = Message::new();
+        reply.build(&attributes)?;
+
+        client.handle_read(TransportMessage {
+            now: start,
+            transport: TransportContext {
+                local_addr,
+                peer_addr: server_addr,
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: BytesMut::from(&reply.raw[..]),
+        })?;
+
+        let mut error = None;
+        while let Some(event) = client.poll_event() {
+            if let Event::AllocateError(id, err) = event {
+                error = Some((id, err));
+            }
+        }
+        let (id, _) = error.expect("a reply the client cannot authenticate with is an error");
+        assert_eq!(
+            id, tid,
+            "{}: the error must name the allocation its caller knows",
+            code.0
+        );
+    }
+    Ok(())
+}
+
+/// A Data indication (or ChannelData) that does not come from the TURN server is not relayed
+/// peer data: anyone could send one to the client's socket.
+#[test]
+fn test_data_from_a_non_server_address_is_ignored() -> Result<()> {
+    let (conn, mut client) = create_test_client_with_turn_server()?;
+    let local_addr = conn.local_addr()?;
+    let server_addr = client.turn_server_addr().expect("configured");
+    let stray: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    assert_ne!(stray, server_addr);
+
+    let indication = |from: SocketAddr| -> Result<TransportMessage<BytesMut>> {
+        let mut msg = Message::new();
+        msg.build(&[
+            Box::new(MessageType::new(METHOD_DATA, CLASS_INDICATION)),
+            Box::new(TransactionId::new()),
+            Box::new(PeerAddress {
+                ip: "10.0.0.1".parse().unwrap(),
+                port: 5000,
+            }),
+            Box::new(Data(b"hello".to_vec())),
+        ])?;
+        Ok(TransportMessage {
+            now: Instant::now(),
+            transport: TransportContext {
+                local_addr,
+                peer_addr: from,
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: BytesMut::from(&msg.raw[..]),
+        })
+    };
+
+    client.handle_read(indication(stray)?)?;
+    assert!(
+        client.poll_event().is_none(),
+        "a Data indication from a stray address was delivered as relayed data"
+    );
+
+    client.handle_read(indication(server_addr)?)?;
+    assert!(
+        matches!(
+            client.poll_event(),
+            Some(Event::DataIndicationOrChannelData(..))
+        ),
+        "a Data indication from the TURN server is still delivered"
+    );
+    client.close()
+}
+
+/// A server-side view of the exchange in `test_responses_without_valid_integrity_are_dropped`.
+struct FakeTurnServer {
+    local_addr: SocketAddr,
+    server_addr: SocketAddr,
+    key: Vec<u8>,
+}
+
+impl FakeTurnServer {
+    /// The next request the client sent, decoded.
+    fn next_request(&self, client: &mut Client) -> Message {
+        let transmit = client.poll_write().expect("the client sent a request");
+        let mut msg = Message::new();
+        msg.raw = transmit.message.to_vec();
+        msg.decode().expect("the client's request decodes");
+        msg
+    }
+
+    /// Answers `request` with `class` and `attrs`, signed with `key` when given.
+    fn answer(
+        &self,
+        client: &mut Client,
+        request: &Message,
+        class: MessageClass,
+        attrs: Vec<Box<dyn Setter>>,
+        key: Option<&[u8]>,
+    ) -> Result<()> {
+        let provider = test_crypto_provider();
+        let mut setters: Vec<Box<dyn Setter + '_>> = vec![
+            Box::new(request.transaction_id),
+            Box::new(MessageType::new(request.typ.method, class)),
+        ];
+        setters.extend(attrs);
+        if let Some(key) = key {
+            setters.push(Box::new(MessageIntegrity::new_raw_integrity_with_provider(
+                key.to_vec(),
+                provider.crypto(),
+            )));
+        }
+        setters.push(Box::new(FINGERPRINT));
+        let mut reply = Message::new();
+        reply.build(&setters)?;
+        client.handle_read(TransportMessage {
+            now: Instant::now(),
+            transport: TransportContext {
+                local_addr: self.local_addr,
+                peer_addr: self.server_addr,
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: BytesMut::from(&reply.raw[..]),
+        })
+    }
+}
+
+/// Responses to authenticated TURN requests (Allocate after the 401, Refresh,
+/// CreatePermission, ChannelBind) must carry a MESSAGE-INTEGRITY made with the long-term key.
+/// One that is unsigned or signed with another key is dropped, leaving the transaction open;
+/// only 401 and 438 error responses may come unsigned.
+#[test]
+fn test_responses_without_valid_integrity_are_dropped() -> Result<()> {
+    let local_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let server_addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+    let relayed_addr: SocketAddr = "192.0.2.15:50000".parse().unwrap();
+    let peer_addr: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: server_addr.to_string(),
+            local_addr,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    let server = FakeTurnServer {
+        local_addr,
+        server_addr,
+        key: MessageIntegrity::long_term_integrity_key(
+            "user".to_owned(),
+            "realm".to_owned(),
+            "pass".to_owned(),
+            test_crypto_provider().crypto(),
+        )?,
+    };
+    let wrong_key = MessageIntegrity::long_term_integrity_key(
+        "user".to_owned(),
+        "realm".to_owned(),
+        "guess".to_owned(),
+        test_crypto_provider().crypto(),
+    )?;
+    let forgeries: [Option<&[u8]>; 2] = [None, Some(&wrong_key)];
+
+    // The anonymous Allocate is answered with the 401 nonce exchange, unsigned as servers do.
+    let tid = client.allocate(Instant::now())?;
+    let attempt = server.next_request(&mut client);
+    server.answer(
+        &mut client,
+        &attempt,
+        CLASS_ERROR_RESPONSE,
+        vec![
+            Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_UNAUTHORIZED,
+                reason: b"Unauthorized".to_vec(),
+            }),
+            Box::new(Nonce::new(ATTR_NONCE, "nonce".to_owned())),
+            Box::new(Realm::new(ATTR_REALM, "realm".to_owned())),
+        ],
+        None,
+    )?;
+    let allocate = server.next_request(&mut client);
+    assert_eq!(allocate.transaction_id, tid);
+    assert!(allocate.contains(ATTR_MESSAGE_INTEGRITY));
+
+    let allocate_success = || -> Vec<Box<dyn Setter>> {
+        vec![
+            Box::new(RelayedAddress {
+                ip: relayed_addr.ip(),
+                port: relayed_addr.port(),
+            }),
+            Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(600))),
+        ]
+    };
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &allocate,
+            CLASS_SUCCESS_RESPONSE,
+            allocate_success(),
+            forged,
+        )?;
+        assert!(
+            client.poll_event().is_none(),
+            "a forged Allocate success response was accepted"
+        );
+        server.answer(
+            &mut client,
+            &allocate,
+            CLASS_ERROR_RESPONSE,
+            vec![Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_FORBIDDEN,
+                reason: b"Forbidden".to_vec(),
+            })],
+            forged,
+        )?;
+        assert!(
+            client.poll_event().is_none(),
+            "a forged Allocate error response was accepted"
+        );
+        assert!(client.has_transaction(&tid), "the Allocate stays open");
+    }
+    server.answer(
+        &mut client,
+        &allocate,
+        CLASS_SUCCESS_RESPONSE,
+        allocate_success(),
+        Some(&server.key),
+    )?;
+    assert!(matches!(
+        client.poll_event(),
+        Some(Event::AllocateResponse(id, addr)) if id == tid && addr == relayed_addr
+    ));
+
+    // CreatePermission.
+    let tid = client
+        .relay(relayed_addr)?
+        .create_permission(Instant::now(), peer_addr)?
+        .expect("a new permission is requested");
+    let create_permission = server.next_request(&mut client);
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &create_permission,
+            CLASS_SUCCESS_RESPONSE,
+            vec![],
+            forged,
+        )?;
+        server.answer(
+            &mut client,
+            &create_permission,
+            CLASS_ERROR_RESPONSE,
+            vec![Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_FORBIDDEN,
+                reason: b"Forbidden".to_vec(),
+            })],
+            forged,
+        )?;
+        assert!(
+            client.poll_event().is_none(),
+            "a forged CreatePermission response was accepted"
+        );
+        assert!(client.has_transaction(&tid));
+    }
+    server.answer(
+        &mut client,
+        &create_permission,
+        CLASS_SUCCESS_RESPONSE,
+        vec![],
+        Some(&server.key),
+    )?;
+    assert!(matches!(
+        client.poll_event(),
+        Some(Event::CreatePermissionResponse(id, addr)) if id == tid && addr == peer_addr
+    ));
+
+    // ChannelBind, started by the first send to the permitted peer (which also sends the data
+    // as a Send indication meanwhile).
+    client
+        .relay(relayed_addr)?
+        .send_to(Instant::now(), b"hi", peer_addr)?;
+    let channel_bind = server.next_request(&mut client);
+    assert_eq!(channel_bind.typ.method, METHOD_CHANNEL_BIND);
+    while client.poll_write().is_some() {}
+    let binding_state = |client: &Client| {
+        client
+            .binding_mgr
+            .find_by_addr(&peer_addr)
+            .map(|b| b.state())
+    };
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &channel_bind,
+            CLASS_SUCCESS_RESPONSE,
+            vec![],
+            forged,
+        )?;
+        assert_eq!(
+            binding_state(&client),
+            Some(BindingState::Request),
+            "a forged ChannelBind success response was accepted"
+        );
+        server.answer(
+            &mut client,
+            &channel_bind,
+            CLASS_ERROR_RESPONSE,
+            vec![Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_FORBIDDEN,
+                reason: b"Forbidden".to_vec(),
+            })],
+            forged,
+        )?;
+        assert_eq!(
+            binding_state(&client),
+            Some(BindingState::Request),
+            "a forged ChannelBind error response was accepted"
+        );
+    }
+    server.answer(
+        &mut client,
+        &channel_bind,
+        CLASS_SUCCESS_RESPONSE,
+        vec![],
+        Some(&server.key),
+    )?;
+    assert_eq!(binding_state(&client), Some(BindingState::Ready));
+
+    // Refresh: a forged LIFETIME=0 would make the client drop a live allocation.
+    client.refresh_allocations(Instant::now())?;
+    let refresh = server.next_request(&mut client);
+    assert_eq!(refresh.typ.method, METHOD_REFRESH);
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &refresh,
+            CLASS_SUCCESS_RESPONSE,
+            vec![Box::new(crate::proto::lifetime::Lifetime(Duration::ZERO))],
+            forged,
+        )?;
+        assert!(
+            client.relay(relayed_addr).is_ok(),
+            "a forged Refresh response released the allocation"
+        );
+        assert!(client.has_transaction(&refresh.transaction_id));
+    }
+
+    // A 438 is answered unsigned by servers and still updates the nonce.
+    server.answer(
+        &mut client,
+        &refresh,
+        CLASS_ERROR_RESPONSE,
+        vec![
+            Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_STALE_NONCE,
+                reason: b"Stale Nonce".to_vec(),
+            }),
+            Box::new(Nonce::new(ATTR_NONCE, "fresh".to_owned())),
+        ],
+        None,
+    )?;
+    assert!(!client.has_transaction(&refresh.transaction_id));
+    assert_eq!(
+        client
+            .relays
+            .get(&relayed_addr)
+            .map(|r| r.nonce.text.clone()),
+        Some("fresh".to_owned())
+    );
+
+    Ok(())
 }

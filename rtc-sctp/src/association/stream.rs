@@ -1,23 +1,30 @@
 use crate::association::Association;
 use crate::association::state::AssociationState;
-use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
+use crate::chunk::chunk_payload_data::{
+    ChunkPayloadData, MessageReliability, PayloadProtocolIdentifier,
+};
 use crate::queue::reassembly_queue::{Chunks, ReassemblyQueue};
 use crate::{ErrorCauseCode, Event, Side};
 use shared::error::{Error, Result};
 
-use crate::util::{ByteSlice, BytesArray, BytesSource};
+use crate::util::{ByteSlice, BytesArray, BytesChunk, BytesSource};
 use bytes::Bytes;
 use log::{debug, error, trace};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// Identifier for a stream within a particular association
 pub type StreamId = u16;
 
 /// Application events about streams
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamEvent {
     /// One or more new streams has been opened
-    Opened { id: StreamId },
+    Opened {
+        /// Which stream was opened.
+        id: StreamId,
+    },
     /// A currently open stream has data or errors waiting to be read
     Readable {
         /// Which stream is now readable
@@ -54,10 +61,22 @@ pub enum StreamEvent {
         /// Which stream is now readable
         id: StreamId,
     },
+    /// Outgoing buffered data was released (acknowledged OR abandoned), carrying
+    /// the exact number of user payload bytes freed for this stream. Unlike the
+    /// edge-triggered [`StreamEvent::BufferedAmountLow`], this fires on every
+    /// release with the byte delta, so upper layers can keep their own
+    /// send-buffer accounting (e.g. a synchronous back-pressure counter) exact.
+    BufferedAmountReleased {
+        /// Which stream released buffered bytes
+        id: StreamId,
+        /// User payload bytes released
+        n_bytes: usize,
+    },
 }
 
 /// Reliability type for stream
 #[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ReliabilityType {
     /// ReliabilityTypeReliable is used for reliable transmission
     #[default]
@@ -111,15 +130,28 @@ impl Stream<'_> {
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier)
             && (s.state == RecvSendState::ReadWritable || s.state == RecvSendState::Readable)
         {
-            Ok(s.reassembly_queue.read())
+            let chunks = s.reassembly_queue.read();
+            if !s.reassembly_queue.is_readable() {
+                self.association
+                    .retry_deferred_resets(self.stream_identifier);
+            }
+            Ok(chunks)
         } else {
             Err(Error::ErrStreamClosed)
         }
     }
 
     /// write_sctp writes len(p) bytes from p to the DTLS connection
-    pub fn write_sctp(&mut self, p: &Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
-        self.write_source(&mut ByteSlice::from_slice(p), ppi)
+    ///
+    /// `now` is the instant the message is handed to the stack. See the note on
+    /// [`Stream`] for why it is a parameter.
+    pub fn write_sctp(
+        &mut self,
+        now: Instant,
+        p: &Bytes,
+        ppi: PayloadProtocolIdentifier,
+    ) -> Result<usize> {
+        self.write_source(now, &mut BytesChunk::new(p), ppi)
     }
 
     /// Send data on the given stream.
@@ -127,23 +159,46 @@ impl Stream<'_> {
     /// Uses the deafult payload protocol (PPI).
     ///
     /// Returns the number of bytes successfully written.
-    pub fn write(&mut self, data: &[u8]) -> Result<usize> {
-        self.write_with_ppi(data, self.get_default_payload_type()?)
+    pub fn write(&mut self, now: Instant, data: &[u8]) -> Result<usize> {
+        self.write_with_ppi(now, data, self.get_default_payload_type()?)
     }
 
     /// Send data on the given stream, with a specific payload protocol.
     ///
     /// Returns the number of bytes successfully written.
-    pub fn write_with_ppi(&mut self, data: &[u8], ppi: PayloadProtocolIdentifier) -> Result<usize> {
-        self.write_source(&mut ByteSlice::from_slice(data), ppi)
+    pub fn write_with_ppi(
+        &mut self,
+        now: Instant,
+        data: &[u8],
+        ppi: PayloadProtocolIdentifier,
+    ) -> Result<usize> {
+        self.write_source(now, &mut ByteSlice::from_slice(data), ppi)
     }
 
     /// write writes len(p) bytes from p with the default Payload Protocol Identifier
-    pub fn write_chunk(&mut self, p: &Bytes) -> Result<usize> {
+    pub fn write_chunk(&mut self, now: Instant, p: &Bytes) -> Result<usize> {
         self.write_source(
-            &mut ByteSlice::from_slice(p),
+            now,
+            &mut BytesChunk::new(p),
             self.get_default_payload_type()?,
         )
+    }
+
+    /// Send an owned [`Bytes`] on the stream with a specific payload protocol.
+    ///
+    /// Unlike [`write_with_ppi`](Self::write_with_ppi), which takes a `&[u8]` and
+    /// must copy it into a freshly allocated buffer, this enqueues the payload
+    /// zero-copy: each fragment is a refcounted slice of `data`. Prefer this on the
+    /// hot send path when the caller already owns the payload as `Bytes`.
+    ///
+    /// Returns the number of bytes successfully written.
+    pub fn write_chunk_with_ppi(
+        &mut self,
+        now: Instant,
+        data: &Bytes,
+        ppi: PayloadProtocolIdentifier,
+    ) -> Result<usize> {
+        self.write_source(now, &mut BytesChunk::new(data), ppi)
     }
 
     /// Send data on the given stream
@@ -152,8 +207,9 @@ impl Stream<'_> {
     /// Note that this method might also write a partial chunk. In this case
     /// it will not count this chunk as fully written. However
     /// the chunk will be advanced and contain only non-written data after the call.
-    pub fn write_chunks(&mut self, data: &mut [Bytes]) -> Result<usize> {
+    pub fn write_chunks(&mut self, now: Instant, data: &mut [Bytes]) -> Result<usize> {
         self.write_source(
+            now,
             &mut BytesArray::from_chunks(data),
             self.get_default_payload_type()?,
         )
@@ -162,6 +218,7 @@ impl Stream<'_> {
     /// write_source writes BytesSource to the DTLS connection
     fn write_source<B: BytesSource>(
         &mut self,
+        now: Instant,
         source: &mut B,
         ppi: PayloadProtocolIdentifier,
     ) -> Result<usize> {
@@ -182,10 +239,11 @@ impl Stream<'_> {
             _ => {}
         };
 
+        let id = self.association.allocate_message_id()?;
         let (p, _) = source.pop_chunk(self.association.max_message_size() as usize);
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            let (is_buffered_amount_high, chunks) = s.packetize(&p, ppi);
+            let (is_buffered_amount_high, chunks) = s.packetize(now, &p, ppi);
 
             if is_buffered_amount_high {
                 trace!("StreamEvent::BufferedAmountHigh");
@@ -196,7 +254,7 @@ impl Stream<'_> {
                     }))
             }
 
-            self.association.send_payload_data(chunks)?;
+            self.association.send_payload_data(id, chunks);
 
             Ok(p.len())
         } else {
@@ -204,6 +262,7 @@ impl Stream<'_> {
         }
     }
 
+    /// Whether this stream has data or an error waiting to be read.
     pub fn is_readable(&self) -> bool {
         if let Some(s) = self.association.streams.get(&self.stream_identifier) {
             s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable
@@ -212,6 +271,7 @@ impl Stream<'_> {
         }
     }
 
+    /// Whether this stream can currently accept more data.
     pub fn is_writable(&self) -> bool {
         if let Some(s) = self.association.streams.get(&self.stream_identifier) {
             s.state == RecvSendState::Writable || s.state == RecvSendState::ReadWritable
@@ -222,7 +282,10 @@ impl Stream<'_> {
 
     /// stop closes the read-direction of the stream.
     /// Future calls to read are not permitted after calling stop.
-    pub fn stop(&mut self) -> Result<()> {
+    ///
+    /// `now` is the instant the caller is acting at: resetting the stream queues an outgoing
+    /// chunk, so it is on the same write path as [`write_sctp`](Self::write_sctp).
+    pub fn stop(&mut self, now: Instant) -> Result<()> {
         let mut reset = false;
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
             if s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable {
@@ -235,7 +298,7 @@ impl Stream<'_> {
             // Reset the outgoing stream
             // https://tools.ietf.org/html/rfc6525
             self.association
-                .send_reset_request(self.stream_identifier)?;
+                .send_reset_request(now, self.stream_identifier)?;
         }
 
         Ok(())
@@ -256,14 +319,30 @@ impl Stream<'_> {
     /// immediately with an appropriate value (see the documentation of `Shutdown`).
     ///
     /// Resets the stream when both halves of this stream are shutdown.
-    pub fn close(&mut self) -> Result<()> {
+    pub fn close(&mut self, now: Instant) -> Result<()> {
         self.finish()?;
-        self.stop()
+        self.stop(now)
     }
 
     /// stream_identifier returns the Stream identifier associated to the stream.
     pub fn stream_identifier(&self) -> StreamId {
         self.stream_identifier
+    }
+
+    /// Sets this stream's weight under weighted fair queueing, in data channel priority units
+    /// (RFC 8832: 128, 256, 512, 1024); messages written afterwards use it.
+    pub fn set_priority(&mut self, priority: u16) -> Result<()> {
+        if !self
+            .association
+            .streams
+            .contains_key(&self.stream_identifier)
+        {
+            return Err(Error::ErrStreamClosed);
+        }
+        self.association
+            .pending_queue
+            .set_weight(self.stream_identifier, priority);
+        Ok(())
     }
 
     /// set_default_payload_type sets the default payload type used by write.
@@ -362,6 +441,7 @@ impl Stream<'_> {
 }
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum RecvSendState {
     #[default]
     Closed = 0,
@@ -387,6 +467,7 @@ pub struct StreamState {
     pub(crate) side: Side,
     pub(crate) max_payload_size: u32,
     pub(crate) stream_identifier: StreamId,
+    pub(crate) generation: u64,
     pub(crate) default_payload_type: PayloadProtocolIdentifier,
     pub(crate) reassembly_queue: ReassemblyQueue,
     pub(crate) sequence_number: u16,
@@ -408,6 +489,7 @@ impl StreamState {
         StreamState {
             side,
             stream_identifier,
+            generation: 0,
             max_payload_size,
             default_payload_type,
             reassembly_queue: ReassemblyQueue::new(stream_identifier),
@@ -449,6 +531,7 @@ impl StreamState {
 
     fn packetize(
         &mut self,
+        now: Instant,
         raw: &Bytes,
         ppi: PayloadProtocolIdentifier,
     ) -> (bool, Vec<ChunkPayloadData>) {
@@ -459,11 +542,22 @@ impl StreamState {
         //   All Data Channel Establishment Protocol messages MUST be sent using
         //   ordered delivery and reliable transmission.
         let unordered = ppi != PayloadProtocolIdentifier::Dcep && self.unordered;
+        let reliability = if ppi == PayloadProtocolIdentifier::Dcep {
+            MessageReliability::Reliable
+        } else {
+            match self.reliability_type {
+                ReliabilityType::Reliable => MessageReliability::Reliable,
+                ReliabilityType::Rexmit => MessageReliability::Rexmit {
+                    max_retransmits: self.reliability_value,
+                },
+                ReliabilityType::Timed => MessageReliability::Timed {
+                    deadline: now + Duration::from_millis(self.reliability_value as u64),
+                },
+            }
+        };
 
         let mut chunks = vec![];
 
-        let head_abandoned = false;
-        let head_all_inflight = false;
         while remaining != 0 {
             let fragment_size = std::cmp::min(self.max_payload_size as usize, remaining); //self.association.max_payload_size
 
@@ -472,6 +566,11 @@ impl StreamState {
             let user_data = raw.slice(i..i + fragment_size);
 
             let chunk = ChunkPayloadData {
+                // Timed reliability measures a message's age from here, so that
+                // a long wait for cwnd or rwnd counts against maxPacketLifeTime.
+                created_at: Some(now),
+                reliability,
+                stream_generation: self.generation,
                 stream_identifier: self.stream_identifier,
                 user_data,
                 unordered,
@@ -480,8 +579,6 @@ impl StreamState {
                 immediate_sack: false,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
-                abandoned: head_abandoned, // all fragmented chunks use the same abandoned
-                all_inflight: head_all_inflight, // all fragmented chunks use the same all_inflight
                 ..Default::default()
             };
 

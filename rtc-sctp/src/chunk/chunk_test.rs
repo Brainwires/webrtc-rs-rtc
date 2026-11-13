@@ -465,6 +465,7 @@ use crate::chunk::chunk_init::*;
 use crate::chunk::chunk_payload_data::*;
 use crate::chunk::chunk_selective_ack::ChunkSelectiveAck;
 use crate::packet::*;
+use crate::param::param_forward_tsn_supported::ParamForwardTsnSupported;
 use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
 use crate::param::param_state_cookie::*;
 
@@ -649,6 +650,55 @@ fn test_init_marshal_unmarshal() -> Result<()> {
     Ok(())
 }
 
+// RFC 4960 Sec 3.2.1: every parameter starts with a 4-byte TLV header, so a
+// trailing zero-length parameter (ForwardTsnSupported) leaves exactly
+// INIT_OPTIONAL_VAR_HEADER_LENGTH bytes unparsed when the loop reaches it.
+// The loop must consume that last parameter instead of stopping one short.
+#[test]
+fn test_init_unmarshal_trailing_forward_tsn_supported() -> Result<()> {
+    let mut p = Packet {
+        common_header: CommonHeader {
+            destination_port: 1,
+            source_port: 1,
+            verification_tag: 123,
+        },
+        chunks: vec![],
+    };
+
+    let mut init_ack = ChunkInit {
+        is_ack: true,
+        initiate_tag: 123,
+        advertised_receiver_window_credit: 1024,
+        num_outbound_streams: 1,
+        num_inbound_streams: 1,
+        initial_tsn: 123,
+        params: vec![],
+    };
+
+    // State cookie first, ForwardTsnSupported last.
+    init_ack.params.push(Box::new(ParamStateCookie::new()));
+    init_ack.params.push(Box::new(ParamForwardTsnSupported));
+
+    p.chunks.push(Box::new(init_ack));
+
+    let raw_pkt = p.marshal()?;
+    let pkt = Packet::unmarshal(&raw_pkt)?;
+
+    let c = pkt.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkInit>()
+        .expect("Failed to cast Chunk -> ChunkInit");
+    assert_eq!(2, c.params.len());
+    assert!(
+        c.params[1]
+            .as_any()
+            .downcast_ref::<ParamForwardTsnSupported>()
+            .is_some()
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_payload_data_marshal_unmarshal() -> Result<()> {
     let raw_pkt = Bytes::from_static(&[
@@ -767,4 +817,55 @@ fn test_select_ack_chunk_followed_by_a_payload_data_chunk() -> Result<()> {
         "Failed to cast Chunk -> PayloadData"
     );
     Ok(())
+}
+
+///////////////////////////////////////////////////////////////////
+//chunk_heartbeat_test
+///////////////////////////////////////////////////////////////////
+use super::chunk_heartbeat::*;
+use super::chunk_heartbeat_ack::*;
+use crate::param::Param;
+use crate::param::param_heartbeat_info::ParamHeartbeatInfo;
+
+fn heartbeat_info_param() -> Box<dyn Param> {
+    Box::new(ParamHeartbeatInfo {
+        heartbeat_information: Bytes::from_static(&[0x01, 0x02, 0x03, 0x04]),
+    })
+}
+
+#[test]
+fn test_chunk_heartbeat_roundtrip() -> Result<()> {
+    let hb = ChunkHeartbeat {
+        params: vec![heartbeat_info_param()],
+    };
+    let raw = hb.marshal()?;
+    let parsed = ChunkHeartbeat::unmarshal(&raw)?;
+    assert_eq!(parsed.params.len(), 1);
+    assert_eq!(raw, parsed.marshal()?);
+    Ok(())
+}
+
+#[test]
+fn test_chunk_heartbeat_ack_roundtrip() -> Result<()> {
+    let ack = ChunkHeartbeatAck {
+        params: vec![heartbeat_info_param()],
+    };
+    let raw = ack.marshal()?;
+    let parsed = ChunkHeartbeatAck::unmarshal(&raw)?;
+    assert_eq!(parsed.params.len(), 1);
+    assert_eq!(raw, parsed.marshal()?);
+    Ok(())
+}
+
+/// An error cause whose length field runs past the end of its chunk is a parse error. It used
+/// to slice past the buffer and panic, and ABORT/ERROR chunks are parsed before the association
+/// checks anything, so the first packet from an unknown peer could do it.
+#[test]
+fn test_error_cause_longer_than_its_chunk_is_rejected() {
+    // ABORT, 8 bytes: one cause (code 13) claiming a 255-byte length.
+    let abort = Bytes::from_static(&[0x06, 0x00, 0x00, 0x08, 0x00, 0x0d, 0x00, 0xff]);
+    assert!(ChunkAbort::unmarshal(&abort).is_err());
+    // ERROR, the same cause.
+    let error = Bytes::from_static(&[0x09, 0x00, 0x00, 0x08, 0x00, 0x0d, 0x00, 0xff]);
+    assert!(ChunkError::unmarshal(&error).is_err());
 }

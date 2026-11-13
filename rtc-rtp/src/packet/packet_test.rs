@@ -904,8 +904,12 @@ fn test_rfc8285_one_byte_extension_terminate_processing_when_reserved_id_encount
         "Extension should be empty for invalid ID"
     );
 
-    let payload = reserved_id_pkt.slice(17..);
+    // RFC 8285 §4.2 stops extension processing at ID 15, but the extension length field
+    // (one word here) still says where the header ends (RFC 3550 §5.3.1): the payload starts
+    // after the whole block, not after the ID 15 byte.
+    let payload = reserved_id_pkt.slice(20..);
     assert_eq!(p.payload, payload, "p.payload must be same as payload");
+    assert_eq!(p.header.marshal_size(), 20);
 
     Ok(())
 }
@@ -1261,4 +1265,44 @@ fn test_round_trip() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// A one-byte extension block that contains ID 15 ends extension processing there (RFC 8285
+/// §4.2), but the rest of the block is still header. It used to be left at the front of the
+/// payload, and `marshal_size()` then disagreed with the wire, which shifted the SRTP keystream
+/// offset.
+#[test]
+fn test_unmarshal_one_byte_extension_with_reserved_id_consumes_the_block() -> Result<()> {
+    let raw: &[u8] = &[
+        0x90, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, // header, X=1
+        0xbe, 0xde, 0x00, 0x02, // one-byte profile, 2 words
+        0x10, 0xaa, // id 1, one byte
+        0xf0, 0x01, 0x02, 0x03, 0x04, 0x05, // id 15, then ignored bytes
+        0xde, 0xad, // payload
+    ];
+    let packet = Packet::unmarshal(&mut &raw[..])?;
+    assert_eq!(&packet.payload[..], &[0xde, 0xad]);
+    assert_eq!(packet.header.extensions.len(), 1);
+    assert_eq!(packet.header.marshal_size(), 24);
+    Ok(())
+}
+
+/// An extension item longer than what is left of its block is malformed. It used to be checked
+/// against the rest of the packet instead, so it swallowed payload bytes.
+#[test]
+fn test_unmarshal_extension_item_past_its_block_is_an_error() {
+    let one_byte: &[u8] = &[
+        0x90, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, // header, X=1
+        0xbe, 0xde, 0x00, 0x01, // one-byte profile, 1 word
+        0x13, 0xaa, 0xbb, 0xcc, // id 1 claiming 4 bytes; 3 left in the block
+        0xdd, 0xee, // payload
+    ];
+    assert!(Packet::unmarshal(&mut &one_byte[..]).is_err());
+    let two_byte: &[u8] = &[
+        0x90, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, // header, X=1
+        0x10, 0x00, 0x00, 0x01, // two-byte profile, 1 word
+        0x01, 0x04, 0xaa, 0xbb, // id 1 claiming 4 bytes; 2 left in the block
+        0xdd, 0xee, 0xff, // payload
+    ];
+    assert!(Packet::unmarshal(&mut &two_byte[..]).is_err());
 }

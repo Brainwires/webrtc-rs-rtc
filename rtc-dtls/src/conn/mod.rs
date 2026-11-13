@@ -1,3 +1,12 @@
+//! The DTLS association.
+//!
+//! [`DTLSConn`](crate::conn::DTLSConn) joins the handshake state machine to the record layer for one peer: inbound
+//! datagrams go in through [`read`](crate::conn::DTLSConn::read), application data comes out through
+//! [`incoming_application_data`](crate::conn::DTLSConn::incoming_application_data), and whatever should go on
+//! the wire is collected from [`outgoing_raw_packet`](crate::conn::DTLSConn::outgoing_raw_packet).
+//!
+//! Normally an application drives [`Endpoint`](crate::endpoint::Endpoint) instead, which owns one
+//! of these per remote address.
 #[cfg(test)]
 mod conn_test;
 
@@ -26,7 +35,7 @@ use shared::{error::*, replay_detector::*};
 use crate::config::HandshakeConfig;
 use bytes::BytesMut;
 use log::*;
-use std::io::{BufReader, BufWriter};
+use std::io::BufWriter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +45,22 @@ pub(crate) const DEFAULT_NAMED_CURVE: NamedCurve = NamedCurve::X25519;
 pub(crate) const INBOUND_BUFFER_SIZE: usize = 8192;
 // Default replay protection window is specified by RFC 6347 Section 4.1.2.6
 pub(crate) const DEFAULT_REPLAY_PROTECTION_WINDOW: usize = 64;
+/// Most not-yet-decryptable records held for later (next epoch / cipher suite not ready).
+/// A flight needs only a few; the rest are unauthenticated until decrypted.
+pub(crate) const MAX_EARLY_ENCRYPTED_PACKETS: usize = 64;
+/// The highest epoch a peer's records move to. A DTLS 1.2 handshake has one epoch transition,
+/// 0 to 1, and this stack does not renegotiate (a DTLS restart builds a new connection), so a
+/// ChangeCipherSpec is honoured only for that transition. It also bounds the per-epoch replay
+/// detectors: records more than one epoch ahead of `remote_epoch` are discarded, so at most
+/// `MAX_REMOTE_EPOCH + 2` exist.
+pub(crate) const MAX_REMOTE_EPOCH: u16 = 1;
+/// How many times a handshake flight may be retransmitted before the handshake fails.
+///
+/// Zero means "no retries at all": the first firing of the retransmit timer ends the handshake,
+/// so any reply slower than one `retransmit_interval` is fatal. That is almost never what a
+/// caller wants, and it is what `ConfigBuilder::build` accidentally used between P7 and this
+/// constant being introduced.
+pub(crate) const DEFAULT_MAXIMUM_RETRANSMIT_NUMBER: usize = 7;
 
 pub(crate) static INVALID_KEYING_LABELS: &[&str] = &[
     "client finished",
@@ -45,6 +70,7 @@ pub(crate) static INVALID_KEYING_LABELS: &[&str] = &[
 ];
 
 // Conn represents a DTLS connection
+/// One DTLS association: the handshake state machine plus the record layer around it.
 pub struct DTLSConn {
     is_client: bool,
     maximum_transmission_unit: usize,
@@ -65,6 +91,8 @@ pub struct DTLSConn {
     connection_closed_by_user: bool,
     // closeLock              sync.Mutex
     closed: bool, //  *closer.Closer
+    /// The peer sent close_notify. Its reply has been queued; the connection is finished.
+    pub(crate) closed_by_peer: bool,
     //handshakeLoopsFinished sync.WaitGroup
 
     //readDeadline  :deadline.Deadline,
@@ -86,9 +114,20 @@ pub struct DTLSConn {
     pub(crate) handshake_config: Arc<HandshakeConfig>,
     pub(crate) retransmit: bool,
     pub(crate) handshake_rx: Option<()>,
+    /// Whether the datagram most recently passed to [`Self::read`] carried an accepted handshake
+    /// record. After completion, only an authenticated repeat of the peer's Finished is accepted.
+    /// Reset on every `read`, unlike the sticky `handshake_rx`, so a completed association can tell
+    /// an RFC 6347 §4.2.4 last-flight repeat from ordinary post-handshake application data.
+    pub(crate) received_handshake_in_last_datagram: bool,
 }
 
 impl DTLSConn {
+    /// Creates a connection in the given role, ready to handshake.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the configuration is invalid — no certificate for a server, or an unusable cipher
+    /// suite list.
     pub fn new(
         handshake_config: Arc<HandshakeConfig>,
         is_client: bool,
@@ -110,10 +149,7 @@ impl DTLSConn {
             };
 
             (
-                State {
-                    is_client,
-                    ..Default::default()
-                },
+                State::new(handshake_config.crypto_provider.clone(), is_client),
                 flight,
                 HandshakeState::Preparing,
             )
@@ -137,6 +173,7 @@ impl DTLSConn {
             handshake_completed: false,
             connection_closed_by_user: false,
             closed: false,
+            closed_by_peer: false,
 
             current_handshake_state: initial_fsm_state,
             current_retransmit_timer: None,
@@ -147,10 +184,12 @@ impl DTLSConn {
             handshake_config,
             retransmit: false,
             handshake_rx: None,
+            received_handshake_in_last_datagram: false,
         }
     }
 
     // Read reads data from the connection.
+    /// Takes the next decrypted application payload, if one is ready.
     pub fn incoming_application_data(&mut self) -> Option<BytesMut> {
         if !self.is_handshake_completed() {
             None
@@ -159,6 +198,7 @@ impl DTLSConn {
         }
     }
 
+    /// Takes the next datagram the caller should send.
     pub fn outgoing_raw_packet(&mut self) -> Option<BytesMut> {
         if let Err(err) = self.handle_outgoing_packets() {
             warn!(
@@ -171,6 +211,11 @@ impl DTLSConn {
     }
 
     // Write writes p to the DTLS connection
+    /// Queues `p` as application data, encrypting it once the handshake has completed.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the connection is closed or the handshake has not finished.
     pub fn write(&mut self, p: &[u8]) -> Result<()> {
         if self.is_connection_closed() {
             return Err(Error::ErrConnClosed);
@@ -198,6 +243,7 @@ impl DTLSConn {
     }
 
     // Close closes the connection.
+    /// Begins an orderly shutdown by queueing a `close_notify` alert.
     pub fn close(&mut self) {
         if !self.closed {
             self.closed = true;
@@ -318,14 +364,13 @@ impl DTLSConn {
         }
         p.record.record_layer_header.sequence_number = seq;
 
+        // Marshal straight into the Vec: `BufWriter` would heap-allocate an
+        // 8 KiB staging buffer for every outbound record.
         let mut raw_packet = vec![];
-        {
-            let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_packet.as_mut());
-            p.record.marshal(&mut writer)?;
-        }
+        p.record.marshal(&mut raw_packet)?;
 
         if p.should_encrypt
-            && let Some(cipher_suite) = &self.state.cipher_suite
+            && let Some(cipher_suite) = &mut self.state.cipher_suite
         {
             raw_packet = cipher_suite.encrypt(&p.record.record_layer_header, &raw_packet)?;
         }
@@ -374,7 +419,7 @@ impl DTLSConn {
             raw_packet.extend_from_slice(&record_layer_header_bytes);
             raw_packet.extend_from_slice(handshake_fragment);
             if p.should_encrypt
-                && let Some(cipher_suite) = &self.state.cipher_suite
+                && let Some(cipher_suite) = &mut self.state.cipher_suite
             {
                 raw_packet = cipher_suite.encrypt(&record_layer_header, &raw_packet)?;
             }
@@ -438,10 +483,20 @@ impl DTLSConn {
         self.handshake_completed
     }
 
+    /// Feeds one received datagram into the connection.
+    ///
+    /// Records whether this datagram carried a handshake record in
+    /// `received_handshake_in_last_datagram`, which a completed association uses to tell an
+    /// RFC 6347 §4.2.4 last-flight repeat from ordinary post-handshake application data.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the record is malformed or fails authentication.
     pub fn read(&mut self, buf: &[u8]) -> Result<()> {
         // Per RFC 6347: buffer future-epoch packets only until Finished is received
         // (i.e. until handshake completes). After that, discard them.
         let enqueue = !self.is_handshake_completed();
+        self.received_handshake_in_last_datagram = false;
         for pkt in unpack_datagram(buf)? {
             let (hs, alert, err) = self.handle_incoming_packet(pkt, enqueue);
             if let Some(alert) = alert {
@@ -458,6 +513,10 @@ impl DTLSConn {
                     reset_local_sequence_number: false,
                 });
 
+                if alert.alert_description == AlertDescription::CloseNotify {
+                    // A close_notify is only queued here as the reply to the peer's own.
+                    self.closed_by_peer = true;
+                }
                 if alert.alert_level == AlertLevel::Fatal
                     || alert.alert_description == AlertDescription::CloseNotify
                 {
@@ -470,6 +529,7 @@ impl DTLSConn {
             }
 
             if hs {
+                self.received_handshake_in_last_datagram = true;
                 self.handshake_rx = Some(());
             }
         }
@@ -508,6 +568,10 @@ impl DTLSConn {
                         reset_local_sequence_number: false,
                     });
 
+                    if alert.alert_description == AlertDescription::CloseNotify {
+                        // A close_notify is only queued here as the reply to the peer's own.
+                        self.closed_by_peer = true;
+                    }
                     if alert.alert_level == AlertLevel::Fatal
                         || alert.alert_description == AlertDescription::CloseNotify
                     {
@@ -524,12 +588,29 @@ impl DTLSConn {
         Ok(is_handshake)
     }
 
+    /// Holds a record that arrived before it can be decrypted (next epoch, cipher suite not ready
+    /// yet). The queue is bounded: these records are unauthenticated until decrypted, so past
+    /// [`MAX_EARLY_ENCRYPTED_PACKETS`] the newest is dropped, as a lost datagram would be.
+    fn enqueue_early_encrypted(&mut self, pkt: Vec<u8>) {
+        if self.incoming_encrypted_packets.len() >= MAX_EARLY_ENCRYPTED_PACKETS {
+            debug!(
+                "{}: early encrypted queue full ({}), dropping packet",
+                srv_cli_str(self.is_client),
+                MAX_EARLY_ENCRYPTED_PACKETS
+            );
+            return;
+        }
+        self.incoming_encrypted_packets.push_back(pkt);
+    }
+
     fn handle_incoming_packet(
         &mut self,
         mut pkt: Vec<u8>,
         enqueue: bool,
     ) -> (bool, Option<Alert>, Option<Error>) {
-        let mut reader = BufReader::new(pkt.as_slice());
+        // Parse the 13-byte header from the slice directly: `BufReader` would
+        // heap-allocate an 8 KiB buffer for every inbound record.
+        let mut reader = pkt.as_slice();
         let h = match RecordLayerHeader::unmarshal(&mut reader) {
             Ok(h) => h,
             Err(err) => {
@@ -561,12 +642,35 @@ impl DTLSConn {
                     "{}: received packet of next epoch, queuing packet",
                     srv_cli_str(self.is_client)
                 );
-                self.incoming_encrypted_packets.push_back(pkt);
+                self.enqueue_early_encrypted(pkt);
             }
             return (false, None, None);
         }
 
-        // Anti-replay protection
+        // Once the handshake has completed, a genuine peer only sends old-epoch handshake
+        // records, to repeat its final flight (RFC 6347 4.2.4 retransmission relies on them).
+        // Any other old-epoch record is plaintext that can only be forged or stale: acting on it
+        // (an alert, or our fatal alert answering bad ApplicationData, ChangeCipherSpec or an
+        // undecodable record) would let anyone spoofing the peer's address tear down the
+        // association without keys. So it is silently discarded [RFC6347 Section-4.1.2.7].
+        // Before the handshake completes, old epochs must be accepted [RFC6347 Section-4.1].
+        if h.epoch < epoch
+            && self.is_handshake_completed()
+            && h.content_type != ContentType::Handshake
+        {
+            debug!(
+                "{}: discarded {:?} record from old epoch {} (current: {}, seq: {})",
+                srv_cli_str(self.is_client),
+                h.content_type,
+                h.epoch,
+                epoch,
+                h.sequence_number,
+            );
+            return (false, None, None);
+        }
+
+        // Anti-replay protection: one detector per epoch. Records past `remote_epoch + 1` were
+        // discarded above, and `remote_epoch` stops at `MAX_REMOTE_EPOCH`, so this stays small.
         while self.replay_detector.len() <= h.epoch as usize {
             self.replay_detector
                 .push(Box::new(SlidingWindowDetector::new(
@@ -601,19 +705,21 @@ impl DTLSConn {
                         "{}: handshake not finished, queuing packet",
                         srv_cli_str(self.is_client)
                     );
-                    self.incoming_encrypted_packets.push_back(pkt);
+                    self.enqueue_early_encrypted(pkt);
                 }
                 return (false, None, None);
             }
 
-            if let Some(cipher_suite) = &self.state.cipher_suite {
+            if let Some(cipher_suite) = &mut self.state.cipher_suite {
                 pkt = match cipher_suite.decrypt(&pkt) {
                     Ok(pkt) => pkt,
                     Err(err) => {
                         debug!("{}: decrypt failed: {}", srv_cli_str(self.is_client), err);
 
-                        // If we get an error for PSK we need to return an error.
-                        if cipher_suite.is_psk() {
+                        // During a PSK handshake, a decrypt failure means a key mismatch, so
+                        // alert. Afterwards, anyone can forge such a record, so silently
+                        // discard it [RFC6347 Section-4.1.2.7].
+                        if cipher_suite.is_psk() && !self.handshake_completed {
                             return (
                                 false,
                                 Some(Alert {
@@ -628,6 +734,22 @@ impl DTLSConn {
                     }
                 };
             }
+        }
+
+        // Once complete, neither plaintext handshake records nor a new transcript
+        // may spend the last-flight retry budget. Authenticate a repeat and match it
+        // against the Finished already received before signaling the endpoint.
+        if self.is_handshake_completed() && h.content_type == ContentType::Handshake {
+            let repeats_finished = h.epoch != 0
+                && self.cache.matches_received_finished(
+                    &pkt[RECORD_LAYER_HEADER_SIZE..],
+                    h.epoch,
+                    !self.is_client,
+                );
+            if repeats_finished {
+                self.replay_detector[h.epoch as usize].accept();
+            }
+            return (repeats_finished, None, None);
         }
 
         let is_handshake = match self.fragment_buffer.push(&pkt) {
@@ -647,7 +769,7 @@ impl DTLSConn {
             self.replay_detector[h.epoch as usize].accept();
             while let Ok((out, epoch)) = self.fragment_buffer.pop() {
                 //log::debug!("Extension Debug: out.len()={}", out.len());
-                let mut reader = BufReader::new(out.as_slice());
+                let mut reader = out.as_slice();
                 let raw_handshake = match Handshake::unmarshal(&mut reader) {
                     Ok(rh) => {
                         debug!(
@@ -681,7 +803,7 @@ impl DTLSConn {
             return (true, None, None);
         }
 
-        let mut reader = BufReader::new(pkt.as_slice());
+        let mut reader = pkt.as_slice();
         let r = match RecordLayer::unmarshal(&mut reader) {
             Ok(r) => r,
             Err(err) => {
@@ -728,19 +850,35 @@ impl DTLSConn {
                             "{}: CipherSuite not initialized, queuing packet",
                             srv_cli_str(self.is_client)
                         );
-                        self.incoming_encrypted_packets.push_back(pkt);
+                        self.enqueue_early_encrypted(pkt);
                     }
                     return (false, None, None);
                 }
 
-                let new_remote_epoch = h.epoch + 1;
+                // A ChangeCipherSpec is not authenticated: every cipher hands it back
+                // unchecked, so its epoch is only the sender's claim, and anyone spoofing the
+                // peer's address can send one. It is acted on only for the handshake's one
+                // transition, before the handshake completes. Afterwards a spoofed one would
+                // move `remote_epoch` past the peer's and make every genuine record look old.
+                if self.is_handshake_completed() || epoch >= MAX_REMOTE_EPOCH {
+                    debug!(
+                        "{}: discarded ChangeCipherSpec (epoch: {}, remote epoch: {})",
+                        srv_cli_str(self.is_client),
+                        h.epoch,
+                        epoch
+                    );
+                    return (false, None, None);
+                }
+                let Some(new_remote_epoch) = h.epoch.checked_add(1) else {
+                    return (false, None, None);
+                };
                 debug!(
                     "{}: <- ChangeCipherSpec (epoch: {})",
                     srv_cli_str(self.is_client),
                     new_remote_epoch
                 );
 
-                if epoch + 1 == new_remote_epoch {
+                if epoch.checked_add(1) == Some(new_remote_epoch) {
                     self.state.remote_epoch = new_remote_epoch;
                     self.replay_detector[h.epoch as usize].accept();
                 }

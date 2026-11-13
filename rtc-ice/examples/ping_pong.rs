@@ -1,12 +1,18 @@
 use bytes::BytesMut;
 use clap::Parser;
 use futures::StreamExt;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rtc_ice::agent::Agent;
 use rtc_ice::agent::agent_config::AgentConfig;
 use rtc_ice::candidate::candidate_host::CandidateHostConfig;
 use rtc_ice::candidate::*;
+use rtc_ice::crypto;
 use rtc_ice::state::*;
 use rtc_ice::{Credentials, Event};
 use sansio::Protocol;
@@ -17,12 +23,13 @@ use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Mutex, mpsc, watch};
 
 #[macro_use]
 extern crate lazy_static;
 
+type Body = Full<Bytes>;
 type SenderType = Arc<Mutex<mpsc::Sender<String>>>;
 type ReceiverType = Arc<Mutex<mpsc::Receiver<String>>>;
 
@@ -40,35 +47,35 @@ lazy_static! {
 }
 
 // HTTP Listener to get ICE Credentials/Candidate from remote Peer
-async fn remote_handler(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+async fn remote_handler(req: Request<Incoming>) -> Result<Response<Body>, hyper::Error> {
     //println!("received {:?}", req);
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/remoteAuth") => {
-            let full_body =
-                match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?) {
-                    Ok(s) => s.to_owned(),
-                    Err(err) => panic!("{}", err),
-                };
+            let full_body = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes())
+            {
+                Ok(s) => s.to_owned(),
+                Err(err) => panic!("{}", err),
+            };
             let tx = REMOTE_AUTH_CHANNEL.0.lock().await;
             //println!("body: {:?}", full_body);
             let _ = tx.send(full_body).await;
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(Body::default());
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
 
         (&Method::POST, "/remoteCandidate") => {
-            let full_body =
-                match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?) {
-                    Ok(s) => s.to_owned(),
-                    Err(err) => panic!("{}", err),
-                };
+            let full_body = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes())
+            {
+                Ok(s) => s.to_owned(),
+                Err(err) => panic!("{}", err),
+            };
             let tx = REMOTE_CAND_CHANNEL.0.lock().await;
             //println!("body: {:?}", full_body);
             let _ = tx.send(full_body).await;
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(Body::default());
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
@@ -134,10 +141,23 @@ async fn main() -> Result<(), Error> {
     println!("Listening on http://localhost:{local_http_port}");
     let mut done_http_server = done_rx.clone();
     tokio::spawn(async move {
-        let addr = ([0, 0, 0, 0], local_http_port).into();
-        let service =
-            make_service_fn(|_| async { Ok::<_, hyper::Error>(service_fn(remote_handler)) });
-        let server = Server::bind(&addr).serve(service);
+        let addr: std::net::SocketAddr = ([0, 0, 0, 0], local_http_port).into();
+        let server = async move {
+            let listener = TcpListener::bind(addr).await?;
+            loop {
+                let (stream, _) = listener.accept().await?;
+                tokio::spawn(async move {
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service_fn(remote_handler))
+                        .await
+                    {
+                        eprintln!("http connection error: {err}");
+                    }
+                });
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), io::Error>(())
+        };
         tokio::select! {
             _ = done_http_server.changed() => {
                 println!("receive cancel http server!");
@@ -163,13 +183,17 @@ async fn main() -> Result<(), Error> {
 
     let port = if cli.controlling { 4000 } else { 4001 };
     let udp_socket = UdpSocket::bind(("0.0.0.0", port)).await?;
-    let mut ice_agent = Agent::new(Arc::new(AgentConfig {
-        disconnected_timeout: Some(Duration::from_secs(5)),
-        failed_timeout: Some(Duration::from_secs(5)),
-        ..Default::default()
-    }))?;
+    let mut ice_agent = Agent::new(
+        Instant::now(),
+        Arc::new(AgentConfig {
+            disconnected_timeout: Some(Duration::from_secs(5)),
+            failed_timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        }),
+        crypto::default_provider().map_err(|e| Error::Other(e.to_string()))?,
+    )?;
 
-    let client = Arc::new(Client::new());
+    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http::<Body>());
 
     // When we have gathered a new ICE Candidate send it to the remote peer
     let client2 = Arc::clone(&client);
@@ -263,7 +287,12 @@ async fn main() -> Result<(), Error> {
     let peer_addr = remote_candidate.addr();
     ice_agent.add_remote_candidate(remote_candidate)?;
 
-    ice_agent.start_connectivity_checks(cli.controlling, remote_ufrag, remote_pwd)?;
+    ice_agent.start_connectivity_checks(
+        Instant::now(),
+        cli.controlling,
+        remote_ufrag,
+        remote_pwd,
+    )?;
 
     println!("Enter bye to stop");
     let (mut tx, mut rx) = futures::channel::mpsc::channel(8);
@@ -296,7 +325,7 @@ async fn main() -> Result<(), Error> {
         }
         let mut is_failed = false;
         while let Some(event) = ice_agent.poll_event() {
-            match event {
+            match event.event {
                 Event::ConnectionStateChange(cs) => {
                     println!("ConnectionStateChange with {}", cs);
                     match cs {

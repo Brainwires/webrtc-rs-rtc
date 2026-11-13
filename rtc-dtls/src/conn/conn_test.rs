@@ -20,7 +20,6 @@ use shared::error::*;*/
 
 //use crate::extension::renegotiation_info::ExtensionRenegotiationInfo;
 //use rand::Rng;
-//use shared::crypto::KeyingMaterialExporter;
 
 const ERR_TEST_PSK_INVALID_IDENTITY: &str = "TestPSK: Server got invalid identity";
 const ERR_PSK_REJECTED: &str = "PSK Rejected";
@@ -309,7 +308,9 @@ async fn test_export_keying_material() -> shared::error::Result<()> {
         closed: AtomicBool::new(false),
         current_flight: Box::new(Flight0 {}) as Box<dyn Flight>,
         flights: None,
-        cfg: HandshakeConfig::default(),
+        cfg: HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ),
         retransmit: false,
         handshake_rx: None,
 
@@ -2384,7 +2385,9 @@ async fn test_renegotation_info() -> Result<()> {
 /// is completed (RFC 6347: buffer only until Finished is received).
 #[test]
 fn test_read_does_not_enqueue_after_handshake_completed() {
-    let config = Arc::new(HandshakeConfig::default());
+    let config = Arc::new(HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ));
     let mut conn = DTLSConn::new(config, false, None);
 
     // Mark handshake as completed.
@@ -2415,7 +2418,9 @@ fn test_read_does_not_enqueue_after_handshake_completed() {
 /// is in progress (needed to handle Finished arriving before ChangeCipherSpec).
 #[test]
 fn test_read_enqueues_during_handshake() {
-    let config = Arc::new(HandshakeConfig::default());
+    let config = Arc::new(HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ));
     let mut conn = DTLSConn::new(config, false, None);
 
     assert!(!conn.is_handshake_completed());
@@ -2448,7 +2453,9 @@ fn test_handle_incoming_queued_packets_drains_when_cipher_ready() {
     use crate::cipher_suite::CipherSuite;
     use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
 
-    let config = Arc::new(HandshakeConfig::default());
+    let config = Arc::new(HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ));
     let mut conn = DTLSConn::new(config, false, None);
 
     assert!(!conn.is_handshake_completed());
@@ -2478,7 +2485,13 @@ fn test_handle_incoming_queued_packets_drains_when_cipher_ready() {
     // Now initialize the cipher suite (simulates ChangeCipherSpec having been processed).
     let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
     // init() with dummy key material — will produce an initialized cipher suite.
-    let _ = cs.init(&[0u8; 48], &[0u8; 32], &[0u8; 32], false);
+    let _ = cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    );
     assert!(cs.is_initialized());
     conn.state.cipher_suite = Some(cs);
 
@@ -2498,12 +2511,20 @@ fn test_handle_incoming_queued_packets_sets_handshake_rx() {
     use crate::cipher_suite::CipherSuite;
     use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
 
-    let config = Arc::new(HandshakeConfig::default());
+    let config = Arc::new(HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ));
     let mut conn = DTLSConn::new(config, false, None);
 
     // Initialize cipher suite.
     let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
-    let _ = cs.init(&[0u8; 48], &[0u8; 32], &[0u8; 32], false);
+    let _ = cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    );
     conn.state.cipher_suite = Some(cs);
     conn.state.remote_epoch = 0;
     conn.handshake_rx = None;
@@ -2537,7 +2558,9 @@ fn test_handle_incoming_queued_packets_sets_handshake_rx() {
 }
 
 fn setup_dtls_conn_server_handshake_in_progress() -> DTLSConn {
-    let handshake_config = Arc::new(HandshakeConfig::default());
+    let handshake_config = Arc::new(HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ));
     // is_client=false (server), no initial_state → handshake not completed
     DTLSConn::new(handshake_config, false, None)
 }
@@ -2575,7 +2598,13 @@ fn test_queued_packets_drained_when_cipher_ready() {
 
     // Initialize cipher suite (simulates ChangeCipherSpec having been processed).
     let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
-    let _ = cs.init(&[0u8; 48], &[0u8; 32], &[0u8; 32], false);
+    let _ = cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    );
     conn.state.cipher_suite = Some(cs);
     conn.state.remote_epoch = 1; // ChangeCipherSpec has been processed
 
@@ -2602,7 +2631,13 @@ fn test_handshake_rx_set_after_queue_processing() {
 
     // Initialize cipher suite so the queue-drain guard passes.
     let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
-    let _ = cs.init(&[0u8; 48], &[0u8; 32], &[0u8; 32], false);
+    let _ = cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    );
     conn.state.cipher_suite = Some(cs);
 
     assert!(conn.handshake_rx.is_none());
@@ -2634,4 +2669,171 @@ fn test_handshake_rx_set_after_queue_processing() {
         conn.handshake_rx.is_some(),
         "After fix: handshake_rx must be set when a queued packet yields hs=true"
     );
+}
+
+/// RFC 6347 4.1: "Until the handshake has completed, implementations MUST accept packets from the
+/// old epoch." Between the peer's ChangeCipherSpec (remote_epoch already 1) and the end of the
+/// handshake, a plaintext epoch-0 alert is still honoured; only once the handshake has completed
+/// is it discarded.
+#[test]
+fn test_old_epoch_alert_honoured_until_handshake_completes() {
+    let fatal_alert: Vec<u8> = vec![
+        0x15, // content_type: Alert
+        0xfe, 0xfd, // protocol_version: DTLS 1.2
+        0x00, 0x00, // epoch: 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // sequence_number: 5
+        0x00, 0x02, // content_len: 2
+        0x02, 0x28, // fatal handshake_failure
+    ];
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    conn.state.remote_epoch = 1; // ChangeCipherSpec has been processed
+    assert!(!conn.is_handshake_completed());
+    assert!(
+        matches!(conn.read(&fatal_alert), Err(Error::ErrAlertFatalOrClose)),
+        "an old-epoch alert must be accepted until the handshake completes"
+    );
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    conn.state.remote_epoch = 1;
+    conn.set_handshake_completed();
+    assert!(
+        conn.read(&fatal_alert).is_ok(),
+        "an old-epoch alert must be discarded once the handshake has completed"
+    );
+    assert!(
+        conn.outgoing_packets.is_empty(),
+        "a discarded alert was answered"
+    );
+}
+
+/// The queue of records that arrive before they can be decrypted is bounded: an unauthenticated
+/// sender must not be able to make it grow without limit during the handshake.
+#[test]
+fn test_early_encrypted_queue_is_bounded() {
+    let config = Arc::new(HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ));
+    let mut conn = DTLSConn::new(config, false, None);
+    for sequence in 0..(MAX_EARLY_ENCRYPTED_PACKETS as u8 + 50) {
+        let datagram = vec![
+            0x16, // content_type: Handshake
+            0xfe, 0xfd, // protocol_version: DTLS 1.2
+            0x00, 0x01, // epoch: 1 (one ahead of remote_epoch=0)
+            0x00, 0x00, 0x00, 0x00, 0x00, sequence, // sequence_number
+            0x00, 0x01, // content_len: 1
+            0x00, // payload
+        ];
+        let _ = conn.read(&datagram);
+    }
+    assert_eq!(
+        conn.incoming_encrypted_packets.len(),
+        MAX_EARLY_ENCRYPTED_PACKETS,
+        "the early encrypted queue must stop growing at its cap"
+    );
+}
+
+/// A ChangeCipherSpec is not authenticated, so its epoch is whatever the sender claims. One at
+/// the last epoch has no successor; it used to overflow `epoch + 1` and panic.
+#[test]
+fn test_change_cipher_spec_at_the_last_epoch_is_dropped() {
+    use crate::cipher_suite::CipherSuite;
+    use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
+    cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    )
+    .unwrap();
+    conn.state.cipher_suite = Some(cs);
+    conn.state.remote_epoch = u16::MAX;
+
+    let change_cipher_spec: Vec<u8> = vec![
+        0x14, // content_type: ChangeCipherSpec
+        0xfe, 0xfd, // protocol_version: DTLS 1.2
+        0xff, 0xff, // epoch: 65535
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sequence_number: 0
+        0x00, 0x01, // content_len: 1
+        0x01,
+    ];
+    let _ = conn.read(&change_cipher_spec);
+    assert_eq!(conn.state.remote_epoch, u16::MAX);
+}
+
+/// A ChangeCipherSpec is unauthenticated. Once the handshake has completed, one spoofed at the
+/// current epoch used to move `remote_epoch` to 2, after which every genuine epoch-1 record was
+/// discarded as old: a keyless denial of service. Repeated, it also grew one replay detector
+/// per claimed epoch.
+#[test]
+fn test_change_cipher_spec_after_handshake_is_ignored() {
+    use crate::cipher_suite::CipherSuite;
+    use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
+    cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    )
+    .unwrap();
+    conn.state.cipher_suite = Some(cs);
+    conn.state.remote_epoch = 1;
+    conn.set_handshake_completed();
+
+    for epoch in 1u16..200 {
+        let [hi, lo] = epoch.to_be_bytes();
+        let change_cipher_spec: Vec<u8> = vec![
+            0x14, // content_type: ChangeCipherSpec
+            0xfe, 0xfd, // protocol_version: DTLS 1.2
+            hi, lo, // epoch
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sequence_number: 0
+            0x00, 0x01, // content_len: 1
+            0x01,
+        ];
+        let _ = conn.read(&change_cipher_spec);
+    }
+    assert_eq!(
+        conn.state.remote_epoch, 1,
+        "a spoofed ChangeCipherSpec moved the epoch"
+    );
+    assert!(
+        conn.replay_detector.len() <= usize::from(MAX_REMOTE_EPOCH) + 2,
+        "{} replay detectors",
+        conn.replay_detector.len()
+    );
+}
+
+/// Before the handshake completes, a ChangeCipherSpec at epoch 0 still moves the peer to
+/// epoch 1, and only once.
+#[test]
+fn test_change_cipher_spec_moves_epoch_0_to_1_only() {
+    use crate::cipher_suite::CipherSuite;
+    use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
+    cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    )
+    .unwrap();
+    conn.state.cipher_suite = Some(cs);
+    for (epoch, sequence) in [(0u8, 0u8), (1, 0), (1, 1)] {
+        let change_cipher_spec: Vec<u8> = vec![
+            0x14, 0xfe, 0xfd, 0x00, epoch, 0x00, 0x00, 0x00, 0x00, 0x00, sequence, 0x00, 0x01, 0x01,
+        ];
+        let _ = conn.read(&change_cipher_spec);
+        assert_eq!(conn.state.remote_epoch, 1);
+    }
 }

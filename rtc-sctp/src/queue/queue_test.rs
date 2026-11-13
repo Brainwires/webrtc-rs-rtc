@@ -144,7 +144,7 @@ fn test_payload_queue_mark_all_to_retrasmit() -> Result<()> {
     for i in 0..3 {
         pq.push(make_payload(i + 1, 10), 0);
     }
-    pq.mark_as_acked(2);
+    pq.acknowledge(2);
     pq.mark_all_to_retrasmit();
 
     let c = pq.get(1);
@@ -169,8 +169,8 @@ fn test_payload_queue_reset_retransmit_flag_on_ack() -> Result<()> {
     }
 
     pq.mark_all_to_retrasmit();
-    pq.mark_as_acked(2); // should cancel retransmission for TSN 2
-    pq.mark_as_acked(4); // should cancel retransmission for TSN 4
+    pq.acknowledge(2); // should cancel retransmission for TSN 2
+    pq.acknowledge(4); // should cancel retransmission for TSN 4
 
     let c = pq.get(1);
     assert!(c.is_some(), "should be true");
@@ -275,11 +275,11 @@ fn test_pending_base_queue_out_of_bounce() -> Result<()> {
 #[test]
 fn test_pending_queue_push_and_pop() -> Result<()> {
     let mut pq = PendingQueue::new();
-    pq.push(make_data_chunk(0, false, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(0, false, NO_FRAGMENT)]);
     assert_eq!(10, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(1, false, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(1, false, NO_FRAGMENT)]);
     assert_eq!(20, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(2, false, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(2, false, NO_FRAGMENT)]);
     assert_eq!(30, pq.get_num_bytes(), "total bytes mismatch");
 
     for i in 0..3 {
@@ -295,9 +295,9 @@ fn test_pending_queue_push_and_pop() -> Result<()> {
 
     assert_eq!(0, pq.get_num_bytes(), "total bytes mismatch");
 
-    pq.push(make_data_chunk(3, false, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(3, false, NO_FRAGMENT)]);
     assert_eq!(10, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(4, false, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(4, false, NO_FRAGMENT)]);
     assert_eq!(20, pq.get_num_bytes(), "total bytes mismatch");
 
     for i in 3..5 {
@@ -320,13 +320,13 @@ fn test_pending_queue_push_and_pop() -> Result<()> {
 fn test_pending_queue_unordered_wins() -> Result<()> {
     let mut pq = PendingQueue::new();
 
-    pq.push(make_data_chunk(0, false, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(0, false, NO_FRAGMENT)]);
     assert_eq!(10, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(1, true, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(1, true, NO_FRAGMENT)]);
     assert_eq!(20, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(2, false, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(2, false, NO_FRAGMENT)]);
     assert_eq!(30, pq.get_num_bytes(), "total bytes mismatch");
-    pq.push(make_data_chunk(3, true, NO_FRAGMENT));
+    pq.push_message(vec![make_data_chunk(3, true, NO_FRAGMENT)]);
     assert_eq!(40, pq.get_num_bytes(), "total bytes mismatch");
 
     let c = pq.peek();
@@ -369,12 +369,16 @@ fn test_pending_queue_unordered_wins() -> Result<()> {
 #[test]
 fn test_pending_queue_fragments() -> Result<()> {
     let mut pq = PendingQueue::new();
-    pq.push(make_data_chunk(0, false, FRAG_BEGIN));
-    pq.push(make_data_chunk(1, false, FRAG_MIDDLE));
-    pq.push(make_data_chunk(2, false, FRAG_END));
-    pq.push(make_data_chunk(3, true, FRAG_BEGIN));
-    pq.push(make_data_chunk(4, true, FRAG_MIDDLE));
-    pq.push(make_data_chunk(5, true, FRAG_END));
+    pq.push_message(vec![
+        make_data_chunk(0, false, FRAG_BEGIN),
+        make_data_chunk(1, false, FRAG_MIDDLE),
+        make_data_chunk(2, false, FRAG_END),
+    ]);
+    pq.push_message(vec![
+        make_data_chunk(3, true, FRAG_BEGIN),
+        make_data_chunk(4, true, FRAG_MIDDLE),
+        make_data_chunk(5, true, FRAG_END),
+    ]);
 
     let expects = vec![3, 4, 5, 0, 1, 2];
 
@@ -396,7 +400,11 @@ fn test_pending_queue_fragments() -> Result<()> {
 #[test]
 fn test_pending_queue_selection_persistence() -> Result<()> {
     let mut pq = PendingQueue::new();
-    pq.push(make_data_chunk(0, false, FRAG_BEGIN));
+    pq.push_message(vec![
+        make_data_chunk(0, false, FRAG_BEGIN),
+        make_data_chunk(2, false, FRAG_MIDDLE),
+        make_data_chunk(3, false, FRAG_END),
+    ]);
 
     let c = pq.peek();
     assert!(c.is_some(), "peek error");
@@ -406,9 +414,7 @@ fn test_pending_queue_selection_persistence() -> Result<()> {
     let result = pq.pop(beginning_fragment, unordered);
     assert!(result.is_some(), "should not error: {}", 0);
 
-    pq.push(make_data_chunk(1, true, NO_FRAGMENT));
-    pq.push(make_data_chunk(2, false, FRAG_MIDDLE));
-    pq.push(make_data_chunk(3, false, FRAG_END));
+    pq.push_message(vec![make_data_chunk(1, true, NO_FRAGMENT)]);
 
     let expects = vec![2, 3, 1];
 
@@ -473,6 +479,56 @@ fn test_reassembly_queue_ordered_fragments() -> Result<()> {
     } else {
         assert!(false);
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_reassembly_queue_to_payload() -> Result<()> {
+    // A multi-fragment ordered message: "ABC" + "DEFG" == "ABCDEFG" (7 bytes).
+    let mut rq = ReassemblyQueue::new(0);
+    let org_ppi = PayloadProtocolIdentifier::Binary;
+
+    rq.push(ChunkPayloadData {
+        payload_type: org_ppi,
+        beginning_fragment: true,
+        tsn: 1,
+        stream_sequence_number: 0,
+        user_data: Bytes::from_static(b"ABC"),
+        ..Default::default()
+    });
+    let complete = rq.push(ChunkPayloadData {
+        payload_type: org_ppi,
+        ending_fragment: true,
+        tsn: 2,
+        stream_sequence_number: 0,
+        user_data: Bytes::from_static(b"DEFG"),
+        ..Default::default()
+    });
+    assert!(complete, "chunk set should be complete");
+
+    let chunks = rq.read().expect("a complete message");
+
+    // Ample buffer: all fragments concatenated in order with a single copy.
+    let payload = chunks.to_payload(16)?;
+    assert_eq!(
+        &payload[..],
+        b"ABCDEFG",
+        "to_payload must concatenate fragments in order"
+    );
+
+    // Exact boundary (max_len == total) still succeeds.
+    assert_eq!(
+        &chunks.to_payload(7)?[..],
+        b"ABCDEFG",
+        "max_len == total must succeed"
+    );
+
+    // Too small (max_len < total) is rejected with ErrShortBuffer, matching read().
+    assert!(
+        matches!(chunks.to_payload(6), Err(Error::ErrShortBuffer)),
+        "to_payload must reject oversized messages like read()"
+    );
 
     Ok(())
 }
@@ -604,6 +660,55 @@ fn test_reassembly_queue_ordered_and_unordered_fragments() -> Result<()> {
     Ok(())
 }
 */
+
+/// When both an unordered and an ordered message are readable, `read`
+/// returns the one that completed first (timestamp order).
+#[test]
+fn test_reassembly_queue_read_prefers_earlier_completion() -> Result<()> {
+    let org_ppi = PayloadProtocolIdentifier::Binary;
+    let make_chunk = |tsn: u32, ssn: u16, unordered: bool, data: &'static [u8]| ChunkPayloadData {
+        payload_type: org_ppi,
+        unordered,
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        stream_sequence_number: ssn,
+        user_data: Bytes::from_static(data),
+        ..Default::default()
+    };
+    let mut buf = vec![0u8; 16];
+
+    // Ordered completes first -> read it first, unordered second.
+    let mut rq = ReassemblyQueue::new(0);
+    // No sleep between the pushes: `Chunks::arrival` is a monotonic counter incremented per
+    // completed message, not a timestamp, so ordering follows insertion order. The sleep this
+    // replaces dated from when `arrival` was an `Instant` and bought nothing but 2ms.
+    assert!(rq.push(make_chunk(1, 0, false, b"ABC")));
+    assert!(rq.push(make_chunk(2, 1, true, b"DEF")));
+
+    let chunks = rq.read().expect("first read");
+    assert_eq!(3, chunks.read(&mut buf)?);
+    assert_eq!(&buf[..3], b"ABC", "older (ordered) message should win");
+    let chunks = rq.read().expect("second read");
+    assert_eq!(3, chunks.read(&mut buf)?);
+    assert_eq!(&buf[..3], b"DEF");
+    assert_eq!(0, rq.get_num_bytes(), "num bytes mismatch");
+
+    // Unordered completes first -> read it first, ordered second.
+    let mut rq = ReassemblyQueue::new(0);
+    assert!(rq.push(make_chunk(2, 1, true, b"DEF")));
+    assert!(rq.push(make_chunk(1, 0, false, b"ABC")));
+
+    let chunks = rq.read().expect("first read");
+    assert_eq!(3, chunks.read(&mut buf)?);
+    assert_eq!(&buf[..3], b"DEF", "older (unordered) message should win");
+    let chunks = rq.read().expect("second read");
+    assert_eq!(3, chunks.read(&mut buf)?);
+    assert_eq!(&buf[..3], b"ABC");
+    assert_eq!(0, rq.get_num_bytes(), "num bytes mismatch");
+
+    Ok(())
+}
 
 #[test]
 fn test_reassembly_queue_unordered_complete_skips_incomplete() -> Result<()> {
@@ -932,14 +1037,14 @@ fn test_reassembly_queue_forward_tsn_for_unordered_framents() -> Result<()> {
 
 #[test]
 fn test_chunk_set_empty_chunk_set() -> Result<()> {
-    let cset = Chunks::new(0, PayloadProtocolIdentifier::default(), vec![]);
+    let cset = Chunks::new(0, 0, PayloadProtocolIdentifier::default(), vec![]);
     assert!(!cset.is_complete(), "empty chunkSet cannot be complete");
     Ok(())
 }
 
 #[test]
 fn test_chunk_set_push_dup_chunks_to_chunk_set() -> Result<()> {
-    let mut cset = Chunks::new(0, PayloadProtocolIdentifier::default(), vec![]);
+    let mut cset = Chunks::new(0, 0, PayloadProtocolIdentifier::default(), vec![]);
     cset.push(ChunkPayloadData {
         tsn: 100,
         beginning_fragment: true,
@@ -957,7 +1062,7 @@ fn test_chunk_set_push_dup_chunks_to_chunk_set() -> Result<()> {
 
 #[test]
 fn test_chunk_set_incomplete_chunk_set_no_beginning() -> Result<()> {
-    let cset = Chunks::new(0, PayloadProtocolIdentifier::default(), vec![]);
+    let cset = Chunks::new(0, 0, PayloadProtocolIdentifier::default(), vec![]);
     assert!(
         !cset.is_complete(),
         "chunkSet not starting with B=1 cannot be complete"
@@ -968,6 +1073,7 @@ fn test_chunk_set_incomplete_chunk_set_no_beginning() -> Result<()> {
 #[test]
 fn test_chunk_set_incomplete_chunk_set_no_contiguous_tsn() -> Result<()> {
     let cset = Chunks::new(
+        0,
         0,
         PayloadProtocolIdentifier::default(),
         vec![
@@ -1036,5 +1142,93 @@ fn test_reassembly_queue_ssn_overflow_in_forward_tsn_for_ordered() -> Result<()>
     }
     rq.forward_tsn_for_ordered(u16::MAX);
 
+    Ok(())
+}
+
+#[test]
+fn test_message_index_survives_cumulative_prefix_and_tsn_wrap() {
+    use crate::chunk::chunk_payload_data::{MessageId, MessageReliability};
+    let mut queue = PayloadQueue::new();
+    for (tsn, id, beginning, ending) in [
+        (0, 11, false, true),
+        (u32::MAX, 11, true, false),
+        // A lone remaining tail still belongs to a fragmented message.
+        (1, 12, false, true),
+    ] {
+        let mut chunk = make_payload(tsn, 10);
+        chunk.message_id = MessageId::new(id);
+        chunk.reliability = MessageReliability::Rexmit { max_retransmits: 1 };
+        chunk.beginning_fragment = beginning;
+        chunk.ending_fragment = ending;
+        queue.push_no_check(chunk);
+    }
+    assert_eq!(
+        vec![u32::MAX, 0],
+        queue.message_tsns(MessageId::new(11).unwrap())
+    );
+    queue.pop(u32::MAX).unwrap();
+    assert_eq!(vec![0], queue.message_tsns(MessageId::new(11).unwrap()));
+    queue.pop(0).unwrap();
+    assert!(queue.message_tsns(MessageId::new(11).unwrap()).is_empty());
+    assert_eq!(vec![1], queue.message_tsns(MessageId::new(12).unwrap()));
+}
+
+/// DATA too far past the cumulative TSN to be reported in a SACK gap block is refused.
+#[test]
+fn test_payload_queue_refuses_tsns_beyond_the_receive_window() {
+    let pq = PayloadQueue::new();
+    let cumulative_tsn = 1000u32;
+    let near = ChunkPayloadData {
+        tsn: cumulative_tsn + MAX_RECEIVE_TSN_WINDOW,
+        ..Default::default()
+    };
+    let far = ChunkPayloadData {
+        tsn: cumulative_tsn + MAX_RECEIVE_TSN_WINDOW + 1,
+        ..Default::default()
+    };
+    let very_far = ChunkPayloadData {
+        tsn: cumulative_tsn.wrapping_add((1u32 << 31) - 1),
+        ..Default::default()
+    };
+    assert!(pq.can_push(&near, cumulative_tsn));
+    assert!(!pq.can_push(&far, cumulative_tsn));
+    assert!(!pq.can_push(&very_far, cumulative_tsn));
+}
+
+/// TSNs are serial numbers: a fragmented message whose TSNs wrap past u32::MAX reassembles.
+/// The contiguity check used to compute `u32::MAX + 1` and panic.
+#[test]
+fn test_reassembly_queue_fragments_across_the_tsn_wrap() -> Result<()> {
+    for unordered in [false, true] {
+        let mut rq = ReassemblyQueue::new(0);
+        let first = ChunkPayloadData {
+            unordered,
+            payload_type: PayloadProtocolIdentifier::Binary,
+            beginning_fragment: true,
+            tsn: u32::MAX,
+            stream_sequence_number: 0,
+            user_data: Bytes::from_static(b"AB"),
+            ..Default::default()
+        };
+        let last = ChunkPayloadData {
+            unordered,
+            payload_type: PayloadProtocolIdentifier::Binary,
+            ending_fragment: true,
+            tsn: 0,
+            stream_sequence_number: 0,
+            user_data: Bytes::from_static(b"CD"),
+            ..Default::default()
+        };
+        // The end arrives first, so the start completes the set.
+        rq.push(last);
+        assert!(
+            rq.push(first),
+            "unordered={unordered}: set should be complete"
+        );
+        let chunks = rq.read().expect("a complete message");
+        let mut buf = [0u8; 8];
+        let n = chunks.read(&mut buf)?;
+        assert_eq!(&buf[..n], b"ABCD", "unordered={unordered}");
+    }
     Ok(())
 }

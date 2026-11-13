@@ -1,0 +1,931 @@
+use crate::data_channel::RTCDataChannelId;
+use crate::data_channel::message::RTCDataChannelMessage;
+use crate::peer_connection::event::RTCPeerConnectionEvent;
+use crate::peer_connection::event::data_channel_event::RTCDataChannelEvent;
+use crate::peer_connection::event::{RTCEventInternal, TaggedRTCEventInternal};
+use crate::peer_connection::message::internal::{
+    ApplicationMessage, DTLSMessage, DataChannelEvent, RTCMessageInternal, RTPMessage,
+    TaggedRTCMessageInternal, TrackPacket,
+};
+
+use crate::media_stream::track::MediaStreamTrackId;
+use crate::peer_connection::configuration::media_engine::MIME_TYPE_RTX;
+use crate::rtp_transceiver::rtp_sender::rtp_codec::parse_rtx_apt;
+use crate::rtp_transceiver::rtp_sender::{RTCRtpCodecParameters, RTCRtpCodingParameters};
+use crate::rtp_transceiver::{PayloadType, SSRC, internal::RTCRtpTransceiverInternal};
+use crate::statistics::accumulator::RTCStatsAccumulator;
+use interceptor::Packet;
+use log::{debug, trace, warn};
+use rustc_hash::FxHashMap;
+use shared::TransportContext;
+use shared::error::{Error, Result};
+use shared::marshal::MarshalSize;
+use std::collections::VecDeque;
+use std::time::Instant;
+
+/// Returns `true` if the given MIME type identifies a repair codec (RTX or FEC)
+/// rather than a primary media codec. The check is case-insensitive and covers
+/// all RTX variants (e.g. `video/rtx`, `audio/rtx`) as well as FEC types
+/// (`video/ulpfec`, `video/flexfec`, `video/flexfec-03`). (Brainwires fork.)
+pub(crate) fn is_repair_mime_type(mime_type: &str) -> bool {
+    let mt = mime_type.to_ascii_lowercase();
+    mt.ends_with("/rtx")
+        || mt.ends_with("/ulpfec")
+        || mt.ends_with("/flexfec")
+        || mt.ends_with("/flexfec-03")
+}
+
+/// Which transceiver owns an inbound SSRC, so a packet doesn't walk every transceiver to find out.
+/// An entry is only a hint: it is re-checked on use, so a stale one costs a scan, never a wrong hit.
+#[derive(Default)]
+pub(crate) struct SsrcOwners(FxHashMap<SSRC, usize>);
+
+impl SsrcOwners {
+    pub(crate) fn cached(
+        &self,
+        ssrc: SSRC,
+        transceivers: &[RTCRtpTransceiverInternal],
+        owns: fn(&RTCRtpTransceiverInternal, SSRC) -> bool,
+    ) -> Option<usize> {
+        let id = *self.0.get(&ssrc)?;
+        owns(transceivers.get(id)?, ssrc).then_some(id)
+    }
+
+    pub(crate) fn find(
+        &mut self,
+        ssrc: SSRC,
+        transceivers: &[RTCRtpTransceiverInternal],
+        owns: fn(&RTCRtpTransceiverInternal, SSRC) -> bool,
+    ) -> Option<usize> {
+        if let Some(id) = self.cached(ssrc, transceivers, owns) {
+            return Some(id);
+        }
+        let id = transceivers.iter().position(|t| owns(t, ssrc))?;
+        self.0.insert(ssrc, id);
+        Some(id)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+fn receiver_track_has_ssrc(transceiver: &RTCRtpTransceiverInternal, ssrc: SSRC) -> bool {
+    transceiver
+        .receiver()
+        .as_ref()
+        .is_some_and(|receiver| receiver.track().ssrcs().any(|s| s == ssrc))
+}
+
+#[derive(Default)]
+pub(crate) struct EndpointHandlerContext {
+    pub(crate) ssrc_owners: SsrcOwners,
+    pub(crate) read_outs: VecDeque<TaggedRTCMessageInternal>,
+    pub(crate) write_outs: VecDeque<TaggedRTCMessageInternal>,
+    pub(crate) event_outs: VecDeque<TaggedRTCEventInternal>,
+}
+
+/// EndpointHandler implements DataChannel/Media Endpoint handling
+/// The transmits queue is now stored in RTCPeerConnection and passed by reference
+pub(crate) struct EndpointHandler<'a> {
+    ctx: &'a mut EndpointHandlerContext,
+    rtp_transceivers: &'a mut Vec<RTCRtpTransceiverInternal>,
+    stats: &'a mut RTCStatsAccumulator,
+}
+
+impl<'a> EndpointHandler<'a> {
+    pub(crate) fn new(
+        ctx: &'a mut EndpointHandlerContext,
+        rtp_transceivers: &'a mut Vec<RTCRtpTransceiverInternal>,
+        stats: &'a mut RTCStatsAccumulator,
+    ) -> Self {
+        EndpointHandler {
+            ctx,
+            rtp_transceivers,
+            stats,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        "EndpointHandler"
+    }
+}
+
+// Implement Protocol trait for message processing
+impl<'a>
+    sansio::Protocol<TaggedRTCMessageInternal, TaggedRTCMessageInternal, TaggedRTCEventInternal>
+    for EndpointHandler<'a>
+{
+    type Rout = TaggedRTCMessageInternal;
+    type Wout = TaggedRTCMessageInternal;
+    type Eout = TaggedRTCEventInternal;
+    type Error = Error;
+    type Time = Instant;
+
+    fn handle_read(&mut self, msg: TaggedRTCMessageInternal) -> Result<()> {
+        match msg.message {
+            RTCMessageInternal::Dtls(DTLSMessage::DataChannel(message)) => {
+                self.handle_dtls_message(msg.now, msg.transport, message)
+            }
+            RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtp(message))) => {
+                self.handle_rtp_message(msg.now, msg.transport, message)
+            }
+            RTCMessageInternal::Rtp(RTPMessage::Packet(Packet::Rtcp(message))) => {
+                self.handle_rtcp_message(msg.now, msg.transport, message)
+            }
+            _ => {
+                warn!("drop unsupported message from {}", msg.transport.peer_addr);
+                Ok(())
+            }
+        }
+    }
+
+    fn poll_read(&mut self) -> Option<Self::Rout> {
+        self.ctx.read_outs.pop_front()
+    }
+
+    fn handle_write(&mut self, msg: TaggedRTCMessageInternal) -> Result<()> {
+        self.ctx.write_outs.push_back(msg);
+        Ok(())
+    }
+
+    fn poll_write(&mut self) -> Option<Self::Wout> {
+        self.ctx.write_outs.pop_front()
+    }
+
+    fn handle_event(&mut self, evt: TaggedRTCEventInternal) -> Result<()> {
+        self.ctx.event_outs.push_back(evt);
+        Ok(())
+    }
+
+    fn poll_event(&mut self) -> Option<Self::Eout> {
+        self.ctx.event_outs.pop_front()
+    }
+
+    fn handle_timeout(&mut self, _now: Instant) -> Result<()> {
+        Ok(())
+    }
+
+    fn poll_timeout(&mut self) -> Option<Instant> {
+        None
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> EndpointHandler<'a> {
+    fn handle_dtls_message(
+        &mut self,
+        now: Instant,
+        transport_context: TransportContext,
+        message: ApplicationMessage,
+    ) -> Result<()> {
+        match message.data_channel_event {
+            DataChannelEvent::Open => {
+                self.handle_datachannel_open(now, transport_context, message.data_channel_id)
+            }
+            DataChannelEvent::Message(data_channel_message) => self.handle_datachannel_message(
+                now,
+                transport_context,
+                message.data_channel_id,
+                data_channel_message,
+            ),
+            DataChannelEvent::Close => {
+                self.handle_datachannel_close(now, transport_context, message.data_channel_id)
+            }
+        }
+    }
+
+    fn handle_rtp_message(
+        &mut self,
+        now: Instant,
+        transport_context: TransportContext,
+        mut rtp_packet: rtp::Packet,
+    ) -> Result<()> {
+        debug!("handle_rtp_message {}", transport_context.peer_addr);
+
+        // RFC 4588: if this packet belongs to a retransmission (RTX) stream,
+        // de-encapsulate it back into its primary stream before dispatching.
+        // The RTX payload is `[OSN (2 bytes)][original RTP payload]`; the
+        // recovered packet carries the primary SSRC, the original payload type
+        // (resolved via the RTX codec's `apt=`) and the original sequence number
+        // (OSN), while keeping the timestamp/marker/extensions "as is". RTX
+        // receive statistics are tracked upstream in the interceptor handler
+        // (using the RTX SSRC), so they are not touched here.
+        let is_primary = self
+            .ctx
+            .ssrc_owners
+            .cached(
+                rtp_packet.header.ssrc,
+                self.rtp_transceivers,
+                receiver_track_has_ssrc,
+            )
+            .is_some();
+        if !is_primary
+            && let Some((primary_ssrc, primary_payload_type)) =
+                self.rtx_primary_for(rtp_packet.header.ssrc, rtp_packet.header.payload_type)
+        {
+            let recovered = deencapsulate_rtx(&mut rtp_packet, primary_ssrc, primary_payload_type);
+            if !recovered {
+                // RTX packet with no OSN header (e.g. a padding-only bandwidth-probe
+                // packet, RFC 4588 §4): nothing to recover.
+                trace!(
+                    "drop rtx packet ssrc = {} without OSN payload",
+                    rtp_packet.header.ssrc
+                );
+                return Ok(());
+            }
+        }
+
+        let ssrc = rtp_packet.header.ssrc;
+
+        if let Some(track_id) = self.find_track_id(ssrc, Some(&rtp_packet.header)) {
+            // Track RTP stats if accumulator exists (created when OnOpen event is fired)
+            if let Some(stream) = self.stats.inbound_rtp_streams.get_mut(&ssrc) {
+                stream.on_rtp_received(
+                    rtp_packet.header.marshal_size(),
+                    rtp_packet.payload.len(),
+                    now,
+                );
+            }
+
+            self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
+                now,
+                transport: transport_context,
+                message: RTCMessageInternal::Rtp(RTPMessage::TrackPacket(TrackPacket {
+                    track_id,
+                    packet: Packet::Rtp(rtp_packet),
+                })),
+            });
+        } else {
+            debug!("drop rtp packet ssrc = {}", ssrc);
+        }
+        Ok(())
+    }
+
+    fn handle_rtcp_message(
+        &mut self,
+        now: Instant,
+        transport_context: TransportContext,
+        rtcp_packets: Vec<Box<dyn rtcp::Packet>>,
+    ) -> Result<()> {
+        debug!("handle_rtcp_message {}", transport_context.peer_addr);
+
+        let rtcp_ssrc = if let Some(rtcp_packet) = rtcp_packets.first() {
+            rtcp_packet.destination_ssrc().first().cloned()
+        } else {
+            None
+        };
+
+        if let Some(rtcp_ssrc) = rtcp_ssrc {
+            if let Some(track_id) = self.find_track_id(rtcp_ssrc, None) {
+                self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
+                    now,
+                    transport: transport_context,
+                    message: RTCMessageInternal::Rtp(RTPMessage::TrackPacket(TrackPacket {
+                        track_id,
+                        packet: Packet::Rtcp(rtcp_packets),
+                    })),
+                });
+            } else {
+                debug!("drop rtcp packet ssrc = {}", rtcp_ssrc);
+            }
+        } else {
+            debug!("drop rtcp packet due to empty ssrc");
+        }
+
+        Ok(())
+    }
+
+    fn handle_datachannel_open(
+        &mut self,
+        now: Instant,
+        transport_context: TransportContext,
+        data_channel_id: RTCDataChannelId,
+    ) -> Result<()> {
+        debug!("data channel is open for {:?}", transport_context);
+        self.ctx.event_outs.push_back(TaggedRTCEventInternal {
+            now,
+            event: RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnDataChannel(
+                RTCDataChannelEvent::OnOpen(data_channel_id),
+            )),
+        });
+
+        Ok(())
+    }
+
+    fn handle_datachannel_close(
+        &mut self,
+        now: Instant,
+        transport_context: TransportContext,
+        data_channel_id: RTCDataChannelId,
+    ) -> Result<()> {
+        debug!("data channel is close for {:?}", transport_context);
+        self.ctx.event_outs.push_back(TaggedRTCEventInternal {
+            now,
+            event: RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnDataChannel(
+                RTCDataChannelEvent::OnClose(data_channel_id),
+            )),
+        });
+
+        Ok(())
+    }
+
+    fn handle_datachannel_message(
+        &mut self,
+        now: Instant,
+        transport_context: TransportContext,
+        data_channel_id: RTCDataChannelId,
+        data_channel_message: RTCDataChannelMessage,
+    ) -> Result<()> {
+        debug!("data channel recv message for {:?}", transport_context);
+        self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
+            now,
+            transport: transport_context,
+            message: RTCMessageInternal::Dtls(DTLSMessage::DataChannel(ApplicationMessage {
+                data_channel_id,
+                data_channel_event: DataChannelEvent::Message(data_channel_message),
+            })),
+        });
+
+        Ok(())
+    }
+
+    /// RFC 4588: resolves a retransmission (RTX) SSRC to the primary stream it repairs.
+    ///
+    /// Returns `(primary_ssrc, primary_payload_type)` when `rtx_ssrc` matches the
+    /// RTX SSRC of one of this endpoint's receive codings (declared via
+    /// `a=ssrc-group:FID <primary> <rtx>` in the remote SDP, RFC 5576). The
+    /// original payload type is resolved from the negotiated RTX codec's `apt=`
+    /// parameter, looked up by the packet's RTX `payload_type`. Returns `None`
+    /// (leaving the packet to be handled as a regular RTP packet) when the SSRC
+    /// is not a known RTX SSRC or the `apt` mapping cannot be resolved.
+    fn rtx_primary_for(
+        &self,
+        rtx_ssrc: SSRC,
+        rtx_payload_type: PayloadType,
+    ) -> Option<(SSRC, PayloadType)> {
+        self.rtp_transceivers.iter().find_map(|transceiver| {
+            let receiver = transceiver.receiver().as_ref()?;
+            resolve_rtx_primary(
+                receiver.get_coding_parameters(),
+                receiver.get_codec_preferences(),
+                rtx_ssrc,
+                rtx_payload_type,
+            )
+        })
+    }
+
+    // crosscheck with RTCPeerConnection::start_rtp, since remote tracks(RTCRtpCodingParameters) are added in it
+    //
+    // A pure lookup. Establishing a stream — resolving its codec from the arriving payload type,
+    // binding it to the interceptors, creating its accumulator and firing `OnTrack` — happens in
+    // `StreamEstablisher`, driven by the interceptor handler *before* the chain sees the packet.
+    // By the time a packet reaches here the SSRC is registered on the receiver's track, so all
+    // that is left is to name the track it belongs to.
+    fn find_track_id(
+        &mut self,
+        ssrc: SSRC,
+        rtp_header: Option<&rtp::Header>,
+    ) -> Option<MediaStreamTrackId> {
+        if let Some(id) =
+            self.ctx
+                .ssrc_owners
+                .find(ssrc, self.rtp_transceivers, receiver_track_has_ssrc)
+            && let Some(receiver) = self.rtp_transceivers[id].receiver()
+        {
+            return Some(receiver.track().track_id().clone());
+        }
+
+        // No receiver owns this ssrc. For inbound RTCP (no rtp_header) it may be feedback
+        // (PLI/FIR/RR) about one of our *senders* — e.g. a subscriber's keyframe request for
+        // a forwarded stream. Surface it tagged with the sender's track id so the
+        // application (an SFU) can relay the feedback upstream to the publisher. RTP media
+        // is never inbound on a sender, so this branch is RTCP-only.
+        if rtp_header.is_none()
+            && let Some(track_id) = self.rtp_transceivers.iter().find_map(|transceiver| {
+                transceiver.sender().as_ref().and_then(|sender| {
+                    let track = sender.track();
+                    track
+                        .ssrcs()
+                        .any(|track_ssrc| track_ssrc == ssrc)
+                        .then(|| track.track_id().clone())
+                })
+            })
+        {
+            return Some(track_id);
+        }
+
+        trace!(
+            "no track id for {:?} for {} packet",
+            ssrc,
+            if rtp_header.is_some() { "RTP" } else { "RTCP" }
+        );
+        None
+    }
+}
+
+/// RFC 4588: resolve a single receiver's coding/codec state to the primary
+/// stream that an RTX packet (`rtx_ssrc`, `rtx_payload_type`) repairs.
+///
+/// Returns `(primary_ssrc, primary_payload_type)` when `rtx_ssrc` is the RTX
+/// SSRC of one of `coding_parameters` (declared via `a=ssrc-group:FID <primary>
+/// <rtx>`, RFC 5576) and the original payload type can be resolved from the
+/// matching RTX codec's `apt=` parameter (looked up by `rtx_payload_type`).
+/// Returns `None` when the SSRC is not a known RTX SSRC or the `apt` mapping
+/// cannot be resolved.
+pub(crate) fn resolve_rtx_primary(
+    coding_parameters: &[RTCRtpCodingParameters],
+    codec_preferences: &[RTCRtpCodecParameters],
+    rtx_ssrc: SSRC,
+    rtx_payload_type: PayloadType,
+) -> Option<(SSRC, PayloadType)> {
+    // Associate the RTX SSRC with its primary stream via the FID group recorded
+    // in the coding parameters.
+    let primary_ssrc =
+        coding_parameters
+            .iter()
+            .find_map(|coding| match (&coding.rtx, coding.ssrc) {
+                (Some(rtx), Some(primary_ssrc)) if rtx.ssrc == rtx_ssrc => Some(primary_ssrc),
+                _ => None,
+            })?;
+
+    // Resolve the original payload type from the negotiated RTX codec's `apt=`
+    // parameter.
+    let primary_payload_type = codec_preferences.iter().find_map(|codec| {
+        if codec.payload_type == rtx_payload_type
+            && codec
+                .rtp_codec
+                .mime_type
+                .eq_ignore_ascii_case(MIME_TYPE_RTX)
+        {
+            parse_rtx_apt(&codec.rtp_codec.sdp_fmtp_line)
+        } else {
+            None
+        }
+    })?;
+
+    Some((primary_ssrc, primary_payload_type))
+}
+
+/// RFC 4588 §4: recover the original RTP packet carried inside an RTX packet.
+///
+/// The retransmission payload is `[OSN: u16 big-endian][original RTP payload]`,
+/// where OSN "MUST be set to the sequence number of the associated original RTP
+/// packet" (RFC 4588 §4). On success the packet is rewritten in place to look
+/// like the original: the SSRC becomes `primary_ssrc`, the payload type becomes
+/// `primary_payload_type` (the `apt`), the sequence number becomes the OSN, and
+/// the 2-byte OSN header is stripped from the payload. The timestamp, marker and
+/// CSRC list are already carried "as is" by the RTX packet per RFC 4588 §4 and
+/// are left untouched; any original RTP padding was removed by the sender before
+/// retransmission, so the padding flag is cleared.
+///
+/// Returns `false` without modifying the packet when the payload is shorter than
+/// the 2-byte OSN header (e.g. a padding-only bandwidth-probe packet).
+fn deencapsulate_rtx(
+    packet: &mut rtp::Packet,
+    primary_ssrc: SSRC,
+    primary_payload_type: PayloadType,
+) -> bool {
+    if packet.payload.len() < 2 {
+        return false;
+    }
+
+    let original_sequence_number = u16::from_be_bytes([packet.payload[0], packet.payload[1]]);
+    packet.header.ssrc = primary_ssrc;
+    packet.header.payload_type = primary_payload_type;
+    packet.header.sequence_number = original_sequence_number;
+    packet.header.padding = false;
+    packet.payload = packet.payload.slice(2..);
+
+    true
+}
+
+#[cfg(test)]
+mod rtx_test {
+    use super::{
+        EndpointHandler, EndpointHandlerContext, Instant, Packet, RTCMessageInternal,
+        RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpTransceiverInternal, RTPMessage,
+        TrackPacket, TransportContext, deencapsulate_rtx, resolve_rtx_primary,
+    };
+    use crate::media_stream::track::MediaStreamTrack;
+    use crate::rtp_transceiver::rtp_sender::{
+        RTCRtpCodec, RTCRtpEncodingParameters, RTCRtpRtxParameters, RtpCodecKind,
+    };
+    use crate::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
+    use crate::statistics::accumulator::RTCStatsAccumulator;
+    use bytes::Bytes;
+    use shared::TransportProtocol;
+
+    fn coding(primary_ssrc: u32, rtx_ssrc: Option<u32>) -> RTCRtpCodingParameters {
+        RTCRtpCodingParameters {
+            rid: String::new(),
+            ssrc: Some(primary_ssrc),
+            rtx: rtx_ssrc.map(|ssrc| RTCRtpRtxParameters { ssrc }),
+            fec: None,
+        }
+    }
+
+    fn codec(payload_type: u8, mime_type: &str, fmtp: &str) -> RTCRtpCodecParameters {
+        RTCRtpCodecParameters {
+            rtp_codec: RTCRtpCodec {
+                mime_type: mime_type.to_owned(),
+                clock_rate: 90000,
+                channels: 0,
+                sdp_fmtp_line: fmtp.to_owned(),
+                rtcp_feedback: vec![],
+            },
+            payload_type,
+        }
+    }
+
+    #[test]
+    fn resolves_rtx_ssrc_to_primary_and_apt() {
+        let codings = [coding(1000, Some(2000))];
+        let prefs = [codec(96, "video/VP8", ""), codec(97, "video/rtx", "apt=96")];
+        assert_eq!(
+            resolve_rtx_primary(&codings, &prefs, 2000, 97),
+            Some((1000, 96))
+        );
+    }
+
+    #[test]
+    fn selects_the_correct_primary_among_several_codings() {
+        let codings = [coding(1000, Some(2000)), coding(1001, Some(2001))];
+        let prefs = [
+            codec(97, "video/rtx", "apt=96"),
+            codec(99, "video/rtx", "apt=98"),
+        ];
+        assert_eq!(
+            resolve_rtx_primary(&codings, &prefs, 2001, 99),
+            Some((1001, 98))
+        );
+    }
+
+    #[test]
+    fn unknown_rtx_ssrc_is_not_resolved() {
+        let codings = [coding(1000, Some(2000))];
+        let prefs = [codec(97, "video/rtx", "apt=96")];
+        // 2000 is the only RTX SSRC: an unknown SSRC (9999) and the primary's own
+        // SSRC (1000) must not be mistaken for RTX.
+        assert_eq!(resolve_rtx_primary(&codings, &prefs, 9999, 97), None);
+        assert_eq!(resolve_rtx_primary(&codings, &prefs, 1000, 97), None);
+    }
+
+    #[test]
+    fn coding_without_rtx_pairing_is_not_resolved() {
+        // rid-based / undeclared codings carry no rtx SSRC (rtx: None).
+        let codings = [coding(1000, None)];
+        let prefs = [codec(97, "video/rtx", "apt=96")];
+        assert_eq!(resolve_rtx_primary(&codings, &prefs, 2000, 97), None);
+    }
+
+    #[test]
+    fn missing_or_mismatched_rtx_codec_pref_is_not_resolved() {
+        let codings = [coding(1000, Some(2000))];
+        // No codec preference at the RTX payload type.
+        assert_eq!(resolve_rtx_primary(&codings, &[], 2000, 97), None);
+        // Payload type present but it is not an RTX codec.
+        let non_rtx = [codec(97, "video/VP8", "")];
+        assert_eq!(resolve_rtx_primary(&codings, &non_rtx, 2000, 97), None);
+        // RTX codec present but without a parseable apt.
+        let no_apt = [codec(97, "video/rtx", "")];
+        assert_eq!(resolve_rtx_primary(&codings, &no_apt, 2000, 97), None);
+    }
+
+    // RFC 4588 §4: the RTX payload is [OSN (2 bytes, big-endian)][original payload].
+    #[test]
+    fn deencapsulates_rtx_packet_into_primary() {
+        let mut packet = rtp::Packet {
+            header: rtp::Header {
+                marker: true,
+                payload_type: 97,    // negotiated RTX payload type
+                sequence_number: 42, // RTX stream sequence number (independent)
+                timestamp: 9000,     // already the original timestamp (RFC 4588 §4)
+                ssrc: 0xDEAD_BEEF,   // RTX SSRC
+                padding: true,
+                ..Default::default()
+            },
+            // OSN = 0x1234, followed by the original media payload.
+            payload: Bytes::from(vec![0x12, 0x34, 0xAA, 0xBB, 0xCC]),
+        };
+
+        assert!(deencapsulate_rtx(&mut packet, 0x1111_2222, 96));
+
+        // Rewritten to look like the original primary packet.
+        assert_eq!(packet.header.ssrc, 0x1111_2222);
+        assert_eq!(packet.header.payload_type, 96);
+        assert_eq!(packet.header.sequence_number, 0x1234); // OSN
+        // Kept "as is".
+        assert_eq!(packet.header.timestamp, 9000);
+        assert!(packet.header.marker);
+        // Original padding was removed by the sender before retransmission.
+        assert!(!packet.header.padding);
+        // OSN header stripped, original payload preserved.
+        assert_eq!(&packet.payload[..], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn padding_only_probe_packet_is_left_unchanged() {
+        // A bandwidth-probe RTX packet may carry fewer than 2 payload bytes and
+        // therefore has no OSN to recover.
+        let mut packet = rtp::Packet {
+            header: rtp::Header {
+                payload_type: 97,
+                ssrc: 0xDEAD_BEEF,
+                ..Default::default()
+            },
+            payload: Bytes::from(vec![0x00]),
+        };
+        let before = packet.clone();
+
+        assert!(!deencapsulate_rtx(&mut packet, 0x1111_2222, 96));
+        assert_eq!(packet, before);
+    }
+
+    #[test]
+    fn empty_payload_is_left_unchanged() {
+        let mut packet = rtp::Packet {
+            header: rtp::Header {
+                payload_type: 97,
+                ssrc: 7,
+                ..Default::default()
+            },
+            payload: Bytes::new(),
+        };
+
+        assert!(!deencapsulate_rtx(&mut packet, 1, 96));
+    }
+
+    // Builds a video receive transceiver whose primary stream is paired with an
+    // RTX stream via the FID group, matching what start_rtp sets up for an
+    // `a=ssrc-group:FID` offer. The primary SSRC already has a (non-empty) codec
+    // so find_track_id resolves it directly.
+    fn rtx_receiver_transceiver(
+        primary_ssrc: u32,
+        rtx_ssrc: u32,
+        primary_pt: u8,
+        rtx_pt: u8,
+    ) -> RTCRtpTransceiverInternal {
+        let mut transceiver = RTCRtpTransceiverInternal::new(
+            RtpCodecKind::Video,
+            None,
+            RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                streams: vec![],
+                send_encodings: vec![],
+            },
+        );
+
+        let receiver = transceiver.receiver_mut().as_mut().unwrap();
+        receiver.set_coding_parameters(vec![coding(primary_ssrc, Some(rtx_ssrc))]);
+        receiver.set_codec_preferences(vec![
+            codec(primary_pt, "video/VP8", ""),
+            codec(rtx_pt, "video/rtx", &format!("apt={primary_pt}")),
+        ]);
+        receiver.set_track(MediaStreamTrack::new(
+            "stream".to_string(),
+            format!("track-{primary_ssrc}"),
+            "label".to_string(),
+            RtpCodecKind::Video,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: coding(primary_ssrc, Some(rtx_ssrc)),
+                active: true,
+                codec: RTCRtpCodec {
+                    mime_type: "video/VP8".to_owned(),
+                    clock_rate: 90000,
+                    channels: 0,
+                    sdp_fmtp_line: String::new(),
+                    rtcp_feedback: vec![],
+                },
+                max_bitrate: 0,
+                max_framerate: None,
+                scale_resolution_down_by: None,
+            }],
+        ));
+        transceiver
+    }
+
+    fn test_transport() -> TransportContext {
+        TransportContext {
+            local_addr: "127.0.0.1:5000".parse().unwrap(),
+            peer_addr: "127.0.0.1:5001".parse().unwrap(),
+            transport_protocol: TransportProtocol::UDP,
+            ecn: None,
+        }
+    }
+
+    #[test]
+    fn handle_rtp_message_deencapsulates_and_dispatches_rtx() {
+        let (primary_ssrc, rtx_ssrc, primary_pt, rtx_pt) = (1000u32, 2000u32, 96u8, 97u8);
+        let mut transceivers = vec![rtx_receiver_transceiver(
+            primary_ssrc,
+            rtx_ssrc,
+            primary_pt,
+            rtx_pt,
+        )];
+        let mut stats = RTCStatsAccumulator::new();
+        let mut ctx = EndpointHandlerContext::default();
+
+        // RTX packet on the RTX SSRC: payload = [OSN=42][media 0xDE 0xAD].
+        let rtx_packet = rtp::Packet {
+            header: rtp::Header {
+                marker: true,
+                payload_type: rtx_pt,
+                sequence_number: 9, // RTX stream sequence number (independent)
+                timestamp: 12_345,
+                ssrc: rtx_ssrc,
+                ..Default::default()
+            },
+            payload: Bytes::from(vec![0x00, 0x2A, 0xDE, 0xAD]),
+        };
+
+        {
+            let mut handler = EndpointHandler::new(&mut ctx, &mut transceivers, &mut stats);
+            handler
+                .handle_rtp_message(Instant::now(), test_transport(), rtx_packet)
+                .expect("handle_rtp_message");
+        }
+
+        // The recovered packet is dispatched on the primary stream, de-encapsulated.
+        let dispatched = ctx
+            .read_outs
+            .pop_front()
+            .expect("a track packet should be dispatched");
+        match dispatched.message {
+            RTCMessageInternal::Rtp(RTPMessage::TrackPacket(TrackPacket {
+                packet: Packet::Rtp(packet),
+                ..
+            })) => {
+                assert_eq!(packet.header.ssrc, primary_ssrc);
+                assert_eq!(packet.header.payload_type, primary_pt);
+                assert_eq!(packet.header.sequence_number, 42); // OSN
+                assert_eq!(packet.header.timestamp, 12_345); // preserved
+                assert!(packet.header.marker); // preserved
+                assert_eq!(&packet.payload[..], &[0xDE, 0xAD]); // OSN stripped
+            }
+            _ => panic!("expected a de-encapsulated RTP TrackPacket on the primary stream"),
+        }
+    }
+
+    fn dispatch(
+        ctx: &mut EndpointHandlerContext,
+        transceivers: &mut Vec<RTCRtpTransceiverInternal>,
+        ssrc: u32,
+        payload_type: u8,
+        payload: &'static [u8],
+    ) -> Option<(String, rtp::Packet)> {
+        let mut stats = RTCStatsAccumulator::new();
+        let packet = rtp::Packet {
+            header: rtp::Header {
+                payload_type,
+                ssrc,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(payload),
+        };
+        EndpointHandler::new(ctx, transceivers, &mut stats)
+            .handle_rtp_message(Instant::now(), test_transport(), packet)
+            .expect("handle_rtp_message");
+
+        match ctx.read_outs.pop_front()?.message {
+            RTCMessageInternal::Rtp(RTPMessage::TrackPacket(TrackPacket {
+                track_id,
+                packet: Packet::Rtp(packet),
+            })) => Some((track_id, packet)),
+            _ => panic!("expected an RTP TrackPacket"),
+        }
+    }
+
+    #[test]
+    fn rtx_after_primary_is_still_deencapsulated() {
+        let mut transceivers = vec![rtx_receiver_transceiver(1000, 2000, 96, 97)];
+        let mut ctx = EndpointHandlerContext::default();
+
+        dispatch(&mut ctx, &mut transceivers, 1000, 96, &[0xDE, 0xAD]).expect("primary");
+
+        let (_, packet) = dispatch(
+            &mut ctx,
+            &mut transceivers,
+            2000,
+            97,
+            &[0x00, 0x2A, 0xDE, 0xAD],
+        )
+        .expect("rtx");
+        assert_eq!(packet.header.ssrc, 1000);
+        assert_eq!(packet.header.payload_type, 96);
+        assert_eq!(packet.header.sequence_number, 42);
+    }
+
+    #[test]
+    fn a_packet_reaches_its_track_after_transceivers_move() {
+        let mut transceivers = vec![
+            rtx_receiver_transceiver(1000, 2000, 96, 97),
+            rtx_receiver_transceiver(1001, 2001, 96, 97),
+        ];
+        let mut ctx = EndpointHandlerContext::default();
+        let mut track_of = |transceivers: &mut Vec<_>, ssrc| {
+            dispatch(&mut ctx, transceivers, ssrc, 96, &[0xDE, 0xAD]).map(|(track_id, _)| track_id)
+        };
+
+        assert_eq!(
+            track_of(&mut transceivers, 1001).as_deref(),
+            Some("track-1001")
+        );
+
+        // The remembered position is now out of range.
+        let first = transceivers.remove(0);
+        assert_eq!(
+            track_of(&mut transceivers, 1001).as_deref(),
+            Some("track-1001")
+        );
+
+        // The remembered position now holds a different receiver.
+        transceivers.insert(0, first);
+        assert_eq!(
+            track_of(&mut transceivers, 1001).as_deref(),
+            Some("track-1001")
+        );
+        assert_eq!(
+            track_of(&mut transceivers, 1000).as_deref(),
+            Some("track-1000")
+        );
+
+        transceivers.remove(0);
+        assert_eq!(track_of(&mut transceivers, 1000), None);
+    }
+
+    #[test]
+    fn handle_rtp_message_drops_rtx_probe_packet() {
+        let (primary_ssrc, rtx_ssrc, primary_pt, rtx_pt) = (1000u32, 2000u32, 96u8, 97u8);
+        let mut transceivers = vec![rtx_receiver_transceiver(
+            primary_ssrc,
+            rtx_ssrc,
+            primary_pt,
+            rtx_pt,
+        )];
+        let mut stats = RTCStatsAccumulator::new();
+        let mut ctx = EndpointHandlerContext::default();
+
+        // A padding-only probe on the RTX SSRC: payload shorter than the OSN.
+        let probe = rtp::Packet {
+            header: rtp::Header {
+                payload_type: rtx_pt,
+                ssrc: rtx_ssrc,
+                ..Default::default()
+            },
+            payload: Bytes::from(vec![0x00]),
+        };
+
+        {
+            let mut handler = EndpointHandler::new(&mut ctx, &mut transceivers, &mut stats);
+            handler
+                .handle_rtp_message(Instant::now(), test_transport(), probe)
+                .expect("handle_rtp_message");
+        }
+
+        assert!(
+            ctx.read_outs.is_empty(),
+            "an RTX probe packet with no OSN should be dropped, not dispatched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod repair_mime_type_tests {
+    use super::is_repair_mime_type;
+
+    /// Regression: RTX must be excluded regardless of media type (video/rtx, audio/rtx)
+    /// and case variations so it is never selected as a primary codec.
+    #[test]
+    fn is_repair_mime_type_detects_rtx_variants() {
+        assert!(is_repair_mime_type("video/rtx"));
+        assert!(is_repair_mime_type("audio/rtx"));
+        assert!(is_repair_mime_type("Video/RTX"));
+        assert!(is_repair_mime_type("VIDEO/RTX"));
+    }
+
+    /// Regression: all FEC mime types must be treated as repair codecs.
+    #[test]
+    fn is_repair_mime_type_detects_fec_variants() {
+        assert!(is_repair_mime_type("video/ulpfec"));
+        assert!(is_repair_mime_type("video/flexfec"));
+        assert!(is_repair_mime_type("video/flexfec-03"));
+        assert!(is_repair_mime_type("Video/ULPFEC"));
+        assert!(is_repair_mime_type("VIDEO/FLEXFEC"));
+        assert!(is_repair_mime_type("VIDEO/FLEXFEC-03"));
+    }
+
+    /// Primary media codecs must NOT be classified as repair.
+    #[test]
+    fn is_repair_mime_type_rejects_primary_codecs() {
+        assert!(!is_repair_mime_type("video/VP8"));
+        assert!(!is_repair_mime_type("video/VP9"));
+        assert!(!is_repair_mime_type("video/H264"));
+        assert!(!is_repair_mime_type("audio/opus"));
+        assert!(!is_repair_mime_type("audio/PCMU"));
+        assert!(!is_repair_mime_type(""));
+    }
+}

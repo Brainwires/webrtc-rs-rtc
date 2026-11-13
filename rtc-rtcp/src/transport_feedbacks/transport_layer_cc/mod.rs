@@ -1,3 +1,11 @@
+//! Transport-wide congestion control feedback.
+//!
+//! Reports the arrival status and time of packets by their *transport-wide* sequence number — the
+//! one the `TransportCcExtension` RTP header extension stamps on every packet
+//! regardless of stream, which is why one report can cover audio and video together.
+//!
+//! Status is run-length or bit-vector encoded ([`StatusChunkTypeTcc`](crate::transport_feedbacks::transport_layer_cc::StatusChunkTypeTcc)) so a report covering
+//! hundreds of packets stays small.
 #[cfg(test)]
 mod transport_layer_cc_test;
 
@@ -49,7 +57,9 @@ use std::fmt;
 #[repr(u16)]
 pub enum StatusChunkTypeTcc {
     #[default]
+    /// A run-length chunk: one status repeated for a stated number of packets.
     RunLengthChunk = 0,
+    /// A status-vector chunk: explicit per-packet status for a small group.
     StatusVectorChunk = 1,
 }
 
@@ -76,6 +86,7 @@ pub enum SymbolSizeTypeTcc {
     /// <https://tools.ietf.org/html/draft-holmer-rmcat-transport-wide-cc-extensions-01#section-3.1.4>
     #[default]
     OneBit = 0,
+    /// Two-bit symbols, which can also express "received, large delta".
     TwoBit = 1,
 }
 
@@ -112,7 +123,9 @@ impl From<u16> for SymbolTypeTcc {
 /// RunLengthChunk and StatusVectorChunk
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketStatusChunk {
+    /// A run-length encoded chunk.
     RunLengthChunk(RunLengthChunk),
+    /// A status-vector chunk.
     StatusVectorChunk(StatusVectorChunk),
 }
 
@@ -313,6 +326,7 @@ impl Unmarshal for StatusVectorChunk {
 /// <https://tools.ietf.org/html/draft-holmer-rmcat-transport-wide-cc-extensions-01#section-3.1.5>
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecvDelta {
+    /// Which symbol size this chunk uses.
     pub type_tcc_packet: SymbolTypeTcc,
     /// us
     pub delta: i64,
@@ -576,7 +590,7 @@ impl Unmarshal for TransportLayerCc {
 
         // https://tools.ietf.org/html/rfc4585#page-33
         // header's length + payload's length
-        let total_length = 4 * (h.length + 1) as usize;
+        let total_length = 4 * (h.length as usize + 1);
 
         if total_length < HEADER_LENGTH + PACKET_CHUNK_OFFSET {
             return Err(Error::PacketTooShort);

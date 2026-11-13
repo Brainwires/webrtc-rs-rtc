@@ -1,6 +1,12 @@
 use super::*;
 use shared::marshal::*;
 
+/// The built-in provider, for tests only. Library code never resolves a default: every public
+/// constructor takes the provider from its caller.
+fn test_crypto_provider() -> std::sync::Arc<dyn crypto::RTCCryptoProvider> {
+    crypto::default_provider().expect("a built-in crypto provider must be enabled for tests")
+}
+
 use bytes::Bytes;
 use lazy_static::lazy_static;
 
@@ -72,6 +78,7 @@ fn build_test_context() -> Result<Context> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         None,
+        test_crypto_provider().crypto(),
     )
 }
 
@@ -92,6 +99,7 @@ fn test_rtp_invalid_auth() -> Result<()> {
         ProtectionProfile::Aes128CmHmacSha1_80,
         None,
         None,
+        test_crypto_provider().crypto(),
     )?;
 
     for test_case in &*RTP_TEST_CASES {
@@ -170,3 +178,69 @@ fn test_rtp_lifecyle() -> Result<()> {
 //TODO: BenchmarkEncryptRTP
 //TODO: BenchmarkEncryptRTPInPlace
 //TODO: BenchmarkDecryptRTP
+
+/// Packets that fail authentication must not create per-SSRC state: otherwise a peer (or
+/// anyone who can reach the socket) can grow the state map with made-up SSRCs.
+#[test]
+fn test_unauthenticated_packets_do_not_create_ssrc_state() -> Result<()> {
+    let mut ctx = build_test_context()?;
+    for ssrc in 0..1000u32 {
+        let header = rtp::header::Header {
+            version: 2,
+            sequence_number: 1,
+            ssrc,
+            ..Default::default()
+        };
+        let mut raw = header.marshal()?.to_vec();
+        raw.extend_from_slice(&[0u8; 30]); // payload + a bogus auth tag
+        assert!(ctx.decrypt_rtp_with_header(&raw, &header).is_err());
+    }
+    assert!(
+        ctx.srtp_ssrc_states.is_empty(),
+        "{} SSRC states were created by unauthenticated packets",
+        ctx.srtp_ssrc_states.len()
+    );
+    Ok(())
+}
+
+/// Fuzz regression (`context_decrypt`): a header extension element that runs past the declared
+/// extension length made `Header::marshal_size` exceed the packet, and the AEAD cipher's
+/// `split_at_mut(header_len)` panicked. The packet is the minimised fuzz input.
+#[test]
+fn test_encrypt_rtp_extension_overrunning_header_is_an_error() -> Result<()> {
+    const PACKET: [&str; 6] = [
+        "92009000000000f89292b60201000000000000961000003b005a5a5a16009292920000920000f892b6ffffffffffffff",
+        "ffffffffffffffffffffffffffffffffffffffffffffffff00000000000026ab00080000042800005a5a5a5a5a5a5a5a",
+        "5a003b00000000000a00040000000a00005a5a0000929200ffffffffffffffffffffffffffffffffffffffffffffffff",
+        "ffffffffffffffffffffffffffffffffffff00000000000026ab0008000b00042800005a5a5a5a5a5a5a5a5a003b0000",
+        "0000000a00040000000a00005a5affffffffffffffffffffffffffffff00000000000026ab0008000b00042800005a5a",
+        "5a5a5a5a5a5a5a003b00000000000a00040000000a00005a5a",
+    ];
+    let packet: Vec<u8> = PACKET
+        .concat()
+        .as_bytes()
+        .chunks(2)
+        .map(|h| u8::from_str_radix(std::str::from_utf8(h).unwrap(), 16).unwrap())
+        .collect();
+    // A small packet with the same flaw: a two-byte extension block of one word holding an
+    // element whose 11-byte payload runs into the RTP payload.
+    let mut small = vec![
+        0x90, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 0x10, 0x00, 0x00, 0x01, 0x01, 0x0b,
+    ];
+    small.extend_from_slice(&[0xab; 11]);
+
+    let provider = test_crypto_provider();
+    for profile in [
+        ProtectionProfile::AeadAes256Gcm,
+        ProtectionProfile::AeadAes128Gcm,
+        ProtectionProfile::Aes128CmHmacSha1_80,
+    ] {
+        let key = vec![1u8; profile.key_len()];
+        let salt = vec![2u8; profile.salt_len()];
+        let mut ctx = Context::new(&key, &salt, profile, None, None, provider.crypto())?;
+        assert!(ctx.encrypt_rtp(&packet).is_err(), "{profile:?}");
+        assert!(ctx.encrypt_rtp(&small).is_err(), "{profile:?}");
+        assert!(ctx.decrypt_rtp(&small).is_err(), "{profile:?}");
+    }
+    Ok(())
+}

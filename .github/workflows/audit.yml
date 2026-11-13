@@ -1,0 +1,38 @@
+name: audit
+
+# Every PR, whatever its base, and every push to the release branches. The lockfile is not
+# committed, so each run resolves dependencies afresh (`cargo generate-lockfile`) and checks what
+# a build today would get.
+on:
+  pull_request:
+  push:
+    branches: [ master, v0.20.x, v0.21.x, v1.x ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  advisories:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Resolve dependencies afresh
+        run: cargo generate-lockfile
+      # Fails on any advisory (vulnerability, unmaintained, unsound, yanked) reachable from the
+      # library: normal and build dependencies, all features. No ignores.
+      - name: Library dependency graph
+        run: cargo deny --config .github/deny-library.toml check advisories
+      # The whole workspace, dev-dependencies and examples included; ignores in deny.toml are
+      # limited to advisories that cannot reach the library, each with its reason.
+      - name: Whole workspace
+        run: cargo deny --config deny.toml check advisories

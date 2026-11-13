@@ -2,6 +2,7 @@ use super::{chunk_header::*, chunk_type::*, *};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 pub(crate) const PAYLOAD_DATA_ENDING_FRAGMENT_BITMASK: u8 = 1;
@@ -15,13 +16,22 @@ pub(crate) const PAYLOAD_DATA_HEADER_SIZE: usize = 12;
 /// <https://www.iana.org/assignments/sctp-parameters/sctp-parameters.xhtml#sctp-parameters-25>
 #[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
+#[non_exhaustive]
 pub enum PayloadProtocolIdentifier {
+    /// `WebRTC DCEP` (50): a Data Channel Establishment Protocol control message.
     Dcep = 50,
+    /// `WebRTC String` (51): a non-empty UTF-8 string message.
     String = 51,
+    /// `WebRTC Binary` (53): a non-empty binary message.
     Binary = 53,
+    /// `WebRTC String Empty` (56): an empty string message.
+    ///
+    /// Needed because SCTP cannot carry a zero-length payload.
     StringEmpty = 56,
+    /// `WebRTC Binary Empty` (57): an empty binary message.
     BinaryEmpty = 57,
     #[default]
+    /// An identifier this crate does not recognise.
     Unknown,
 }
 
@@ -48,6 +58,42 @@ impl From<u32> for PayloadProtocolIdentifier {
             56 => PayloadProtocolIdentifier::StringEmpty,
             57 => PayloadProtocolIdentifier::BinaryEmpty,
             _ => PayloadProtocolIdentifier::Unknown,
+        }
+    }
+}
+
+/// Association-local identity, unrelated to TSN, SSN, SID reuse or time.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub(crate) struct MessageId(NonZeroU64);
+
+impl MessageId {
+    /// Encode a zero-based association sequence with a niche for decoded DATA,
+    /// which has no local identity. Option<MessageId> stays one machine word.
+    /// Returns None when the sequence is exhausted.
+    pub(crate) fn new(sequence: u64) -> Option<Self> {
+        NonZeroU64::new(sequence.checked_add(1)?).map(Self)
+    }
+}
+
+/// Sender policy captured once per message and copied to every fragment.
+/// It remains valid after stream reset, SID reuse, or later policy changes.
+#[derive(Debug, Default, Copy, Clone)]
+pub(crate) enum MessageReliability {
+    #[default]
+    Reliable,
+    Rexmit {
+        max_retransmits: u32,
+    },
+    Timed {
+        deadline: Instant,
+    },
+}
+
+impl MessageReliability {
+    pub(crate) fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Timed { deadline } => Some(deadline),
+            _ => None,
         }
     }
 }
@@ -99,19 +145,33 @@ pub struct ChunkPayloadData {
     pub(crate) payload_type: PayloadProtocolIdentifier,
     pub(crate) user_data: Bytes,
 
-    /// Whether this data chunk was acknowledged (received by peer)
-    pub(crate) acked: bool,
+    /// Acknowledged by a peer SACK, independently of local payload release.
+    pub(crate) acknowledged: bool,
     pub(crate) miss_indicator: u32,
 
-    /// Partial-reliability parameters used only by sender
+    /// Partial-reliability parameters used only by sender.
+    ///
+    /// Reassigned on every (re)transmission, so it is the RTT baseline. It is
+    /// deliberately *not* the timed-reliability baseline: a message may wait in
+    /// the pending queue for a long time before it is first transmitted, and
+    /// `maxPacketLifeTime` has to cover that wait. See `created_at`.
     pub(crate) since: Option<Instant>,
+    /// When the message this chunk belongs to was handed to the association.
+    ///
+    /// Set once, from the instant the caller passed to `Stream::write*`, and
+    /// never reassigned. This is the baseline for `ReliabilityType::Timed`.
+    pub(crate) created_at: Option<Instant>,
+    /// Sender identity shared by every fragment; absent on decoded peer DATA.
+    pub(crate) message_id: Option<MessageId>,
+    /// Reliability belongs to the queued message, independently of its stream.
+    pub(crate) reliability: MessageReliability,
+    /// Identifies the stream incarnation whose send buffer owns this DATA.
+    pub(crate) stream_generation: u64,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
-    /// valid only with the first fragment
+    /// This fragment belongs to an atomically abandoned message.
     pub(crate) abandoned: bool,
-    /// valid only with the first fragment
-    pub(crate) all_inflight: bool,
 
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
@@ -130,12 +190,15 @@ impl Default for ChunkPayloadData {
             stream_sequence_number: 0,
             payload_type: PayloadProtocolIdentifier::default(),
             user_data: Bytes::new(),
-            acked: false,
+            acknowledged: false,
             miss_indicator: 0,
             since: None,
+            created_at: None,
+            message_id: None,
+            reliability: MessageReliability::Reliable,
+            stream_generation: 0,
             nsent: 0,
             abandoned: false,
-            all_inflight: false,
             retransmit: false,
         }
     }
@@ -212,12 +275,15 @@ impl Chunk for ChunkPayloadData {
             payload_type,
             user_data,
 
-            acked: false,
+            acknowledged: false,
             miss_indicator: 0,
             since: None,
+            created_at: None,
+            message_id: None,
+            reliability: MessageReliability::Reliable,
+            stream_generation: 0,
             nsent: 0,
             abandoned: false,
-            all_inflight: false,
             retransmit: false,
         })
     }
@@ -229,7 +295,9 @@ impl Chunk for ChunkPayloadData {
         writer.put_u16(self.stream_identifier);
         writer.put_u16(self.stream_sequence_number);
         writer.put_u32(self.payload_type as u32);
-        writer.extend(self.user_data.clone());
+        // NB: `extend(Bytes)` iterates the payload one byte at a time (Bytes is
+        // `IntoIterator<Item = u8>`); `extend_from_slice` does a single bulk copy.
+        writer.extend_from_slice(&self.user_data);
 
         Ok(writer.len())
     }
@@ -249,16 +317,27 @@ impl Chunk for ChunkPayloadData {
 
 impl ChunkPayloadData {
     pub(crate) fn abandoned(&self) -> bool {
-        self.abandoned && self.all_inflight
+        self.abandoned
     }
 
-    pub(crate) fn set_abandoned(&mut self, abandoned: bool) {
-        self.abandoned = abandoned;
+    pub(crate) fn is_outstanding(&self) -> bool {
+        !self.acknowledged && !self.abandoned
     }
 
-    pub(crate) fn set_all_inflight(&mut self) {
-        if self.ending_fragment {
-            self.all_inflight = true;
-        }
+    pub(crate) fn is_fast_retransmit_candidate(&self) -> bool {
+        self.is_outstanding() && self.nsent == 1 && self.miss_indicator >= 3
+    }
+
+    /// Record peer progress without changing payload ownership.
+    pub(crate) fn acknowledge(&mut self) -> bool {
+        let newly_acknowledged = !self.acknowledged;
+        self.acknowledged = true;
+        self.retransmit = false;
+        newly_acknowledged
+    }
+
+    pub(crate) fn mark_abandoned(&mut self) {
+        self.abandoned = true;
+        self.retransmit = false;
     }
 }

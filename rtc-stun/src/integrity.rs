@@ -2,12 +2,9 @@
 mod integrity_test;
 
 use crate::attributes::*;
-use crate::checks::*;
 use crate::message::*;
-use md5::{Digest, Md5};
+use crypto::{CryptoError, HashAlgorithm, HmacAlgorithm, RTCCrypto, SecretVec};
 use shared::error::*;
-
-use ring::hmac;
 use std::fmt;
 
 // separator for credentials.
@@ -19,21 +16,30 @@ pub(crate) const CREDENTIALS_SEP: &str = ":";
 // newHMAC function and internal/hmac/pool.go.
 //
 // RFC 5389 Section 15.4
-#[derive(Default, Clone)]
-pub struct MessageIntegrity(pub Vec<u8>);
-
-fn new_hmac(key: &[u8], message: &[u8]) -> Vec<u8> {
-    let mac = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key);
-    hmac::sign(&mac, message).as_ref().to_vec()
+#[derive(Clone)]
+/// The `MESSAGE-INTEGRITY` key: an HMAC-SHA1 is computed over the message with it.
+///
+/// Built from a short-term password, or from a long-term username/realm/password triple.
+pub struct MessageIntegrity<'a> {
+    key: SecretVec,
+    crypto: &'a dyn RTCCrypto,
 }
 
-impl fmt::Display for MessageIntegrity {
+fn crypto_error(error: CryptoError) -> Error {
+    Error::Crypto(error.to_string())
+}
+
+impl<'a> fmt::Display for MessageIntegrity<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "KEY: 0x{:x?}", self.0)
+        write!(
+            f,
+            "MESSAGE-INTEGRITY key: [REDACTED; {} bytes]",
+            self.key.len()
+        )
     }
 }
 
-impl Setter for MessageIntegrity {
+impl<'a> Setter for MessageIntegrity<'a> {
     // add_to adds MESSAGE-INTEGRITY attribute to message.
     //
     // CPU costly, see BenchmarkMessageIntegrity_AddTo.
@@ -52,10 +58,18 @@ impl Setter for MessageIntegrity {
         // Adjusting m.Length to contain MESSAGE-INTEGRITY TLV.
         m.length += (MESSAGE_INTEGRITY_SIZE + ATTRIBUTE_HEADER_SIZE) as u32;
         m.write_length(); // writing length to m.Raw
-        let v = new_hmac(&self.0, &m.raw); // calculating HMAC for adjusted m.Raw
+        let mut value = [0_u8; MESSAGE_INTEGRITY_SIZE];
+        // A STUN message is authenticated once, so the MAC is keyed here rather than held. On a
+        // per-packet path the keyed object belongs in the surrounding state instead.
+        let result = self
+            .crypto
+            .new_hmac(HmacAlgorithm::Sha1, self.key.as_ref())
+            .and_then(|mut mac| mac.sign(&[&m.raw], &mut value));
         m.length = length; // changing m.Length back
+        m.write_length();
+        result.map_err(crypto_error)?;
 
-        m.add(ATTR_MESSAGE_INTEGRITY, &v);
+        m.add(ATTR_MESSAGE_INTEGRITY, &value);
 
         Ok(())
     }
@@ -63,28 +77,63 @@ impl Setter for MessageIntegrity {
 
 pub(crate) const MESSAGE_INTEGRITY_SIZE: usize = 20;
 
-impl MessageIntegrity {
-    // new_long_term_integrity returns new MessageIntegrity with key for long-term
-    // credentials. Password, username, and realm must be SASL-prepared.
-    pub fn new_long_term_integrity(username: String, realm: String, password: String) -> Self {
-        let s = [username, realm, password].join(CREDENTIALS_SEP);
-
-        let mut h = Md5::new();
-        h.update(s.as_bytes());
-
-        MessageIntegrity(h.finalize().as_slice().to_vec())
+impl<'a> MessageIntegrity<'a> {
+    /// Creates a raw-key integrity attribute with an explicit crypto provider.
+    #[must_use]
+    pub fn new_raw_integrity_with_provider(
+        key: impl Into<Vec<u8>>,
+        crypto: &'a dyn RTCCrypto,
+    ) -> Self {
+        Self {
+            key: SecretVec::new(key.into()),
+            crypto,
+        }
     }
 
-    // new_short_term_integrity returns new MessageIntegrity with key for short-term
-    // credentials. Password must be SASL-prepared.
-    pub fn new_short_term_integrity(password: String) -> Self {
-        MessageIntegrity(password.as_bytes().to_vec())
+    /// Creates a short-term integrity attribute with an explicit crypto provider.
+    #[must_use]
+    pub fn new_short_term_integrity_with_provider(
+        password: String,
+        crypto: &'a dyn RTCCrypto,
+    ) -> Self {
+        Self::new_raw_integrity_with_provider(password.into_bytes(), crypto)
     }
 
-    // Check checks MESSAGE-INTEGRITY attribute.
-    //
-    // CPU costly, see BenchmarkMessageIntegrity_Check.
-    pub fn check(&self, m: &mut Message) -> Result<()> {
+    /// Creates a long-term integrity attribute with an explicit crypto provider.
+    pub fn new_long_term_integrity_with_provider(
+        username: String,
+        realm: String,
+        password: String,
+        crypto: &'a dyn RTCCrypto,
+    ) -> Result<Self> {
+        let key = MessageIntegrity::long_term_integrity_key(username, realm, password, crypto)?;
+        Ok(Self::new_raw_integrity_with_provider(key, crypto))
+    }
+
+    /// Creates a long-term integrity key with an explicit crypto provider.
+    pub fn long_term_integrity_key(
+        username: String,
+        realm: String,
+        password: String,
+        crypto: &'a dyn RTCCrypto,
+    ) -> Result<Vec<u8>> {
+        let credentials = [username, realm, password].join(CREDENTIALS_SEP);
+        let key = crypto
+            .hash(HashAlgorithm::Md5, credentials.as_bytes())
+            .map_err(crypto_error)?;
+        if key.len() != 16 {
+            return Err(Error::Crypto(format!(
+                "provider returned an invalid MD5 digest length: {}",
+                key.len()
+            )));
+        }
+        Ok(key)
+    }
+
+    /// Check checks MESSAGE-INTEGRITY attribute.
+    ///
+    /// CPU costly, see BenchmarkMessageIntegrity_Check.
+    pub fn check(m: &mut Message, key: &[u8], crypto: &dyn RTCCrypto) -> Result<()> {
         let v = m.get(ATTR_MESSAGE_INTEGRITY)?;
 
         // Adjusting length in header to match m.Raw that was
@@ -109,9 +158,17 @@ impl MessageIntegrity {
         let start_of_hmac = MESSAGE_HEADER_SIZE + m.length as usize
             - (ATTRIBUTE_HEADER_SIZE + MESSAGE_INTEGRITY_SIZE);
         let b = &m.raw[..start_of_hmac]; // data before integrity attribute
-        let expected = new_hmac(&self.0, b);
+        let result = crypto
+            .new_hmac(HmacAlgorithm::Sha1, key)
+            .and_then(|mut mac| mac.verify(&[b], &v));
         m.length = length as u32;
         m.write_length(); // writing length back
-        check_hmac(&v, &expected)
+        match result {
+            Ok(()) => Ok(()),
+            Err(CryptoError::AuthenticationFailed | CryptoError::InvalidTagLength { .. }) => {
+                Err(Error::ErrIntegrityMismatch)
+            }
+            Err(error) => Err(crypto_error(error)),
+        }
     }
 }

@@ -1,3 +1,8 @@
+//! Candidate transports: UDP or TCP, over IPv4 or IPv6.
+//!
+//! A [`NetworkType`](crate::network_type::NetworkType) pairs the transport protocol with the address family, because ICE treats
+//! them together: a candidate's type constrains which remote candidates it can be paired with,
+//! and pairs across families are never formed.
 #[cfg(test)]
 mod network_type_test;
 
@@ -13,6 +18,7 @@ pub(crate) const UDP: &str = "udp";
 pub(crate) const TCP: &str = "tcp";
 
 #[must_use]
+/// Every network type this crate can gather candidates for.
 pub fn supported_network_types() -> Vec<NetworkType> {
     vec![
         NetworkType::Udp4,
@@ -24,9 +30,11 @@ pub fn supported_network_types() -> Vec<NetworkType> {
 
 /// Represents the type of network.
 #[derive(Default, PartialEq, Debug, Copy, Clone, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum NetworkType {
     #[serde(rename = "unspecified")]
     #[default]
+    /// No network type was set.
     Unspecified,
 
     /// Indicates UDP over IPv4.
@@ -85,6 +93,7 @@ impl NetworkType {
     }
 
     #[must_use]
+    /// The transport protocol, discarding the address family.
     pub fn to_protocol(self) -> TransportProtocol {
         if self.is_tcp() {
             TransportProtocol::TCP

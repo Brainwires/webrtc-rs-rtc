@@ -1,0 +1,25 @@
+[package]
+name = "rtc-ice-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rtc-ice]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "agent_handle_inbound"
+path = "fuzz_targets/agent_handle_inbound.rs"
+test = false
+doc = false
+bench = false

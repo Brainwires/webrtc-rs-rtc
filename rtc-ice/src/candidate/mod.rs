@@ -1,3 +1,17 @@
+//! ICE candidates: the addresses an agent can be reached at.
+//!
+//! A [`Candidate`](crate::candidate::Candidate) pairs a transport address with a [`CandidateType`](crate::candidate::CandidateType) — host, server-reflexive,
+//! peer-reflexive or relay — and the bookkeeping ICE needs: a priority, a foundation, and
+//! last-sent/last-received times that feed consent freshness.
+//!
+//! Type drives priority, and priority drives check order: host candidates are tried first
+//! because they need no traversal, relay candidates last because they always cost an extra hop.
+//! The [`foundation`](crate::candidate::Candidate::foundation) groups candidates that share a base and transport,
+//! so redundant checks can be skipped.
+//!
+//! Each type has its own constructor module (`candidate_host`, `candidate_relay`, …), all
+//! built on the shared [`CandidateConfig`](crate::candidate::CandidateConfig).
+
 #[cfg(test)]
 mod candidate_pair_test;
 #[cfg(test)]
@@ -10,10 +24,15 @@ mod candidate_test;
 // #[cfg(test)] mod candidate_relay_test;
 // #[cfg(test)] mod candidate_server_reflexive_test;
 
+/// Host candidates: an address on a local interface.
 pub mod candidate_host;
+/// A local/remote candidate pair and its check state.
 pub mod candidate_pair;
+/// Peer-reflexive candidates, learned from an inbound check's source address.
 pub mod candidate_peer_reflexive;
+/// Relay candidates, allocated on a TURN server.
 pub mod candidate_relay;
+/// Server-reflexive candidates, learned from a STUN Binding response.
 pub mod candidate_server_reflexive;
 
 use crate::network_type::NetworkType;
@@ -41,17 +60,30 @@ pub(crate) const COMPONENT_RTCP: u16 = 0;
 
 /// Represents the type of candidate `CandidateType` enum.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CandidateType {
     #[default]
     #[serde(rename = "unspecified")]
+    /// No candidate type was set.
     Unspecified,
     #[serde(rename = "host")]
+    /// An address on one of this host's own interfaces.
+    ///
+    /// Highest priority: reachable without traversal when both peers share a network.
     Host,
     #[serde(rename = "srflx")]
+    /// This host's address as seen by a STUN server — its public mapping through the NAT.
     ServerReflexive,
     #[serde(rename = "prflx")]
+    /// An address learned from a peer's inbound connectivity check.
+    ///
+    /// Discovered during checking rather than gathering, when a NAT maps a different port per
+    /// destination.
     PeerReflexive,
     #[serde(rename = "relay")]
+    /// An address allocated on a TURN server, which forwards on this host's behalf.
+    ///
+    /// Lowest priority: it always costs an extra hop.
     Relay,
 }
 
@@ -105,7 +137,11 @@ pub(crate) fn contains_candidate_type(
 /// Convey transport addresses related to the candidate, useful for diagnostics and other purposes.
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct CandidateRelatedAddress {
+    /// The address of the related candidate — the base this one was derived from.
+    /// The candidate's address.
     pub address: String,
+    /// The port of the related candidate.
+    /// The candidate's port.
     pub port: u16,
 }
 
@@ -117,17 +153,29 @@ impl fmt::Display for CandidateRelatedAddress {
 }
 
 #[derive(Default)]
+/// The fields common to every candidate type, used when constructing one.
 pub struct CandidateConfig {
+    /// A unique identifier for this candidate; generated when left empty.
     pub candidate_id: String,
+    /// The transport, `udp` or `tcp`.
     pub network: String,
+    /// The candidate's address.
     pub address: String,
+    /// The candidate's port.
     pub port: u16,
+    /// The RTP component id: `1` for RTP, `2` for RTCP when not multiplexed.
     pub component: u16,
+    /// The candidate priority; computed from the type and local preference when zero.
     pub priority: u32,
+    /// The foundation, which groups candidates that share a base and transport.
+    ///
+    /// Pairs with the same foundation are checked together, so redundant checks are avoided.
     pub foundation: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+/// One ICE candidate: a transport address this agent can be reached at, or can reach a peer
+/// at, together with its type, priority and liveness bookkeeping.
 pub struct Candidate {
     pub(crate) id: String,
     pub(crate) network_type: NetworkType,
@@ -141,8 +189,14 @@ pub struct Candidate {
 
     pub(crate) resolved_addr: SocketAddr,
 
-    pub(crate) last_sent: Instant,
-    pub(crate) last_received: Instant,
+    /// When traffic was last sent on this candidate, or `None` if none ever has been.
+    pub(crate) last_sent: Option<Instant>,
+    /// When traffic was last received on this candidate, or `None` if none ever has been.
+    pub(crate) last_received: Option<Instant>,
+    /// When an authenticated (MESSAGE-INTEGRITY checked) Binding request or response last
+    /// arrived from this candidate. Consent freshness (RFC 7675) is judged on this alone, so
+    /// unauthenticated traffic from the address cannot keep a dead pair alive.
+    pub(crate) last_authenticated: Option<Instant>,
 
     pub(crate) foundation_override: String,
     pub(crate) priority_override: u32,
@@ -167,8 +221,9 @@ impl Default for Candidate {
 
             resolved_addr: SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
 
-            last_sent: Instant::now(),
-            last_received: Instant::now(),
+            last_sent: None,
+            last_received: None,
+            last_authenticated: None,
 
             foundation_override: String::new(),
             priority_override: 0,
@@ -206,6 +261,10 @@ impl fmt::Display for Candidate {
 }
 
 impl Candidate {
+    /// The candidate's foundation, computed from its type, base address and transport.
+    ///
+    /// A foundation groups equivalent candidates; it is deterministic bookkeeping rather than a
+    /// secret, random identifier. CRC-32C is therefore intentional here.
     pub fn foundation(&self) -> String {
         if !self.foundation_override.is_empty() {
             return self.foundation_override.clone();
@@ -236,13 +295,17 @@ impl Candidate {
         self.component = component;
     }
 
-    /// Returns a time indicating the last time this candidate was received.
-    pub fn last_received(&self) -> Instant {
+    /// When traffic was last received on this candidate.
+    ///
+    /// `None` until the first packet arrives. A freshly constructed or freshly parsed candidate
+    /// has not received anything, and previously said it had — it was seeded with the
+    /// construction instant, which also meant every candidate constructor needed a clock.
+    pub fn last_received(&self) -> Option<Instant> {
         self.last_received
     }
 
-    /// Returns a time indicating the last time this candidate was sent.
-    pub fn last_sent(&self) -> Instant {
+    /// When traffic was last sent on this candidate, or `None` if none ever has been.
+    pub fn last_sent(&self) -> Option<Instant> {
         self.last_sent
     }
 
@@ -275,7 +338,7 @@ impl Candidate {
         // one.
         (1 << 24) * u32::from(self.candidate_type().preference())
             + (1 << 8) * u32::from(self.local_preference())
-            + (256 - u32::from(self.component()))
+            + 256u32.saturating_sub(u32::from(self.component()))
     }
 
     /// Returns `Option<CandidateRelatedAddress>`.
@@ -288,10 +351,12 @@ impl Candidate {
         self.candidate_type
     }
 
+    /// The TCP role for ICE-TCP candidates; `Unspecified` for UDP.
     pub fn tcp_type(&self) -> TcpType {
         self.tcp_type
     }
 
+    /// The STUN or TURN server this candidate was gathered from, if any.
     pub fn url(&self) -> Option<&str> {
         self.url.as_deref()
     }
@@ -324,13 +389,38 @@ impl Candidate {
         val
     }
 
+    /// The candidate's socket address.
     pub fn addr(&self) -> SocketAddr {
         self.resolved_addr
     }
 
-    pub fn seen(&mut self, outbound: bool) {
-        let now = Instant::now();
+    /// Returns the candidate's base address: the local transport address the
+    /// candidate was derived from, i.e. the address packets for this candidate
+    /// must be sent from (RFC 8445 §5.1.1).
+    ///
+    /// For server-reflexive and peer-reflexive candidates this is the related
+    /// (host) address; for host and relay candidates the base is the candidate
+    /// address itself.
+    pub fn base_addr(&self) -> SocketAddr {
+        match self.candidate_type {
+            CandidateType::ServerReflexive | CandidateType::PeerReflexive => self
+                .related_address
+                .as_ref()
+                .and_then(|ra| {
+                    ra.address
+                        .parse::<IpAddr>()
+                        .ok()
+                        .map(|ip| SocketAddr::new(ip, ra.port))
+                })
+                .unwrap_or(self.resolved_addr),
+            _ => self.resolved_addr,
+        }
+    }
 
+    /// Records traffic on this candidate, updating its last-sent or last-received time.
+    ///
+    /// Feeds consent freshness — a pair that stops seeing traffic is eventually abandoned.
+    pub fn seen(&mut self, now: Instant, outbound: bool) {
         if outbound {
             self.set_last_sent(now);
         } else {
@@ -348,6 +438,31 @@ impl Candidate {
             && self.related_address() == other.related_address()
     }
 
+    /// Returns true if this candidate can be paired with `other` according to
+    /// ICE candidate pairing rules.
+    ///
+    /// Candidates must share the same network type (protocol and address family)
+    /// and have compatible TCP types (RFC 6544). UDP candidates use
+    /// `TcpType::Unspecified`.
+    pub(crate) fn can_pair_with(&self, other: &Candidate) -> bool {
+        if self.network_type() != other.network_type() {
+            return false;
+        }
+
+        match (self.tcp_type(), other.tcp_type()) {
+            (TcpType::Active, TcpType::Passive) => true,
+            (TcpType::Passive, TcpType::Active) => true,
+            (TcpType::SimultaneousOpen, TcpType::SimultaneousOpen) => true,
+            (TcpType::Unspecified, TcpType::Unspecified) => true, // UDP candidates
+            _ => false,
+        }
+    }
+
+    /// Sets the resolved IP, deriving the network type from it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `ip`'s family does not match this candidate's network type.
     pub fn set_ip(&mut self, ip: &IpAddr) -> Result<()> {
         self.network_type = determine_network_type(&self.network, ip)?;
         self.resolved_addr = SocketAddr::new(*ip, self.port); //TODO:  create_addr(network_type, *ip, self.port);
@@ -356,12 +471,19 @@ impl Candidate {
 }
 
 impl Candidate {
-    pub fn set_last_received(&mut self, now: Instant) {
-        self.last_received = now;
+    /// When an authenticated Binding request or response last arrived from this candidate.
+    pub fn last_authenticated(&self) -> Option<Instant> {
+        self.last_authenticated
     }
 
+    /// Records that traffic was received on this candidate at `now`.
+    pub fn set_last_received(&mut self, now: Instant) {
+        self.last_received = Some(now);
+    }
+
+    /// Records that traffic was sent on this candidate at `now`.
     pub fn set_last_sent(&mut self, now: Instant) {
-        self.last_sent = now;
+        self.last_sent = Some(now);
     }
 
     /// Returns the local preference for this candidate.
@@ -443,8 +565,15 @@ pub fn unmarshal_candidate(raw: &str) -> Result<Candidate> {
     // Foundation
     let foundation = split[0].to_owned();
 
-    // Component
+    // Component: RFC 8445 §5.1.1.1 numbers components from 1 to 256, and priority() relies on
+    // the bound (its last term is `256 - component`).
     let component: u16 = split[1].parse()?;
+    if !(1..=256).contains(&component) {
+        return Err(Error::Other(format!(
+            "{:?}: component {component} is outside 1..=256",
+            Error::ErrParseComponent
+        )));
+    }
 
     // Network
     let network = split[2].to_owned();

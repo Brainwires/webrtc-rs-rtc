@@ -1,3 +1,12 @@
+//! The `m=` media description.
+//!
+//! One [`MediaDescription`](crate::description::media::MediaDescription) is a media type, a transport port and protocol, a list of formats,
+//! and the attributes that describe them. For RTP media the formats are payload types, and
+//! [`MediaDescription::codecs`](crate::description::media::MediaDescription::codecs) assembles them into [`Codec`](crate::util::Codec)s by joining the
+//! `a=rtpmap`, `a=fmtp` and `a=rtcp-fb` attributes that belong to each.
+//!
+//! [`RangedPort`](crate::description::media::RangedPort) exists because a media section may claim consecutive ports (`<port>/<count>`),
+//! which RTP/RTCP without multiplexing needs.
 use std::collections::HashMap;
 use std::fmt;
 
@@ -5,9 +14,11 @@ use url::Url;
 
 use crate::description::common::*;
 use crate::extmap::*;
+use crate::util::{Codec, merge_codecs, parse_fmtp, parse_rtcp_fb, parse_rtpmap};
 
 /// Constants for extmap key
 pub const EXT_MAP_VALUE_TRANSPORT_CC_KEY: u16 = 3;
+/// The transport-wide congestion control header-extension URI.
 pub const EXT_MAP_VALUE_TRANSPORT_CC_URI: &str =
     "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
 
@@ -78,6 +89,33 @@ impl MediaDescription {
             }
         }
         None
+    }
+
+    /// The codecs this media section offers, keyed by payload type.
+    ///
+    /// Assembled from the `m=` format list plus the `a=rtpmap`, `a=fmtp` and `a=rtcp-fb`
+    /// attributes that describe them.
+    pub fn codecs(&self) -> HashMap<u8, Codec> {
+        let mut codecs: HashMap<u8, Codec> = HashMap::new();
+
+        for a in &self.attributes {
+            let attr = a.to_string();
+            if attr.starts_with("rtpmap:") {
+                if let Ok(codec) = parse_rtpmap(&attr) {
+                    merge_codecs(codec, &mut codecs);
+                }
+            } else if attr.starts_with("fmtp:") {
+                if let Ok(codec) = parse_fmtp(&attr) {
+                    merge_codecs(codec, &mut codecs);
+                }
+            } else if attr.starts_with("rtcp-fb:")
+                && let Ok(codec) = parse_rtcp_fb(&attr)
+            {
+                merge_codecs(codec, &mut codecs);
+            }
+        }
+
+        codecs
     }
 
     /// new_jsep_media_description creates a new MediaName with
@@ -183,6 +221,7 @@ impl MediaDescription {
         self.with_value_attribute("candidate".to_string(), value)
     }
 
+    /// Appends an `a=extmap` header-extension declaration.
     pub fn with_extmap(self, e: ExtMap) -> Self {
         self.with_property_attribute(e.marshal())
     }
@@ -214,7 +253,9 @@ impl MediaDescription {
 /// offsetting range.
 #[derive(Debug, Default, Clone)]
 pub struct RangedPort {
+    /// The first port number.
     pub value: isize,
+    /// How many consecutive ports the media uses, for `<port>/<count>` form.
     pub range: Option<isize>,
 }
 
@@ -231,9 +272,13 @@ impl fmt::Display for RangedPort {
 /// MediaName describes the "m=" field storage structure.
 #[derive(Debug, Default, Clone)]
 pub struct MediaName {
+    /// The media type: `audio`, `video`, or `application` for data channels.
     pub media: String,
+    /// The transport port, possibly a range.
     pub port: RangedPort,
+    /// The transport protocol tokens, such as `UDP`, `TLS`, `RTP`, `SAVPF`.
     pub protos: Vec<String>,
+    /// The payload types (for RTP media) or format tokens this section offers.
     pub formats: Vec<String>,
 }
 

@@ -7,6 +7,15 @@ use shared::{
 use bytes::BytesMut;
 
 impl Context {
+    /// Decrypts an SRTP packet whose header has already been parsed.
+    ///
+    /// Saves re-parsing when the caller needed the header to route the packet. The header must
+    /// be the one belonging to `encrypted`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if authentication fails, if the packet is a replay, or if it is too short to hold
+    /// the profile's auth tag.
     pub fn decrypt_rtp_with_header(
         &mut self,
         encrypted: &[u8],
@@ -17,22 +26,40 @@ impl Context {
             return Err(Error::ErrTooShortRtp);
         }
 
-        let state = self.get_srtp_ssrc_state(header.ssrc);
-        let (roc, diff, _) = state.next_rollover_count(header.sequence_number);
-        if let Some(replay_detector) = &mut state.replay_detector
-            && !replay_detector.check(header.sequence_number as u64)
-        {
-            return Err(Error::SrtpSsrcDuplicated(
-                header.ssrc,
-                header.sequence_number,
-            ));
-        }
+        // Per-SSRC state is created only once a packet for that SSRC authenticates, so packets
+        // under made-up SSRCs cannot grow the state map.
+        let (roc, diff) = match self.srtp_ssrc_states.get_mut(&header.ssrc) {
+            Some(state) => {
+                let (roc, diff, _) = state.next_rollover_count(header.sequence_number);
+                if let Some(replay_detector) = &mut state.replay_detector
+                    && !replay_detector.check(header.sequence_number as u64)
+                {
+                    return Err(Error::SrtpSsrcDuplicated(
+                        header.ssrc,
+                        header.sequence_number,
+                    ));
+                }
+                (roc, diff)
+            }
+            None => {
+                let fresh = SrtpSsrcState {
+                    ssrc: header.ssrc,
+                    ..Default::default()
+                };
+                let (roc, diff, _) = fresh.next_rollover_count(header.sequence_number);
+                (roc, diff)
+            }
+        };
 
         let dst = self.cipher.decrypt_rtp(encrypted, header, roc)?;
         {
+            let is_new = !self.srtp_ssrc_states.contains_key(&header.ssrc);
             let state = self.get_srtp_ssrc_state(header.ssrc);
             if let Some(replay_detector) = &mut state.replay_detector {
-                replay_detector.accept();
+                // A new SSRC's detector has not seen this sequence number yet: check, then accept.
+                if !is_new || replay_detector.check(header.sequence_number as u64) {
+                    replay_detector.accept();
+                }
             }
             state.update_rollover_count(header.sequence_number, diff);
         }
@@ -47,6 +74,14 @@ impl Context {
         self.decrypt_rtp_with_header(encrypted, &header)
     }
 
+    /// Encrypts an RTP payload, using an already-parsed header.
+    ///
+    /// Saves re-parsing when the caller has just built the header. Returns the full protected
+    /// packet, header included.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the SRTP context has no key for this SSRC or the cipher rejects the input.
     pub fn encrypt_rtp_with_header(
         &mut self,
         plaintext: &[u8],

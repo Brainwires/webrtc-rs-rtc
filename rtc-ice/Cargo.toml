@@ -11,36 +11,47 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["crypto-ring"]
+crypto-ring = ["crypto/crypto-ring", "stun/crypto-ring"]
+crypto-aws-lc-rs = ["crypto/crypto-aws-lc-rs", "stun/crypto-aws-lc-rs"]
+
 [dependencies]
 shared = { workspace = true, default-features = false, features = [] }
 sansio.workspace = true
 stun.workspace = true
 mdns.workspace = true
+crypto.workspace = true
 
-crc = "3.0.1"
+crc.workspace = true
 log.workspace = true
-rand.workspace = true
 serde.workspace = true
-url = "2.5.0"
-uuid = { version = "1", features = ["v4"] }
+url.workspace = true
+uuid.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
-regex = "1.10.3"
+regex.workspace = true
 env_logger.workspace = true
 chrono.workspace = true
-ipnet = "2.9.0"
+ipnet.workspace = true
 clap.workspace = true
-lazy_static = "1.4.0"
-hyper = { version = "0.14.28", features = ["full"] }
-sha1 = "0.10.6"
-waitgroup = "0.1.2"
-serde_json = "1.0.114"
+lazy_static.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+waitgroup.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
-futures = "0.3.30"
+futures.workspace = true
 ctrlc.workspace = true
 
 [[example]]
 name = "ping_pong"
 path = "examples/ping_pong.rs"
 bench = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

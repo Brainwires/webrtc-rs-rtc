@@ -4,6 +4,38 @@
 use super::*;
 
 #[test]
+fn fua_start_after_loss_boundary_discards_the_unfinished_nal() -> Result<()> {
+    let old = Bytes::from([vec![0x65], vec![0x11; 400]].concat());
+    let next = Bytes::from([vec![0x65], vec![0x22; 400]].concat());
+    let mut payloader = H264Payloader::default();
+    let fragments = payloader.payload(100, &old)?;
+    assert!(fragments.len() > 2);
+    let mut packet = H264Packet::default();
+    for fragment in &fragments[..fragments.len() - 1] {
+        assert!(packet.depacketize(fragment)?.is_empty());
+    }
+    let mut actual = Bytes::new();
+    for fragment in payloader.payload(100, &next)? {
+        actual = packet.depacketize(&fragment)?;
+    }
+    let expected = Bytes::from([ANNEXB_NALUSTART_CODE.as_ref(), next.as_ref()].concat());
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "old fragments must not prefix the next IDR"
+    );
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn stapa_truncated_length_boundary_returns_an_error() {
+    // A complete two-byte AUD NAL followed by only one byte of the next length.
+    let payload = Bytes::from_static(&[0x78, 0, 2, 0x09, 0xf0, 0xff]);
+    assert!(H264Packet::default().depacketize(&payload).is_err());
+}
+
+#[test]
 fn test_h264_payload() -> Result<()> {
     let empty = Bytes::from_static(&[]);
     let small_payload = Bytes::from_static(&[0x90, 0x90, 0x90]);
@@ -381,4 +413,34 @@ fn test_h264_emit_single_or_fragment_empty_nalu() {
     let mut payloads = vec![];
     H264Payloader::emit_single_or_fragment(&nalu, 10, &mut payloads);
     assert!(payloads.is_empty(), "empty NALU should produce no packets");
+}
+
+/// FU-A reassembly is bounded: a stream of start + middle fragments with no end stops being
+/// buffered at `MAX_FUA_NALU_SIZE`, and a fragment whose start was lost is dropped.
+#[test]
+fn test_h264_fua_reassembly_is_bounded_and_needs_a_start() -> Result<()> {
+    let mut pck = H264Packet::default();
+    let chunk = vec![0xaa; 60_000];
+    let fragment = |header: u8| {
+        let mut p = vec![FUA_NALU_TYPE, header];
+        p.extend_from_slice(&chunk);
+        Bytes::from(p)
+    };
+
+    // A middle fragment with no start before it is dropped.
+    assert!(pck.depacketize(&fragment(0x05))?.is_empty());
+    assert!(pck.fua_buffer.is_none());
+
+    // Start, then middles until well past the cap: the buffer never exceeds it.
+    pck.depacketize(&fragment(FU_START_BITMASK | 0x05))?;
+    for _ in 0..((MAX_FUA_NALU_SIZE / chunk.len()) + 10) {
+        let _ = pck.depacketize(&fragment(0x05));
+        assert!(
+            pck.fua_buffer
+                .as_ref()
+                .is_none_or(|b| b.len() <= MAX_FUA_NALU_SIZE),
+            "FU-A buffer grew past its cap"
+        );
+    }
+    Ok(())
 }

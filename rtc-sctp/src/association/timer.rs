@@ -7,12 +7,24 @@ const NO_MAX_RETRANS: usize = usize::MAX;
 const TIMER_COUNT: usize = 6;
 
 #[derive(Debug, Copy, Clone)]
+/// Retransmission limits for the association's timers.
+///
+/// Each field caps how many times the corresponding timer may fire before the association is
+/// abandoned. `Default` follows the RFC 9260 recommendations.
 pub struct TimerConfig {
+    /// How many times INIT may be retransmitted (T1-init) before the association fails.
     pub max_t1_init_retrans: usize,
+    /// How many times COOKIE-ECHO may be retransmitted (T1-cookie).
     pub max_t1_cookie_retrans: usize,
+    /// How many times SHUTDOWN may be retransmitted (T2-shutdown).
     pub max_t2_shutdown_retrans: usize,
+    /// How many times a DATA chunk may be retransmitted on T3-rtx expiry.
+    ///
+    /// Defaults to unlimited, leaving reliability to the per-stream partial-reliability settings.
     pub max_t3_rtx_retrans: usize,
+    /// How many times a RE-CONFIG chunk (stream reset) may be retransmitted.
     pub max_reconfig_retrans: usize,
+    /// How many times a delayed SACK may be retransmitted.
     pub max_ack_retrans: usize,
 }
 
@@ -56,6 +68,8 @@ pub(crate) struct TimerTable {
     data: [Option<Instant>; TIMER_COUNT],
     retrans: [usize; TIMER_COUNT],
     max_retrans: [usize; TIMER_COUNT],
+    shutdown_interval: Option<u64>,
+    reconfig_interval: Option<u64>,
 }
 
 impl TimerTable {
@@ -85,8 +99,24 @@ impl TimerTable {
         self.data.iter().filter_map(|&x| x).min()
     }
 
+    fn control_interval(&mut self, timer: Timer) -> Option<&mut Option<u64>> {
+        match timer {
+            Timer::T2Shutdown => Some(&mut self.shutdown_interval),
+            Timer::Reconfig => Some(&mut self.reconfig_interval),
+            _ => None,
+        }
+    }
+
     pub fn start(&mut self, timer: Timer, now: Instant, interval: u64) {
-        let interval = if timer == Timer::Ack {
+        // T3 uses the destination's current RTO, which already includes backoff.
+        // Successful DATA acknowledgments reset its error counter independently.
+        let interval = if let Some(current) = self.control_interval(timer) {
+            // Seed T2/RECONFIG from the current DATA RTO, then double their own
+            // interval on expiry. Rearming after serialization must neither
+            // compound T3 backoff nor apply this control timer's backoff twice.
+            // See RFC 9260 9.2 and RFC 6525 5.1.1.
+            *current.get_or_insert(interval)
+        } else if matches!(timer, Timer::Ack | Timer::T3RTX) {
             interval
         } else {
             calculate_next_timeout(interval, self.retrans[timer as usize])
@@ -96,25 +126,34 @@ impl TimerTable {
         self.data[timer as usize] = Some(time);
     }
 
-    /// Restarts the timer if the current instant is none or elapsed.
-    pub fn restart_if_stale(&mut self, timer: Timer, now: Instant, interval: u64) {
-        if let Some(current) = self.data[timer as usize]
-            && current >= now
-        {
-            return;
+    /// Start an idle timer without hiding an unhandled expiration. A due
+    /// deadline stays armed until timeout processing consumes it, unless an
+    /// explicit protocol restart first clears it (for T3, acknowledgment of
+    /// the earliest outstanding TSN under RFC 9260 section 6.3.2 R3).
+    pub fn start_if_idle(&mut self, timer: Timer, now: Instant, interval: u64) {
+        if self.data[timer as usize].is_none() {
+            self.start(timer, now, interval);
         }
-
-        self.start(timer, now, interval);
     }
 
     pub fn stop(&mut self, timer: Timer) {
         self.data[timer as usize] = None;
+        self.reset_retrans(timer);
+        if let Some(interval) = self.control_interval(timer) {
+            *interval = None;
+        }
+    }
+
+    pub fn reset_retrans(&mut self, timer: Timer) {
         self.retrans[timer as usize] = 0;
     }
 
     pub fn is_expired(&mut self, timer: Timer, after: Instant) -> (bool, bool, usize) {
         let expired = self.data[timer as usize].is_some_and(|x| x <= after);
         let mut failure = false;
+        if expired && let Some(interval) = self.control_interval(timer) {
+            *interval = interval.map(|previous| calculate_next_timeout(previous, 1));
+        }
         if expired {
             self.retrans[timer as usize] += 1;
             if self.retrans[timer as usize] > self.max_retrans[timer as usize] {
@@ -126,7 +165,9 @@ impl TimerTable {
     }
 }
 
-const RTO_INITIAL: u64 = 3000; // msec
+// RFC 9260 §16 recommends a one-second initial RTO.  This value is used by
+// both T1-init and T1-cookie before an RTT measurement is available.
+const RTO_INITIAL: u64 = 1000; // msec
 const RTO_MIN: u64 = 1000; // msec
 const RTO_MAX: u64 = 60000; // msec
 const RTO_ALPHA: u64 = 1;
@@ -134,7 +175,7 @@ const RTO_BETA: u64 = 2;
 const RTO_BASE: u64 = 8;
 
 /// rtoManager manages Rtx timeout values.
-/// This is an implementation of RFC 4960 sec 6.3.1.
+/// This is an implementation of RFC 9260 sec 6.3.1.
 #[derive(Default, Debug)]
 pub(crate) struct RtoManager {
     pub(crate) srtt: u64,
@@ -180,6 +221,13 @@ impl RtoManager {
         self.rto
     }
 
+    /// RFC 9260 6.3.3 E2: retain backoff until a new RTT measurement updates RTO.
+    pub(crate) fn backoff(&mut self) {
+        if !self.no_update {
+            self.rto = self.rto.saturating_mul(2).min(RTO_MAX);
+        }
+    }
+
     /// reset resets the RTO variables to the initial values.
     pub(crate) fn reset(&mut self) {
         if self.no_update {
@@ -208,5 +256,71 @@ fn calculate_next_timeout(rto: u64, n_rtos: usize) -> u64 {
         std::cmp::min(rto << n_rtos, RTO_MAX)
     } else {
         RTO_MAX
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rto_backoff_respects_pinned_rto() {
+        let mut rto = RtoManager::new();
+        rto.set_rto(1000, true);
+        rto.backoff();
+        assert_eq!(1000, rto.get_rto());
+        rto.set_rto(1000, false);
+        rto.backoff();
+        assert_eq!(2000, rto.get_rto());
+        rto.set_rto(RTO_MAX - 1, false);
+        rto.backoff();
+        assert_eq!(RTO_MAX, rto.get_rto());
+    }
+
+    #[test]
+    fn rto_manager_uses_rfc9260_initial_rto() {
+        assert_eq!(RTO_INITIAL, 1000);
+        assert_eq!(RtoManager::new().get_rto(), RTO_INITIAL);
+    }
+
+    #[test]
+    fn t1_init_starts_at_initial_rto_before_an_rtt_is_measured() {
+        let now = Instant::now();
+        let mut timers = TimerTable::new(TimerConfig::default());
+
+        timers.start(Timer::T1Init, now, RtoManager::new().get_rto());
+
+        assert_eq!(timers.next_timeout(), Some(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn control_backoff_uses_one_interval_until_stopped() {
+        for timer in [Timer::T2Shutdown, Timer::Reconfig] {
+            let mut timers = TimerTable::new(TimerConfig {
+                max_reconfig_retrans: usize::MAX,
+                ..TimerConfig::default()
+            });
+            let mut now = Instant::now();
+            // A new procedure uses the current RTO, including previous DATA
+            // backoff. Later DATA RTT updates/backoffs cannot compound it.
+            timers.start(timer, now, 8000);
+            assert_eq!(Some(now + Duration::from_secs(8)), timers.get(timer));
+            for interval in [16, 32, 60, 60] {
+                now = timers.get(timer).unwrap();
+                assert_eq!((true, false), {
+                    let (expired, failed, _) = timers.is_expired(timer, now);
+                    (expired, failed)
+                });
+                timers.set(timer, None);
+                for data_rto in [60_000, 1000] {
+                    timers.start(timer, now, data_rto);
+                    assert_eq!(Some(now + Duration::from_secs(interval)), timers.get(timer));
+                }
+            }
+            timers.stop(timer);
+            timers.start(timer, now, 3000);
+            assert_eq!(Some(now + Duration::from_secs(3)), timers.get(timer));
+            assert_eq!((false, false, 0), timers.is_expired(timer, now));
+        }
     }
 }

@@ -26,3 +26,10 @@ path = "fuzz_targets/parse_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "depacketize_sequence"
+path = "fuzz_targets/depacketize_sequence.rs"
+test = false
+doc = false
+bench = false

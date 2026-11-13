@@ -72,7 +72,7 @@ pub(crate) fn srv_cli_str(is_client: bool) -> String {
 }
 
 impl DTLSConn {
-    pub(crate) fn handshake(&mut self) -> Result<()> {
+    pub(crate) fn handshake(&mut self, now: Instant) -> Result<()> {
         loop {
             debug!(
                 "[handshake:{}] {}: {}",
@@ -95,16 +95,24 @@ impl DTLSConn {
             let previous_handshake_state = self.current_handshake_state;
             self.current_handshake_state = match previous_handshake_state {
                 HandshakeState::Preparing => self.prepare()?,
-                HandshakeState::Sending => self.send()?,
+                HandshakeState::Sending => self.send(now)?,
                 HandshakeState::Waiting => self.wait()?,
                 HandshakeState::Finished => self.finish()?,
                 _ => return Err(Error::ErrInvalidFsmTransition),
             };
 
             if previous_handshake_state == self.current_handshake_state
-                && previous_handshake_state == HandshakeState::Waiting
+                && matches!(
+                    previous_handshake_state,
+                    HandshakeState::Waiting | HandshakeState::Finished
+                )
             {
-                // wait for timeout or incoming packet
+                // Wait for a timeout or an incoming packet. `Finished` self transitions for the same
+                // reason `Waiting` does, and has to terminate for a stronger one: an association
+                // re-entered here after completing (the RFC 6347 4.2.4 last flight retransmission)
+                // has already passed the loop head guard, which only returns while
+                // `!is_handshake_completed()`. `send()` queues the flight and yields `Finished`,
+                // `finish()` yields `Finished` again, and without this the loop would spin.
                 return Ok(());
             }
         }
@@ -158,17 +166,22 @@ impl DTLSConn {
 
         Ok(HandshakeState::Sending)
     }
-    fn send(&mut self) -> Result<HandshakeState> {
+    fn send(&mut self, now: Instant) -> Result<HandshakeState> {
         // Send flights
         if let Some(pkts) = self.flights.clone() {
             self.write_packets(pkts);
         }
 
-        if self.current_flight.is_last_send_flight() {
+        // A Sending reached after the association has completed is an RFC 6347 4.2.4
+        // retransmission of our own last flight (the peer repeated its final flight), so it returns
+        // to Finished and never re-arms the receive timer. Only `Flight6` (the server) overrides
+        // `is_last_send_flight`, so on its own that check would send the client — whose last flight
+        // is `Flight5` — back into Waiting, where a failed `Flight5::parse` would strand a completed
+        // association forever. Gating on completion keeps both roles terminal here.
+        if self.current_flight.is_last_send_flight() || self.is_handshake_completed() {
             Ok(HandshakeState::Finished)
         } else {
-            self.current_retransmit_timer =
-                Some(Instant::now() + self.handshake_config.retransmit_interval);
+            self.current_retransmit_timer = Some(now + self.handshake_config.retransmit_interval);
             Ok(HandshakeState::Waiting)
         }
     }
@@ -179,7 +192,6 @@ impl DTLSConn {
                 srv_cli_str(self.state.is_client),
                 self.current_flight
             );
-            self.current_retransmit_timer = None;
             let result = self.current_flight.parse(
                 /*&mut self.handle_queue_tx,*/ &mut self.state,
                 &self.cache,
@@ -199,10 +211,14 @@ impl DTLSConn {
                         self.notify(alert.alert_level, alert.alert_description);
                     }
                     if let Some(err) = err {
+                        self.current_retransmit_timer = None;
                         return Err(err);
                     }
                 }
                 Ok(next_flight) => {
+                    // A partial or repeated flight must not cancel retransmission.
+                    // Only a complete next flight advances the handshake (RFC 6347 4.2.4).
+                    self.current_retransmit_timer = None;
                     debug!(
                         "[handshake:{}] {} -> {}",
                         srv_cli_str(self.state.is_client),
@@ -248,7 +264,7 @@ impl DTLSConn {
         Ok(HandshakeState::Finished)
     }
 
-    pub(crate) fn handshake_timeout(&mut self, _now: Instant) -> Result<()> {
+    pub(crate) fn handshake_timeout(&mut self, now: Instant) -> Result<()> {
         let next_handshake_state = if self.current_handshake_state == HandshakeState::Waiting {
             debug!(
                 "[handshake:{}] {} retransmit_timer",
@@ -265,25 +281,51 @@ impl DTLSConn {
             if self.retransmit {
                 self.current_retransmit_count += 1;
                 if self.current_retransmit_count > self.maximum_retransmit_number {
+                    warn!(
+                        "[handshake:{}] {} current_retransmit_count {} > maximum_retransmit_number {}, HandshakeState::Errored",
+                        srv_cli_str(self.state.is_client),
+                        self.current_flight,
+                        self.current_retransmit_count,
+                        self.maximum_retransmit_number,
+                    );
                     Some(HandshakeState::Errored)
                 } else {
                     Some(HandshakeState::Sending)
                 }
             } else {
                 self.current_retransmit_timer =
-                    Some(Instant::now() + self.handshake_config.retransmit_interval);
+                    Some(now + self.handshake_config.retransmit_interval);
                 Some(HandshakeState::Waiting)
             }
         } else if self.current_handshake_state == HandshakeState::Finished {
-            // Retransmit last flight
-            Some(HandshakeState::Sending)
+            // RFC 6347 4.2.4: retransmit our last flight because the peer repeated its own, which
+            // means ours was lost. Count it against the same budget as any handshake
+            // retransmission, so a peer — or an attacker replaying unauthenticated epoch-0
+            // handshake records — cannot make a completed association regenerate its flight (a full
+            // Flight5 with certificate, for a client) without limit. Once the budget is spent, stop
+            // answering and stay Finished: the association is established, so exhausting
+            // retransmissions here must never take it to Errored the way the Waiting branch does —
+            // that would tear down a live connection.
+            self.current_retransmit_count += 1;
+            if self.current_retransmit_count > self.maximum_retransmit_number {
+                warn!(
+                    "[handshake:{}] {} last-flight retransmit budget spent ({} > {}), staying Finished",
+                    srv_cli_str(self.state.is_client),
+                    self.current_flight,
+                    self.current_retransmit_count,
+                    self.maximum_retransmit_number,
+                );
+                None
+            } else {
+                Some(HandshakeState::Sending)
+            }
         } else {
             None
         };
 
         if let Some(next_handshake_state) = next_handshake_state {
             self.current_handshake_state = next_handshake_state;
-            self.handshake()
+            self.handshake(now)
         } else {
             Ok(())
         }

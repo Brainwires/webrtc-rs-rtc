@@ -22,6 +22,7 @@ pub struct Vp9Payloader {
     picture_id: u16,
     initialized: bool,
 
+    /// Supplies the starting picture id; randomized when absent.
     pub initial_picture_id_fn: Option<InitialPictureIDFn>,
 }
 
@@ -188,7 +189,9 @@ pub struct Vp9Packet {
     pub g: bool,
     /// N_G indicates the number of pictures in a Picture Group (PG)
     pub ng: u8,
+    /// Frame width for each spatial layer.
     pub width: Vec<u16>,
+    /// Frame height for each spatial layer.
     pub height: Vec<u16>,
     /// Temporal layer ID of pictures in a Picture Group
     pub pgtid: Vec<u8>,
@@ -218,6 +221,11 @@ impl Depacketizer for Vp9Packet {
         self.z = (b & 0x01) != 0;
 
         let mut payload_index = 1;
+
+        // The reference indices describe this packet's picture only. They used to accumulate
+        // across packets, so a long-lived depacketizer failed every flexible-mode packet once
+        // two had been seen.
+        self.pdiff.clear();
 
         if self.i {
             payload_index = self.parse_picture_id(reader, payload_index)?;
@@ -413,6 +421,11 @@ impl Vp9Packet {
 
         let ns = (self.ns + 1) as usize;
         self.ng = 0;
+        // A scalability structure replaces the previous one; its picture-group description
+        // used to be appended to the old one on every SS, growing without bound.
+        self.pgtid.clear();
+        self.pgu.clear();
+        self.pgpdiff.clear();
 
         if self.y {
             if reader.remaining() < 4 * ns {

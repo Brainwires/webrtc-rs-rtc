@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn received_finished_matches_only_the_same_message_epoch_and_peer() {
+    let mut cache = HandshakeCache::new();
+    let mut finished = vec![20, 0, 0, 12, 0, 7, 0, 0, 0, 0, 0, 12];
+    finished.extend_from_slice(b"verify-data!");
+    cache.push(finished.clone(), 1, 7, HandshakeType::Finished, true);
+    assert!(cache.matches_received_finished(&finished, 1, true));
+    assert!(!cache.matches_received_finished(&finished, 0, true));
+    assert!(!cache.matches_received_finished(&finished, 1, false));
+    for index in [0, 3, 5, 8, 11, 12, 23] {
+        let mut altered = finished.clone();
+        altered[index] ^= 1;
+        assert!(
+            !cache.matches_received_finished(&altered, 1, true),
+            "altered byte {index}"
+        );
+    }
+    for length in 0..finished.len() {
+        assert!(!cache.matches_received_finished(&finished[..length], 1, true));
+    }
+}
+
+#[test]
+fn only_the_matching_final_fragment_of_finished_triggers_a_reply() {
+    let mut cache = HandshakeCache::new();
+    let mut finished = vec![20, 0, 0, 12, 0, 7, 0, 0, 0, 0, 0, 12];
+    finished.extend_from_slice(b"verify-data!");
+    cache.push(finished.clone(), 1, 7, HandshakeType::Finished, true);
+
+    let mut first = finished[..12].to_vec();
+    first[11] = 6;
+    first.extend_from_slice(&finished[12..18]);
+    assert!(!cache.matches_received_finished(&first, 1, true));
+
+    let mut last = finished[..12].to_vec();
+    last[8] = 6;
+    last[11] = 6;
+    last.extend_from_slice(&finished[18..]);
+    assert!(cache.matches_received_finished(&last, 1, true));
+    let mut combined = first;
+    combined.extend_from_slice(&last);
+    assert!(cache.matches_received_finished(&combined, 1, true));
+
+    last[12] ^= 1;
+    assert!(!cache.matches_received_finished(&last, 1, true));
+}
+
+#[test]
 fn test_handshake_cache_single_push() -> Result<()> {
     let tests = vec![
         (
@@ -644,7 +691,8 @@ fn test_handshake_cache_session_hash() -> Result<()> {
             h.push(i.data, i.epoch, i.message_sequence, i.typ, i.is_client);
         }
 
-        let verify_data = h.session_hash(CipherSuiteHash::Sha256, 0, &[])?;
+        let provider = crypto::default_provider().map_err(|e| Error::Crypto(e.to_string()))?;
+        let verify_data = h.session_hash(provider.crypto(), CipherSuiteHash::Sha256, 0, &[])?;
 
         assert_eq!(
             verify_data, expected,
@@ -653,4 +701,14 @@ fn test_handshake_cache_session_hash() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Messages under ever new sequence numbers stop being cached at the cap.
+#[test]
+fn handshake_cache_is_bounded() {
+    let mut cache = HandshakeCache::new();
+    for seq in 0..(MAX_HANDSHAKE_CACHE_ITEMS as u16 + 10) {
+        cache.push(vec![0u8; 16], 0, seq, HandshakeType::Certificate, true);
+    }
+    assert_eq!(cache.cache.len(), MAX_HANDSHAKE_CACHE_ITEMS);
 }

@@ -13,8 +13,14 @@ use shared::error::Result;
 ///+-+-+-+-+-+-+-+-+
 /// ```
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
+/// A buffered-amount threshold crossing, reported internally so the channel can raise
+/// `OnBufferedAmountLow`/`OnBufferedAmountHigh`.
+///
+/// Not a DCEP message — it never appears on the wire.
 pub enum DataChannelThreshold {
+    /// The buffered amount fell to or below the low threshold, carrying its value.
     Low(u32),
+    /// The buffered amount rose to or above the high threshold, carrying its value.
     High(u32),
 } // internal usage only
 
@@ -47,6 +53,13 @@ impl Unmarshal for DataChannelThreshold {
         Self: Sized,
         B: Buf,
     {
+        // `Buf::get_*` panics on a short buffer, and this is the peer's DCEP payload.
+        if buf.remaining() < 5 {
+            return Err(Error::UnexpectedEndOfBuffer {
+                expected: 5,
+                actual: buf.remaining(),
+            });
+        }
         let t = buf.get_u8();
         let v = buf.get_u32();
         if t == 0 {

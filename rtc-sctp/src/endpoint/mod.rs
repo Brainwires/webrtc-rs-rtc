@@ -10,6 +10,8 @@ use std::{
     time::Instant,
 };
 
+use rustc_hash::FxHashMap;
+
 use crate::Payload;
 use crate::association::Association;
 use crate::chunk::chunk_type::CT_INIT;
@@ -36,12 +38,13 @@ pub struct Endpoint {
     transport_protocol: TransportProtocol,
     /// Identifies associations based on the INIT Dst AID the peer utilized
     ///
-    /// Uses a standard `HashMap` to protect against hash collision attacks.
+    /// Uses a standard `HashMap` to protect against hash collision attacks:
+    /// keys are remote-chosen initiate-tags.
     association_ids_init: HashMap<AssociationId, AssociationHandle>,
     /// Identifies associations based on locally created CIDs
     ///
     /// Uses a cheaper hash function since keys are locally created
-    association_ids: HashMap<AssociationId, AssociationHandle>,
+    association_ids: FxHashMap<AssociationId, AssociationHandle>,
 
     associations: Slab<AssociationMeta>,
     local_cid_generator: Box<dyn AssociationIdGenerator>,
@@ -80,7 +83,7 @@ impl Endpoint {
             local_addr,
             transport_protocol,
             association_ids_init: HashMap::default(),
-            association_ids: HashMap::default(),
+            association_ids: FxHashMap::default(),
             associations: Slab::new(),
             local_cid_generator: (endpoint_config.aid_generator_factory.as_ref())(),
             reject_new_associations: false,
@@ -175,6 +178,7 @@ impl Endpoint {
     /// Initiate an Association
     pub fn connect(
         &mut self,
+        now: Instant,
         config: ClientConfig,
         remote: SocketAddr,
     ) -> Result<(AssociationHandle, Association), ConnectError> {
@@ -188,14 +192,8 @@ impl Endpoint {
         let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
         let local_aid = self.new_aid();
 
-        let (ch, conn) = self.add_association(
-            remote_aid,
-            local_aid,
-            remote,
-            Instant::now(),
-            None,
-            config.transport,
-        );
+        let (ch, conn) =
+            self.add_association(remote_aid, local_aid, remote, now, None, config.transport);
         Ok((ch, conn))
     }
 
@@ -363,6 +361,7 @@ impl IndexMut<AssociationHandle> for Slab<AssociationMeta> {
 
 /// Event resulting from processing a single datagram
 #[allow(clippy::large_enum_variant)] // Not passed around extensively
+#[non_exhaustive]
 pub enum DatagramEvent {
     /// The datagram is redirected to its `Association`
     AssociationEvent(AssociationEvent),
@@ -374,6 +373,7 @@ pub enum DatagramEvent {
 ///
 /// These arise before any I/O has been performed.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectError {
     /// The endpoint can no longer create new associations
     ///

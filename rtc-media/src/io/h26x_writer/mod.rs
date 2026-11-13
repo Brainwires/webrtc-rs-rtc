@@ -9,12 +9,15 @@ use rtp::codec::h265::{H265Packet, H265Payload};
 use rtp::packetizer::Depacketizer;
 
 use crate::io::Writer;
-use shared::error::Result;
+use shared::error::{Error, Result};
 
 const NALU_TTYPE_STAP_A: u32 = 24;
 const NALU_TTYPE_SPS: u32 = 7;
 const NALU_TYPE_BITMASK: u32 = 0x1F;
 const ANNEXB_NALUSTART_CODE: &[u8] = &[0x00, 0x00, 0x00, 0x01];
+/// Largest H.265 NAL unit reassembled from fragmentation units, as for H.264 FU-A
+/// (`rtp::codec::h264::MAX_FUA_NALU_SIZE`).
+pub const MAX_H265_FU_NALU_SIZE: usize = 4 * 1024 * 1024;
 
 fn rebuild_h265_nalu_header(
     payload_header: rtp::codec::h265::H265NALUHeader,
@@ -172,6 +175,17 @@ impl<W: Write> H26xWriter<W> {
                         ));
                     }
 
+                    // A fragment with no start fragment before it has nothing to join.
+                    if self.buffer.is_empty() {
+                        return Ok(());
+                    }
+                    // Bounded: a peer that never sends the end fragment must not grow this
+                    // without limit. Drop the partial NAL unit.
+                    if self.buffer.len() + p.payload().len() > MAX_H265_FU_NALU_SIZE {
+                        self.buffer.clear();
+                        return Err(Error::ErrPacketTooBig);
+                    }
+
                     // Accumulate payload
                     self.buffer.extend_from_slice(&p.payload());
 
@@ -181,6 +195,8 @@ impl<W: Write> H26xWriter<W> {
                         self.buffer.clear();
                     }
                 }
+                // Unknown payload kind: skip it rather than corrupt the Annex-B stream.
+                _ => {}
             }
         }
 

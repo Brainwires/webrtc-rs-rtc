@@ -21,10 +21,19 @@ FUZZ_CRATES=(
     rtc-sdp
     rtc-stun
     rtc-rtp
+    rtc-srtp
+    rtc-ice
+    rtc-turn
+    rtc
 )
 
 for CRATE in "${FUZZ_CRATES[@]}"; do
-    pushd "$CRATE/fuzz"
+    # The `rtc` crate is the workspace root, so its fuzz crate is ./fuzz.
+    if [ "$CRATE" = rtc ]; then
+        pushd fuzz
+    else
+        pushd "$CRATE/fuzz"
+    fi
 
     # List all fuzz targets for this crate (fail build if cargo-fuzz is broken)
     TARGETS=$(cargo fuzz list)
@@ -37,6 +46,7 @@ for CRATE in "${FUZZ_CRATES[@]}"; do
         cargo fuzz build \
             --fuzz-dir . \
             --release \
+            --debug-assertions \
             "$TARGET"
 
         # Copy the compiled binary to $OUT
