@@ -16,6 +16,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# `bash` (not the default `bash -e`) adds `-o pipefail`, so a failing
+# `cargo bench` fails its step instead of being hidden by `tee`.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   benchmark:
     name: Run criterion benchmarks
@@ -36,26 +42,30 @@ jobs:
           key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-bench-
 
+      # Only the criterion `bench` target of each crate: `--output-format bencher`
+      # is a criterion flag that libtest (the lib/test targets `cargo bench` also
+      # runs) rejects. The bencher lines on stdout are what `tool: cargo` parses;
+      # cargo's own stderr stays in the log only.
       - name: Run benchmarks (rtc-rtp)
-        run: cargo bench -p rtc-rtp 2>&1 | tee -a bench-all.txt
+        run: cargo bench -p rtc-rtp --bench bench -- --output-format bencher | tee -a bench-all.txt
 
       - name: Run benchmarks (rtc-rtcp)
-        run: cargo bench -p rtc-rtcp 2>&1 | tee -a bench-all.txt
+        run: cargo bench -p rtc-rtcp --bench bench -- --output-format bencher | tee -a bench-all.txt
 
       - name: Run benchmarks (rtc-stun)
-        run: cargo bench -p rtc-stun 2>&1 | tee -a bench-all.txt
+        run: cargo bench -p rtc-stun --bench bench -- --output-format bencher | tee -a bench-all.txt
 
       - name: Run benchmarks (rtc-sdp)
-        run: cargo bench -p rtc-sdp 2>&1 | tee -a bench-all.txt
+        run: cargo bench -p rtc-sdp --bench bench -- --output-format bencher | tee -a bench-all.txt
 
       - name: Run benchmarks (rtc-srtp)
-        run: cargo bench -p rtc-srtp 2>&1 | tee -a bench-all.txt
+        run: cargo bench -p rtc-srtp --bench bench -- --output-format bencher | tee -a bench-all.txt
 
       - name: Run benchmarks (rtc-turn)
-        run: cargo bench -p rtc-turn 2>&1 | tee -a bench-all.txt
+        run: cargo bench -p rtc-turn --bench bench -- --output-format bencher | tee -a bench-all.txt
 
       - name: Run benchmarks (rtc-media)
-        run: cargo bench -p rtc-media 2>&1 | tee -a bench-all.txt
+        run: cargo bench -p rtc-media --bench bench -- --output-format bencher | tee -a bench-all.txt
 
       - name: Store benchmark results
         uses: benchmark-action/github-action-benchmark@v1
