@@ -171,80 +171,75 @@ impl Unmarshal for Header {
                 return Err(Error::ErrHeaderSizeInsufficientForExtension);
             }
 
+            // The whole extension block is consumed here, whatever its items say, so the
+            // payload starts where the header says it does and `marshal_size()` matches the
+            // wire: each item is bounded by the block, not by the rest of the packet.
+            let mut block = raw_packet.copy_to_bytes(extension_length);
             let mut extensions = vec![];
             match extension_profile {
                 // RFC 8285 RTP One Byte Header Extension
                 EXTENSION_PROFILE_ONE_BYTE => {
-                    let end = curr_offset + extension_length;
-                    while curr_offset < end {
-                        let b = raw_packet.get_u8();
+                    while block.has_remaining() {
+                        let b = block.get_u8();
                         if b == 0x00 {
                             // padding
-                            curr_offset += 1;
                             extensions_padding += 1;
                             continue;
                         }
 
                         let extid = b >> 4;
                         let len = ((b & (0xFF ^ 0xF0)) + 1) as usize;
-                        curr_offset += 1;
 
                         if extid == EXTENSION_ID_RESERVED {
+                            // RFC 8285 §4.2: processing stops at ID 15 and the rest of the
+                            // block is ignored. It is still part of the header.
+                            extensions_padding += 1 + block.remaining();
                             break;
                         }
 
-                        if len > raw_packet.remaining() {
+                        if len > block.remaining() {
                             return Err(Error::ErrHeaderSizeInsufficientForExtension);
                         }
 
                         extensions.push(Extension {
                             id: extid,
-                            payload: raw_packet.copy_to_bytes(len),
+                            payload: block.copy_to_bytes(len),
                         });
-                        curr_offset += len;
                     }
                 }
                 // RFC 8285 RTP Two Byte Header Extension
                 EXTENSION_PROFILE_TWO_BYTE => {
-                    let end = curr_offset + extension_length;
-                    while curr_offset < end {
-                        let b = raw_packet.get_u8();
+                    while block.has_remaining() {
+                        let b = block.get_u8();
                         if b == 0x00 {
                             // padding
-                            curr_offset += 1;
                             extensions_padding += 1;
                             continue;
                         }
 
                         let extid = b;
-                        curr_offset += 1;
 
-                        if curr_offset >= end {
+                        if !block.has_remaining() {
                             return Err(Error::ErrHeaderSizeInsufficientForExtension);
                         }
 
-                        let len = raw_packet.get_u8() as usize;
-                        curr_offset += 1;
+                        let len = block.get_u8() as usize;
 
-                        if len > raw_packet.remaining() {
+                        if len > block.remaining() {
                             return Err(Error::ErrHeaderSizeInsufficientForExtension);
                         }
 
                         extensions.push(Extension {
                             id: extid,
-                            payload: raw_packet.copy_to_bytes(len),
+                            payload: block.copy_to_bytes(len),
                         });
-                        curr_offset += len;
                     }
                 }
                 // RFC3550 Extension
                 _ => {
-                    if raw_packet_len < curr_offset + extension_length {
-                        return Err(Error::ErrHeaderSizeInsufficientForExtension);
-                    }
                     extensions.push(Extension {
                         id: 0,
-                        payload: raw_packet.copy_to_bytes(extension_length),
+                        payload: block,
                     });
                 }
             };

@@ -19,8 +19,8 @@ use anyhow::Result;
 use bytes::BytesMut;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Response, StatusCode};
 use log::{error, info, trace, warn};
 use rtc::data_channel::RTCDataChannelId;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
@@ -38,6 +38,7 @@ use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use serde::{Deserialize, Serialize};
+use signal::http::{Body, BodyExt, Incoming};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -301,32 +302,30 @@ async fn main() -> Result<()> {
 
 /// Run HTTP server for serving demo web pages
 async fn run_http_server() -> Result<()> {
-    let make_service = make_service_fn(|_conn| async {
-        Ok::<_, hyper::Error>(service_fn(move |req| async move {
-            match (req.method(), req.uri().path()) {
-                (&Method::GET, "/polite") | (&Method::GET, "/impolite") => {
-                    let html = std::fs::read_to_string(INDEX)?;
-                    Ok::<_, anyhow::Error>(
-                        Response::builder()
-                            .header("Content-Type", "text/html")
-                            .body(Body::from(html))
-                            .unwrap(),
-                    )
-                }
-                _ => Ok::<_, anyhow::Error>(
+    let make_service = service_fn(move |req| async move {
+        match (req.method(), req.uri().path()) {
+            (&Method::GET, "/polite") | (&Method::GET, "/impolite") => {
+                let html = std::fs::read_to_string(INDEX)?;
+                Ok::<_, anyhow::Error>(
                     Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Body::from("Not Found"))
+                        .header("Content-Type", "text/html")
+                        .body(Body::from(html))
                         .unwrap(),
-                ),
+                )
             }
-        }))
+            _ => Ok::<_, anyhow::Error>(
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("Not Found"))
+                    .unwrap(),
+            ),
+        }
     });
 
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;
     info!("HTTP server listening on http://{}", addr);
 
-    Server::bind(&addr).serve(make_service).await?;
+    signal::http::serve(addr, make_service).await?;
 
     Ok(())
 }

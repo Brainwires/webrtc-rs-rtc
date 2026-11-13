@@ -12,10 +12,15 @@ use crate::peer_connection::message::internal::{
 };
 use crate::peer_connection::transport::dtls::role::RTCDtlsRole;
 use crate::statistics::accumulator::RTCStatsAccumulator;
+use bytes::BytesMut;
+use datachannel::data_channel::DataChannelMessage;
+use datachannel::message::Message as DcepMessage;
+use datachannel::message::message_channel_close::DataChannelClose;
 use log::{debug, warn};
-use sctp::PayloadProtocolIdentifier;
+use sctp::{PayloadProtocolIdentifier, StreamId};
 use shared::TransportContext;
 use shared::error::{Error, Result};
+use shared::marshal::Marshal;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -111,6 +116,46 @@ impl<'a> DataChannelHandler<'a> {
         });
     }
 
+    /// Whether the peer may open an in-band channel on `stream_id`.
+    ///
+    /// RFC 8832 §6: the DTLS client opens channels on even stream ids and the DTLS server on
+    /// odd ones, so the peer's ids have the parity this side's do not. An id of this side's
+    /// parity is one `assign_stream_ids` may hand to a local channel; accepting the peer's
+    /// OPEN on it would let the peer take that stream first. With the role unresolved there
+    /// is no parity to judge by, and no stream is accepted.
+    fn is_peer_stream_id(&self, stream_id: StreamId) -> bool {
+        let local_parity = match self.dtls_role {
+            RTCDtlsRole::Client => 0,
+            RTCDtlsRole::Server => 1,
+            _ => return false,
+        };
+        stream_id % 2 != local_parity
+    }
+
+    /// Asks SCTP to reset `stream_id`, through the same DCEP close a local `close()` sends, so
+    /// a stream the peer was not allowed to open does not linger half-open in the
+    /// association.
+    fn reset_stream(
+        &mut self,
+        now: Instant,
+        association_handle: usize,
+        stream_id: StreamId,
+    ) -> Result<()> {
+        let payload = DcepMessage::DataChannelClose(DataChannelClose).marshal()?;
+        self.ctx.write_outs.push_back(TaggedRTCMessageInternal {
+            now,
+            transport: TransportContext::default(),
+            message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(DataChannelMessage {
+                association_handle,
+                stream_id,
+                ppi: PayloadProtocolIdentifier::Dcep,
+                payload: BytesMut::from(&payload[..]),
+                negotiated: false,
+            })),
+        });
+        Ok(())
+    }
+
     /// Emit the `DataChannelEvent::Open` application message and record the
     /// corresponding peer-connection and per-channel statistics.
     ///
@@ -203,6 +248,18 @@ impl<'a>
                 }
                 opened
             } else {
+                // A stream no channel is registered for is one the peer is opening in-band.
+                // Out-of-band negotiated channels are registered under their id on both
+                // sides, so they are found above and never get here, whatever their parity.
+                if !self.is_peer_stream_id(stream_id) {
+                    warn!(
+                        "rejecting stream {stream_id} the peer opened: RFC 8832 §6 gives ids of \
+                         that parity to this side (DTLS {})",
+                        self.dtls_role
+                    );
+                    self.reset_stream(now, message.association_handle, stream_id)?;
+                    return Ok(());
+                }
                 let data_channel_internal = RTCDataChannelInternal::accept(
                     message.association_handle,
                     message.stream_id,
@@ -1215,5 +1272,116 @@ mod tests {
                 .any(|e| matches!(e, DataChannelEvent::Message(_))),
             "a buffered message must never be delivered after the timeout"
         );
+    }
+
+    /// A DCEP OPEN from the peer, on `stream_id`.
+    fn open_message(association_handle: usize, stream_id: u16) -> DataChannelMessage {
+        use datachannel::message::message_channel_open::{
+            CHANNEL_PRIORITY_NORMAL, ChannelType, DataChannelOpen,
+        };
+        let open = Message::DataChannelOpen(DataChannelOpen {
+            channel_type: ChannelType::Reliable,
+            priority: CHANNEL_PRIORITY_NORMAL,
+            reliability_parameter: 0,
+            label: b"peer".to_vec(),
+            protocol: Vec::new(),
+        })
+        .marshal()
+        .unwrap();
+        DataChannelMessage {
+            association_handle,
+            stream_id,
+            ppi: PayloadProtocolIdentifier::Dcep,
+            payload: BytesMut::from(&open[..]),
+            negotiated: false,
+        }
+    }
+
+    /// RFC 8832 §6: the DTLS client opens channels on even stream ids and the server on odd
+    /// ones. An OPEN from the peer on an id of this side's parity is refused, and the stream
+    /// reset, so the peer cannot take an id `assign_stream_ids` may give a local channel.
+    /// Negotiated channels are registered on both sides and keep working on either parity.
+    #[test]
+    fn peer_open_with_this_sides_stream_parity_is_rejected() {
+        // (this side's role, an id of the peer's parity, an id of this side's parity)
+        for (role, peer_id, own_id) in [(RTCDtlsRole::Client, 3, 2), (RTCDtlsRole::Server, 2, 3)] {
+            let now = Instant::now();
+            let mut ctx = DataChannelHandlerContext::new(now);
+            let (mut data_channels, handles) =
+                registry(vec![negotiated_channel(4), negotiated_channel(5)]);
+            let mut stats = RTCStatsAccumulator::new();
+            let mut handler =
+                DataChannelHandler::new(&mut ctx, &mut data_channels, &mut stats, None, role, None);
+            handler
+                .handle_event(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::SCTPHandshakeComplete(0),
+                })
+                .unwrap();
+            while handler.poll_write().is_some() {}
+            while handler.poll_read().is_some() {}
+
+            let read = |handler: &mut DataChannelHandler<'_>, message: DataChannelMessage| {
+                handler
+                    .handle_read(TaggedRTCMessageInternal {
+                        now,
+                        transport: TransportContext::default(),
+                        message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(message)),
+                    })
+                    .unwrap()
+            };
+
+            read(&mut handler, open_message(0, own_id));
+            assert!(
+                handler.poll_read().is_none(),
+                "{role}: the peer opened a channel on stream {own_id}, of this side's parity"
+            );
+            let reset = handler.poll_write().expect("the refused stream is reset");
+            match reset.message {
+                RTCMessageInternal::Dtls(DTLSMessage::Sctp(m)) => {
+                    use shared::marshal::Unmarshal;
+                    assert_eq!(m.stream_id, own_id);
+                    assert!(matches!(
+                        Message::unmarshal(&mut &m.payload[..]),
+                        Ok(Message::DataChannelClose(_))
+                    ));
+                }
+                _ => panic!("{role}: expected a DCEP close for the refused stream"),
+            }
+
+            read(&mut handler, open_message(0, peer_id));
+            assert!(
+                matches!(
+                    handler.poll_read().map(|m| m.message),
+                    Some(RTCMessageInternal::Dtls(DTLSMessage::DataChannel(
+                        ApplicationMessage {
+                            data_channel_event: DataChannelEvent::Open,
+                            ..
+                        }
+                    )))
+                ),
+                "{role}: the peer's OPEN on stream {peer_id} opens a channel"
+            );
+            while handler.poll_read().is_some() {}
+
+            // Negotiated channels, whichever parity they were given, still carry data.
+            for (handle, stream_id) in [(handles[0], 4), (handles[1], 5)] {
+                read(&mut handler, data_message(0, stream_id, b"hi"));
+                assert!(
+                    matches!(
+                        handler.poll_read().map(|m| m.message),
+                        Some(RTCMessageInternal::Dtls(DTLSMessage::DataChannel(
+                            ApplicationMessage {
+                                data_channel_id,
+                                data_channel_event: DataChannelEvent::Message(_),
+                            }
+                        ))) if data_channel_id == handle
+                    ),
+                    "{role}: negotiated stream {stream_id} lost its data"
+                );
+            }
+            drop(handler);
+            assert_eq!(data_channels.len(), 3);
+        }
     }
 }

@@ -10,8 +10,8 @@ use bytes::BytesMut;
 use clap::Parser;
 use env_logger::Target;
 use futures_util::{SinkExt, StreamExt};
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Response, StatusCode};
 use ice::candidate::candidate_relay::CandidateRelayConfig;
 use log::{error, info, trace};
 use rtc::crypto;
@@ -33,6 +33,7 @@ use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::stun::message::TransactionId;
 use rtc::turn::client::*;
+use signal::http::{Body, BodyExt, Incoming};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::{fs::OpenOptions, io::Write, str::FromStr};
@@ -119,32 +120,30 @@ async fn main() -> Result<()> {
 
 async fn run_http_server() {
     let addr = SocketAddr::from_str("0.0.0.0:8080").unwrap();
-    let make_svc = make_service_fn(|_| async {
-        Ok::<_, hyper::Error>(service_fn(|req| async move {
-            match (req.method(), req.uri().path()) {
-                (&Method::GET, "/") | (&Method::GET, "/index.html") => {
-                    match tokio::fs::read_to_string(INDEX).await {
-                        Ok(content) => Ok::<_, hyper::Error>(
-                            Response::builder()
-                                .header("Content-Type", "text/html")
-                                .body(Body::from(content))
-                                .unwrap(),
-                        ),
-                        Err(_) => Ok(Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Body::from("Not Found"))
-                            .unwrap()),
-                    }
+    let make_svc = service_fn(|req| async move {
+        match (req.method(), req.uri().path()) {
+            (&Method::GET, "/") | (&Method::GET, "/index.html") => {
+                match tokio::fs::read_to_string(INDEX).await {
+                    Ok(content) => Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .header("Content-Type", "text/html")
+                            .body(Body::from(content))
+                            .unwrap(),
+                    ),
+                    Err(_) => Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::from("Not Found"))
+                        .unwrap()),
                 }
-                _ => Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from("Not Found"))
-                    .unwrap()),
             }
-        }))
+            _ => Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("Not Found"))
+                .unwrap()),
+        }
     });
 
-    let server = Server::bind(&addr).serve(make_svc);
+    let server = signal::http::serve(addr, make_svc);
     if let Err(e) = server.await {
         eprintln!("HTTP server error: {e}");
     }

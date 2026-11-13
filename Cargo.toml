@@ -101,7 +101,10 @@ criterion = "0.8.2"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["codec"] }
 tokio-tungstenite = "0.28.0"
-hyper = { version = "0.14.28", features = ["full"] }
+# HTTP/1 only: the examples' signaling servers and clients. No `http2`, so no `h2`.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
 lazy_static = "1.4.0"
 hex = "0.4.3"
 crossbeam-channel = "0.5"
@@ -182,15 +185,17 @@ env_logger.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hyper.workspace = true
-tokio-util.workspace = true
 chrono.workspace = true
 log.workspace = true
 ctrlc.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 
-# integration test with old webrtc crate
-webrtc = "0.14.0"
+# Interop tests against the independent (pre-sans-I/O) webrtc implementation. 0.17.3 is the
+# last release of that line, and the first whose DTLS uses p256 0.14 (crypto-bigint 0.7, past
+# RUSTSEC-2026-0387) and no bincode. webrtc 0.20+ is built on the upstream `rtc` crates, so it
+# would test this stack against its own lineage.
+webrtc = "0.17.3"
 
 [[example]]
 name = "broadcast"
@@ -376,3 +381,8 @@ bench = false
 name = "perfect-negotiation"
 path = "examples/perfect-negotiation/perfect-negotiation.rs"
 bench = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

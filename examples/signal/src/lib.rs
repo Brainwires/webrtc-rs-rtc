@@ -28,12 +28,73 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use self::http::BodyExt;
 use anyhow::Result;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use tokio::sync::{Mutex, mpsc};
+
+/// The HTTP plumbing the examples share: an HTTP/1 server loop and a client, on hyper 1.
+pub mod http {
+    use std::error::Error as StdError;
+    use std::net::SocketAddr;
+
+    pub use http_body_util::{BodyExt, Full};
+    pub use hyper::body::{Bytes, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::Service;
+    use hyper::{Request, Response};
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio::net::TcpListener;
+
+    /// The body every example response and request carries: the whole thing, in memory.
+    pub type Body = Full<Bytes>;
+
+    /// An empty body.
+    pub fn empty() -> Body {
+        Full::new(Bytes::new())
+    }
+
+    /// Serves `service` on `addr` over HTTP/1 until accepting fails, one task per connection.
+    pub async fn serve<S>(addr: SocketAddr, service: S) -> std::io::Result<()>
+    where
+        S: Service<Request<Incoming>, Response = Response<Body>> + Clone + Send + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let listener = TcpListener::bind(addr).await?;
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let service = service.clone();
+            tokio::spawn(async move {
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    eprintln!("http connection error: {err}");
+                }
+            });
+        }
+    }
+
+    /// Sends `req` and returns the response, its body still to be read.
+    pub async fn request(
+        req: Request<Body>,
+    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
+        Client::builder(TokioExecutor::new())
+            .build_http::<Body>()
+            .request(req)
+            .await
+    }
+
+    /// Reads a whole request or response body.
+    pub async fn to_bytes(body: Incoming) -> Result<Bytes, hyper::Error> {
+        Ok(body.collect().await?.to_bytes())
+    }
+}
 
 #[macro_use]
 extern crate lazy_static;
@@ -44,13 +105,14 @@ lazy_static! {
 }
 
 // HTTP Listener to get sdp
-async fn remote_handler(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+async fn remote_handler(
+    req: Request<http::Incoming>,
+) -> Result<Response<http::Body>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         // A HTTP handler that processes a SessionDescription given to us from the other WebRTC-rs or Pion process
         (&Method::POST, "/sdp") => {
             //println!("remote_handler receive from /sdp");
-            let sdp_str = match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?)
-            {
+            let sdp_str = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes()) {
                 Ok(s) => s.to_owned(),
                 Err(err) => panic!("{}", err),
             };
@@ -62,7 +124,7 @@ async fn remote_handler(req: Request<Body>) -> Result<Response<Body>, hyper::Err
                 }
             }
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(http::empty());
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
@@ -85,11 +147,8 @@ pub async fn http_sdp_server(port: u16) -> mpsc::Receiver<String> {
 
     tokio::spawn(async move {
         let addr = SocketAddr::from_str(&format!("0.0.0.0:{port}")).unwrap();
-        let service =
-            make_service_fn(|_| async { Ok::<_, hyper::Error>(service_fn(remote_handler)) });
-        let server = Server::bind(&addr).serve(service);
         // Run this server for... forever!
-        if let Err(e) = server.await {
+        if let Err(e) = http::serve(addr, service_fn(remote_handler)).await {
             eprintln!("server error: {e}");
         }
     });

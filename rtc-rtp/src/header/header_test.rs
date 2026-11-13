@@ -289,3 +289,35 @@ fn test_extension_payload_total_overflow() {
         "expected ExtensionPayloadTotalOverflow, got {err:?}"
     );
 }
+
+/// An extension element may not run past the extension block its header declares: it would be
+/// read out of the RTP payload, and `marshal_size` would then disagree with the wire (the SRTP
+/// AEAD cipher split the packet at that size and panicked). Found by `context_decrypt`.
+#[test]
+fn test_extension_element_past_declared_length_is_rejected() {
+    use shared::marshal::Unmarshal;
+    // Two-byte profile, one word declared, an element claiming 11 bytes of payload.
+    let mut two = vec![
+        0x90, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 0x10, 0x00, 0x00, 0x01, 0x01, 0x0b,
+    ];
+    two.extend_from_slice(&[0xab; 11]);
+    assert!(matches!(
+        Header::unmarshal(&mut &two[..]),
+        Err(Error::ErrHeaderSizeInsufficientForExtension)
+    ));
+    // One-byte profile, one word declared, an element claiming 16 bytes.
+    let mut one = vec![
+        0x90, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 0xbe, 0xde, 0x00, 0x01, 0x1f,
+    ];
+    one.extend_from_slice(&[0xab; 16]);
+    assert!(matches!(
+        Header::unmarshal(&mut &one[..]),
+        Err(Error::ErrHeaderSizeInsufficientForExtension)
+    ));
+    // Elements that fit still parse, and the size round-trips.
+    let ok = [
+        0x90, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 0xbe, 0xde, 0x00, 0x01, 0x12, 1, 2, 3,
+    ];
+    let header = Header::unmarshal(&mut &ok[..]).unwrap();
+    assert_eq!(header.marshal_size(), ok.len());
+}

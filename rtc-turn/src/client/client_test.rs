@@ -1062,3 +1062,305 @@ fn test_data_from_a_non_server_address_is_ignored() -> Result<()> {
     );
     client.close()
 }
+
+/// A server-side view of the exchange in `test_responses_without_valid_integrity_are_dropped`.
+struct FakeTurnServer {
+    local_addr: SocketAddr,
+    server_addr: SocketAddr,
+    key: Vec<u8>,
+}
+
+impl FakeTurnServer {
+    /// The next request the client sent, decoded.
+    fn next_request(&self, client: &mut Client) -> Message {
+        let transmit = client.poll_write().expect("the client sent a request");
+        let mut msg = Message::new();
+        msg.raw = transmit.message.to_vec();
+        msg.decode().expect("the client's request decodes");
+        msg
+    }
+
+    /// Answers `request` with `class` and `attrs`, signed with `key` when given.
+    fn answer(
+        &self,
+        client: &mut Client,
+        request: &Message,
+        class: MessageClass,
+        attrs: Vec<Box<dyn Setter>>,
+        key: Option<&[u8]>,
+    ) -> Result<()> {
+        let provider = test_crypto_provider();
+        let mut setters: Vec<Box<dyn Setter + '_>> = vec![
+            Box::new(request.transaction_id),
+            Box::new(MessageType::new(request.typ.method, class)),
+        ];
+        setters.extend(attrs);
+        if let Some(key) = key {
+            setters.push(Box::new(MessageIntegrity::new_raw_integrity_with_provider(
+                key.to_vec(),
+                provider.crypto(),
+            )));
+        }
+        setters.push(Box::new(FINGERPRINT));
+        let mut reply = Message::new();
+        reply.build(&setters)?;
+        client.handle_read(TransportMessage {
+            now: Instant::now(),
+            transport: TransportContext {
+                local_addr: self.local_addr,
+                peer_addr: self.server_addr,
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: BytesMut::from(&reply.raw[..]),
+        })
+    }
+}
+
+/// Responses to authenticated TURN requests (Allocate after the 401, Refresh,
+/// CreatePermission, ChannelBind) must carry a MESSAGE-INTEGRITY made with the long-term key.
+/// One that is unsigned or signed with another key is dropped, leaving the transaction open;
+/// only 401 and 438 error responses may come unsigned.
+#[test]
+fn test_responses_without_valid_integrity_are_dropped() -> Result<()> {
+    let local_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+    let server_addr: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+    let relayed_addr: SocketAddr = "192.0.2.15:50000".parse().unwrap();
+    let peer_addr: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+    let mut client = Client::new(
+        ClientConfig {
+            turn_serv_addr: server_addr.to_string(),
+            local_addr,
+            transport_protocol: TransportProtocol::UDP,
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            ..Default::default()
+        },
+        test_crypto_provider(),
+    )?;
+    let server = FakeTurnServer {
+        local_addr,
+        server_addr,
+        key: MessageIntegrity::long_term_integrity_key(
+            "user".to_owned(),
+            "realm".to_owned(),
+            "pass".to_owned(),
+            test_crypto_provider().crypto(),
+        )?,
+    };
+    let wrong_key = MessageIntegrity::long_term_integrity_key(
+        "user".to_owned(),
+        "realm".to_owned(),
+        "guess".to_owned(),
+        test_crypto_provider().crypto(),
+    )?;
+    let forgeries: [Option<&[u8]>; 2] = [None, Some(&wrong_key)];
+
+    // The anonymous Allocate is answered with the 401 nonce exchange, unsigned as servers do.
+    let tid = client.allocate(Instant::now())?;
+    let attempt = server.next_request(&mut client);
+    server.answer(
+        &mut client,
+        &attempt,
+        CLASS_ERROR_RESPONSE,
+        vec![
+            Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_UNAUTHORIZED,
+                reason: b"Unauthorized".to_vec(),
+            }),
+            Box::new(Nonce::new(ATTR_NONCE, "nonce".to_owned())),
+            Box::new(Realm::new(ATTR_REALM, "realm".to_owned())),
+        ],
+        None,
+    )?;
+    let allocate = server.next_request(&mut client);
+    assert_eq!(allocate.transaction_id, tid);
+    assert!(allocate.contains(ATTR_MESSAGE_INTEGRITY));
+
+    let allocate_success = || -> Vec<Box<dyn Setter>> {
+        vec![
+            Box::new(RelayedAddress {
+                ip: relayed_addr.ip(),
+                port: relayed_addr.port(),
+            }),
+            Box::new(crate::proto::lifetime::Lifetime(Duration::from_secs(600))),
+        ]
+    };
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &allocate,
+            CLASS_SUCCESS_RESPONSE,
+            allocate_success(),
+            forged,
+        )?;
+        assert!(
+            client.poll_event().is_none(),
+            "a forged Allocate success response was accepted"
+        );
+        server.answer(
+            &mut client,
+            &allocate,
+            CLASS_ERROR_RESPONSE,
+            vec![Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_FORBIDDEN,
+                reason: b"Forbidden".to_vec(),
+            })],
+            forged,
+        )?;
+        assert!(
+            client.poll_event().is_none(),
+            "a forged Allocate error response was accepted"
+        );
+        assert!(client.has_transaction(&tid), "the Allocate stays open");
+    }
+    server.answer(
+        &mut client,
+        &allocate,
+        CLASS_SUCCESS_RESPONSE,
+        allocate_success(),
+        Some(&server.key),
+    )?;
+    assert!(matches!(
+        client.poll_event(),
+        Some(Event::AllocateResponse(id, addr)) if id == tid && addr == relayed_addr
+    ));
+
+    // CreatePermission.
+    let tid = client
+        .relay(relayed_addr)?
+        .create_permission(Instant::now(), peer_addr)?
+        .expect("a new permission is requested");
+    let create_permission = server.next_request(&mut client);
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &create_permission,
+            CLASS_SUCCESS_RESPONSE,
+            vec![],
+            forged,
+        )?;
+        server.answer(
+            &mut client,
+            &create_permission,
+            CLASS_ERROR_RESPONSE,
+            vec![Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_FORBIDDEN,
+                reason: b"Forbidden".to_vec(),
+            })],
+            forged,
+        )?;
+        assert!(
+            client.poll_event().is_none(),
+            "a forged CreatePermission response was accepted"
+        );
+        assert!(client.has_transaction(&tid));
+    }
+    server.answer(
+        &mut client,
+        &create_permission,
+        CLASS_SUCCESS_RESPONSE,
+        vec![],
+        Some(&server.key),
+    )?;
+    assert!(matches!(
+        client.poll_event(),
+        Some(Event::CreatePermissionResponse(id, addr)) if id == tid && addr == peer_addr
+    ));
+
+    // ChannelBind, started by the first send to the permitted peer (which also sends the data
+    // as a Send indication meanwhile).
+    client
+        .relay(relayed_addr)?
+        .send_to(Instant::now(), b"hi", peer_addr)?;
+    let channel_bind = server.next_request(&mut client);
+    assert_eq!(channel_bind.typ.method, METHOD_CHANNEL_BIND);
+    while client.poll_write().is_some() {}
+    let binding_state = |client: &Client| {
+        client
+            .binding_mgr
+            .find_by_addr(&peer_addr)
+            .map(|b| b.state())
+    };
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &channel_bind,
+            CLASS_SUCCESS_RESPONSE,
+            vec![],
+            forged,
+        )?;
+        assert_eq!(
+            binding_state(&client),
+            Some(BindingState::Request),
+            "a forged ChannelBind success response was accepted"
+        );
+        server.answer(
+            &mut client,
+            &channel_bind,
+            CLASS_ERROR_RESPONSE,
+            vec![Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_FORBIDDEN,
+                reason: b"Forbidden".to_vec(),
+            })],
+            forged,
+        )?;
+        assert_eq!(
+            binding_state(&client),
+            Some(BindingState::Request),
+            "a forged ChannelBind error response was accepted"
+        );
+    }
+    server.answer(
+        &mut client,
+        &channel_bind,
+        CLASS_SUCCESS_RESPONSE,
+        vec![],
+        Some(&server.key),
+    )?;
+    assert_eq!(binding_state(&client), Some(BindingState::Ready));
+
+    // Refresh: a forged LIFETIME=0 would make the client drop a live allocation.
+    client.refresh_allocations(Instant::now())?;
+    let refresh = server.next_request(&mut client);
+    assert_eq!(refresh.typ.method, METHOD_REFRESH);
+    for forged in forgeries {
+        server.answer(
+            &mut client,
+            &refresh,
+            CLASS_SUCCESS_RESPONSE,
+            vec![Box::new(crate::proto::lifetime::Lifetime(Duration::ZERO))],
+            forged,
+        )?;
+        assert!(
+            client.relay(relayed_addr).is_ok(),
+            "a forged Refresh response released the allocation"
+        );
+        assert!(client.has_transaction(&refresh.transaction_id));
+    }
+
+    // A 438 is answered unsigned by servers and still updates the nonce.
+    server.answer(
+        &mut client,
+        &refresh,
+        CLASS_ERROR_RESPONSE,
+        vec![
+            Box::new(ErrorCodeAttribute {
+                code: stun::error_code::CODE_STALE_NONCE,
+                reason: b"Stale Nonce".to_vec(),
+            }),
+            Box::new(Nonce::new(ATTR_NONCE, "fresh".to_owned())),
+        ],
+        None,
+    )?;
+    assert!(!client.has_transaction(&refresh.transaction_id));
+    assert_eq!(
+        client
+            .relays
+            .get(&relayed_addr)
+            .map(|r| r.nonce.text.clone()),
+        Some("fresh".to_owned())
+    );
+
+    Ok(())
+}

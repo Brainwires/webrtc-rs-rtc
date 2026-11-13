@@ -308,11 +308,6 @@ impl Cipher for CipherAesCmHmacSha1 {
 
         writer.extend_from_slice(&encrypted[0..tail_offset]);
 
-        let is_encrypted = encrypted[tail_offset] >> 7;
-        if is_encrypted == 0 {
-            return Ok(writer);
-        }
-
         // Split the auth tag and the cipher text into two parts.
         let actual_tag = &encrypted[encrypted_len - self.rtcp_auth_tag_len()..];
         if actual_tag.len() != self.rtcp_auth_tag_len() {
@@ -334,6 +329,13 @@ impl Cipher for CipherAesCmHmacSha1 {
             return Err(Error::RtcpFailedToVerifyAuthTag);
         }
 
+        // RFC 3711 §3.4: SRTCP is authenticated whether or not it is encrypted, so the E flag
+        // (which the tag covers) is read only once the tag has verified.
+        let is_encrypted = encrypted[tail_offset] >> 7;
+        if is_encrypted == 0 {
+            return Ok(writer);
+        }
+
         let counter = generate_counter(
             (srtcp_index & 0xFFFF) as u16,
             (srtcp_index >> 16) as u32,
@@ -346,5 +348,51 @@ impl Cipher for CipherAesCmHmacSha1 {
             .map_err(crypto_error)?;
 
         Ok(writer)
+    }
+}
+
+#[cfg(test)]
+mod srtcp_unencrypted_test {
+    use super::*;
+
+    fn cipher() -> CipherAesCmHmacSha1 {
+        let provider = crypto::default_provider()
+            .expect("a built-in crypto provider must be enabled for tests");
+        CipherAesCmHmacSha1::new(
+            ProtectionProfile::Aes128CmHmacSha1_80,
+            &[0x11; 16],
+            &[0x22; 14],
+            provider.crypto(),
+        )
+        .unwrap()
+    }
+
+    /// A receiver report with the E flag clear and index 1, before its tag.
+    fn unencrypted_rtcp() -> Vec<u8> {
+        let mut raw = vec![0x80, 0xc9, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef];
+        raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        raw
+    }
+
+    /// RFC 3711 §3.4: SRTCP is authenticated even when the E flag says it is not encrypted. A
+    /// packet with E clear and a made-up tag was accepted without any check, so anyone could
+    /// inject RTCP with no keys.
+    #[test]
+    fn unencrypted_srtcp_with_a_bad_tag_is_rejected() {
+        let mut c = cipher();
+        let mut raw = unencrypted_rtcp();
+        raw.extend_from_slice(&[0u8; 10]);
+        assert!(c.decrypt_rtcp(&raw, 1, 0xdeadbeef).is_err());
+    }
+
+    /// A correctly signed unencrypted SRTCP packet is still accepted, unchanged.
+    #[test]
+    fn unencrypted_srtcp_with_a_valid_tag_is_accepted() {
+        let mut c = cipher();
+        let mut raw = unencrypted_rtcp();
+        let tag = c.generate_srtcp_auth_tag(&raw).unwrap();
+        raw.extend_from_slice(&tag[..c.rtcp_auth_tag_len()]);
+        let plain = c.decrypt_rtcp(&raw, 1, 0xdeadbeef).unwrap();
+        assert_eq!(&plain[..], &unencrypted_rtcp()[..8]);
     }
 }

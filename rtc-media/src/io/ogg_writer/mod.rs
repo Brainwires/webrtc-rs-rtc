@@ -178,7 +178,11 @@ impl<W: Write> Writer for OggWriter<W> {
 
         // Should be equivalent to sample_rate * duration
         if self.previous_timestamp != 1 {
-            let increment = packet.header.timestamp - self.previous_timestamp;
+            // RTP timestamps wrap, and a peer may send them out of order.
+            let increment = packet
+                .header
+                .timestamp
+                .wrapping_sub(self.previous_timestamp);
             self.previous_granule_position += increment as u64;
         }
         self.previous_timestamp = packet.header.timestamp;

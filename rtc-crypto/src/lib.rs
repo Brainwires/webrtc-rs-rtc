@@ -18,6 +18,14 @@ pub mod providers;
 #[cfg(feature = "test-support")]
 pub mod conformance;
 
+/// Deterministic providers for fuzz targets. Gated behind `cfg(fuzzing)`; not part of the
+/// supported API.
+#[cfg(all(
+    any(fuzzing, test),
+    any(feature = "crypto-ring", feature = "crypto-aws-lc-rs")
+))]
+pub mod fuzzing;
+
 pub use algorithm::*;
 pub use error::CryptoError;
 #[cfg(feature = "openssl")]

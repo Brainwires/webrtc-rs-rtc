@@ -344,11 +344,13 @@ impl Relay<'_> {
                 msg
             };
 
+            let integrity_key = relay.long_term_integrity_key.clone();
             Ok(self.client.perform_transaction(
                 now,
                 &msg,
                 self.client.turn_server_addr_or_err()?,
                 TransactionType::CreatePermissionRequest(self.relayed_addr, peer_addr_opt),
+                Some(integrity_key),
             ))
         } else {
             Err(Error::ErrConnClosed)
@@ -414,11 +416,13 @@ impl Relay<'_> {
                 Box::new(FINGERPRINT),
             ])?;
 
+            let integrity_key = relay.long_term_integrity_key.clone();
             let _ = self.client.perform_transaction(
                 now,
                 &msg,
                 self.client.turn_server_addr_or_err()?,
                 TransactionType::RefreshRequest(self.relayed_addr),
+                Some(integrity_key),
             );
 
             Ok(())
@@ -517,7 +521,7 @@ impl Relay<'_> {
                 // Built here rather than by the caller: it borrows `crypto_provider`, and that
                 // borrow must end with `setters` so the `&mut self` transaction below is free.
                 Box::new(MessageIntegrity::new_raw_integrity_with_provider(
-                    long_term_integrity_key,
+                    long_term_integrity_key.clone(),
                     self.client.crypto_provider.crypto(),
                 )),
                 Box::new(FINGERPRINT),
@@ -535,6 +539,7 @@ impl Relay<'_> {
             &msg,
             turn_server_addr,
             TransactionType::ChannelBindRequest(relayed_addr, bind_addr),
+            Some(long_term_integrity_key),
         );
 
         Ok(())

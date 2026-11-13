@@ -94,3 +94,35 @@ fn test_message_marshal() {
 
     assert_eq!(actual, expected);
 }
+
+/// A DCEP message whose type is the threshold message but whose body is missing is a parse
+/// error; reading the body used to panic in `Buf::get_u8`/`get_u32`. The type byte alone is
+/// what a peer sends as a one-byte DCEP payload.
+#[test]
+fn test_message_unmarshal_short_threshold_is_an_error() {
+    for len in 1..6 {
+        let mut payload = vec![0u8; len];
+        payload[0] = 0x00; // DataChannelThreshold
+        let mut buf = Bytes::from(payload);
+        assert!(
+            Message::unmarshal(&mut buf).is_err(),
+            "a {len}-byte threshold message parsed"
+        );
+    }
+}
+
+/// Fuzz regression (`data_channel_handle_dcep`): a DCEP payload of the internal threshold type
+/// (0x00) shorter than its 5-byte body panicked in `get_u32` instead of failing to parse. Any
+/// peer could send it on any stream.
+#[test]
+fn test_short_threshold_message_is_an_error() {
+    for raw in [&[0x00][..], &[0x00, 0x01], &[0x00, 0x00, 0x00, 0x00, 0x00]] {
+        let mut buf = raw;
+        assert!(Message::unmarshal(&mut buf).is_err(), "{raw:?}");
+    }
+    let mut full: &[u8] = &[0x00, 0x01, 0x00, 0x00, 0x00, 0x07];
+    assert_eq!(
+        Message::unmarshal(&mut full).unwrap(),
+        Message::DataChannelThreshold(DataChannelThreshold::High(7))
+    );
+}

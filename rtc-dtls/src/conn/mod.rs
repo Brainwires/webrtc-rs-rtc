@@ -48,6 +48,12 @@ pub(crate) const DEFAULT_REPLAY_PROTECTION_WINDOW: usize = 64;
 /// Most not-yet-decryptable records held for later (next epoch / cipher suite not ready).
 /// A flight needs only a few; the rest are unauthenticated until decrypted.
 pub(crate) const MAX_EARLY_ENCRYPTED_PACKETS: usize = 64;
+/// The highest epoch a peer's records move to. A DTLS 1.2 handshake has one epoch transition,
+/// 0 to 1, and this stack does not renegotiate (a DTLS restart builds a new connection), so a
+/// ChangeCipherSpec is honoured only for that transition. It also bounds the per-epoch replay
+/// detectors: records more than one epoch ahead of `remote_epoch` are discarded, so at most
+/// `MAX_REMOTE_EPOCH + 2` exist.
+pub(crate) const MAX_REMOTE_EPOCH: u16 = 1;
 /// How many times a handshake flight may be retransmitted before the handshake fails.
 ///
 /// Zero means "no retries at all": the first firing of the retransmit timer ends the handshake,
@@ -663,7 +669,8 @@ impl DTLSConn {
             return (false, None, None);
         }
 
-        // Anti-replay protection
+        // Anti-replay protection: one detector per epoch. Records past `remote_epoch + 1` were
+        // discarded above, and `remote_epoch` stops at `MAX_REMOTE_EPOCH`, so this stays small.
         while self.replay_detector.len() <= h.epoch as usize {
             self.replay_detector
                 .push(Box::new(SlidingWindowDetector::new(
@@ -848,14 +855,30 @@ impl DTLSConn {
                     return (false, None, None);
                 }
 
-                let new_remote_epoch = h.epoch + 1;
+                // A ChangeCipherSpec is not authenticated: every cipher hands it back
+                // unchecked, so its epoch is only the sender's claim, and anyone spoofing the
+                // peer's address can send one. It is acted on only for the handshake's one
+                // transition, before the handshake completes. Afterwards a spoofed one would
+                // move `remote_epoch` past the peer's and make every genuine record look old.
+                if self.is_handshake_completed() || epoch >= MAX_REMOTE_EPOCH {
+                    debug!(
+                        "{}: discarded ChangeCipherSpec (epoch: {}, remote epoch: {})",
+                        srv_cli_str(self.is_client),
+                        h.epoch,
+                        epoch
+                    );
+                    return (false, None, None);
+                }
+                let Some(new_remote_epoch) = h.epoch.checked_add(1) else {
+                    return (false, None, None);
+                };
                 debug!(
                     "{}: <- ChangeCipherSpec (epoch: {})",
                     srv_cli_str(self.is_client),
                     new_remote_epoch
                 );
 
-                if epoch + 1 == new_remote_epoch {
+                if epoch.checked_add(1) == Some(new_remote_epoch) {
                     self.state.remote_epoch = new_remote_epoch;
                     self.replay_detector[h.epoch as usize].accept();
                 }

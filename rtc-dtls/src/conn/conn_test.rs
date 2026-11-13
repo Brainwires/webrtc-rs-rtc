@@ -2732,3 +2732,108 @@ fn test_early_encrypted_queue_is_bounded() {
         "the early encrypted queue must stop growing at its cap"
     );
 }
+
+/// A ChangeCipherSpec is not authenticated, so its epoch is whatever the sender claims. One at
+/// the last epoch has no successor; it used to overflow `epoch + 1` and panic.
+#[test]
+fn test_change_cipher_spec_at_the_last_epoch_is_dropped() {
+    use crate::cipher_suite::CipherSuite;
+    use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
+    cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    )
+    .unwrap();
+    conn.state.cipher_suite = Some(cs);
+    conn.state.remote_epoch = u16::MAX;
+
+    let change_cipher_spec: Vec<u8> = vec![
+        0x14, // content_type: ChangeCipherSpec
+        0xfe, 0xfd, // protocol_version: DTLS 1.2
+        0xff, 0xff, // epoch: 65535
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sequence_number: 0
+        0x00, 0x01, // content_len: 1
+        0x01,
+    ];
+    let _ = conn.read(&change_cipher_spec);
+    assert_eq!(conn.state.remote_epoch, u16::MAX);
+}
+
+/// A ChangeCipherSpec is unauthenticated. Once the handshake has completed, one spoofed at the
+/// current epoch used to move `remote_epoch` to 2, after which every genuine epoch-1 record was
+/// discarded as old: a keyless denial of service. Repeated, it also grew one replay detector
+/// per claimed epoch.
+#[test]
+fn test_change_cipher_spec_after_handshake_is_ignored() {
+    use crate::cipher_suite::CipherSuite;
+    use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
+    cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    )
+    .unwrap();
+    conn.state.cipher_suite = Some(cs);
+    conn.state.remote_epoch = 1;
+    conn.set_handshake_completed();
+
+    for epoch in 1u16..200 {
+        let [hi, lo] = epoch.to_be_bytes();
+        let change_cipher_spec: Vec<u8> = vec![
+            0x14, // content_type: ChangeCipherSpec
+            0xfe, 0xfd, // protocol_version: DTLS 1.2
+            hi, lo, // epoch
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sequence_number: 0
+            0x00, 0x01, // content_len: 1
+            0x01,
+        ];
+        let _ = conn.read(&change_cipher_spec);
+    }
+    assert_eq!(
+        conn.state.remote_epoch, 1,
+        "a spoofed ChangeCipherSpec moved the epoch"
+    );
+    assert!(
+        conn.replay_detector.len() <= usize::from(MAX_REMOTE_EPOCH) + 2,
+        "{} replay detectors",
+        conn.replay_detector.len()
+    );
+}
+
+/// Before the handshake completes, a ChangeCipherSpec at epoch 0 still moves the peer to
+/// epoch 1, and only once.
+#[test]
+fn test_change_cipher_spec_moves_epoch_0_to_1_only() {
+    use crate::cipher_suite::CipherSuite;
+    use crate::cipher_suite::cipher_suite_aes_128_gcm_sha256::CipherSuiteAes128GcmSha256;
+
+    let mut conn = setup_dtls_conn_server_handshake_in_progress();
+    let mut cs = Box::new(CipherSuiteAes128GcmSha256::new(false));
+    cs.init(
+        crypto::default_provider().unwrap(),
+        &[0u8; 48],
+        &[0u8; 32],
+        &[0u8; 32],
+        false,
+    )
+    .unwrap();
+    conn.state.cipher_suite = Some(cs);
+    for (epoch, sequence) in [(0u8, 0u8), (1, 0), (1, 1)] {
+        let change_cipher_spec: Vec<u8> = vec![
+            0x14, 0xfe, 0xfd, 0x00, epoch, 0x00, 0x00, 0x00, 0x00, 0x00, sequence, 0x00, 0x01, 0x01,
+        ];
+        let _ = conn.read(&change_cipher_spec);
+        assert_eq!(conn.state.remote_epoch, 1);
+    }
+}

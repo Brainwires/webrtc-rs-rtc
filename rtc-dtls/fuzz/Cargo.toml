@@ -220,3 +220,10 @@ path = "fuzz_targets/state_unmarshal_binary.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "conn_handle_records"
+path = "fuzz_targets/conn_handle_records.rs"
+test = false
+doc = false
+bench = false

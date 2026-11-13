@@ -48,6 +48,8 @@ pub(crate) struct TransactionConfig {
     pub(crate) peer_addr: SocketAddr,
     pub(crate) transport_protocol: TransportProtocol,
     pub(crate) interval: u64,
+    /// The long-term credential key the request was signed with, if it was signed.
+    pub(crate) integrity_key: Option<Vec<u8>>,
 }
 
 // Transaction represents a transaction
@@ -62,6 +64,9 @@ pub(crate) struct Transaction {
     pub(crate) interval: u64,
     pub(crate) timeout: Instant,
     pub(crate) transmits: VecDeque<TransportMessage<BytesMut>>,
+    /// The key the request was signed with. A response to a signed request must carry a
+    /// MESSAGE-INTEGRITY made with the same key (RFC 8489 §9.2.5).
+    pub(crate) integrity_key: Option<Vec<u8>>,
 }
 
 impl Transaction {
@@ -82,6 +87,7 @@ impl Transaction {
                 config.now.add(Duration::from_millis(config.interval))
             },
             transmits: VecDeque::new(),
+            integrity_key: config.integrity_key,
         }
     }
 

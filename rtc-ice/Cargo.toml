@@ -38,6 +38,8 @@ ipnet.workspace = true
 clap.workspace = true
 lazy_static.workspace = true
 hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 waitgroup.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -48,3 +50,8 @@ ctrlc.workspace = true
 name = "ping_pong"
 path = "examples/ping_pong.rs"
 bench = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(fuzzing)'
+] }

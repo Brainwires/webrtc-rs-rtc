@@ -90,6 +90,12 @@ impl Endpoint {
         }
     }
 
+    /// The connection with `remote`, for the fuzz harness to reach its record state.
+    #[cfg(fuzzing)]
+    pub(crate) fn connection_mut(&mut self, remote: &SocketAddr) -> Option<&mut DTLSConn> {
+        self.connections.get_mut(remote)
+    }
+
     /// Initiate an Association
     pub fn connect(
         &mut self,

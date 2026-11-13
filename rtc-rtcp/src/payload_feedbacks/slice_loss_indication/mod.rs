@@ -54,7 +54,8 @@ impl Packet for SliceLossIndication {
         Header {
             padding: get_padding_size(self.raw_size()) != 0,
             count: FORMAT_SLI,
-            packet_type: PacketType::TransportSpecificFeedback,
+            // RFC 4585 §6.3.2: SLI is payload-specific feedback (PT=PSFB, FMT=2).
+            packet_type: PacketType::PayloadSpecificFeedback,
             length: ((self.marshal_size() / 4) - 1) as u16,
         }
     }
@@ -140,7 +141,7 @@ impl Unmarshal for SliceLossIndication {
             return Err(Error::PacketTooShort);
         }
 
-        if h.packet_type != PacketType::TransportSpecificFeedback || h.count != FORMAT_SLI {
+        if h.packet_type != PacketType::PayloadSpecificFeedback || h.count != FORMAT_SLI {
             return Err(Error::WrongType);
         }
 

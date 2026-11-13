@@ -833,7 +833,10 @@ impl RTCPeerConnection {
                     self.greater_mid = numeric_mid;
                 }
             } else {
-                self.greater_mid += 1;
+                // A remote description may carry any numeric mid, `isize::MAX` included.
+                self.greater_mid = self.greater_mid.checked_add(1).ok_or_else(|| {
+                    Error::Other("no numeric mid is left above the remote description's".into())
+                })?;
                 transceiver.set_mid(format!("{}", self.greater_mid))?;
             }
         }

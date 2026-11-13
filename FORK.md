@@ -50,11 +50,36 @@ history stays intact.
 ### Hardening (fork only)
 
 Peer-input hardening upstream does not have: bounded DTLS fragment reassembly, early-record queue
-and handshake cache; AEAD-only default DTLS suites; SRTP state only after authentication; ICE
-source filtering, authenticated role conflicts and consent, candidate caps; bounded SCTP
-FORWARD-TSN/SACK/receive window and stream-id checks; TURN client server-address filtering; NACK
-retransmission de-duplication and rate limit; bounded H.264 FU-A and AV1 OBU checks; sha-256
-fingerprint selection; fuzzing CI fixes and stateful SCTP targets. See CHANGELOG.md.
+and handshake cache; AEAD-only default DTLS suites; ChangeCipherSpec honoured only for the
+handshake's one epoch transition; SRTP state only after authentication, and SRTCP authenticated
+whatever its E flag; ICE source filtering, authenticated role conflicts and consent, candidate
+caps (mDNS-resolved ones included), mDNS answers only from the mDNS socket; bounded SCTP
+FORWARD-TSN/SACK/receive window and stream-id checks; DCEP stream-id parity and internal message
+types refused from the wire; TURN client server-address filtering and response MESSAGE-INTEGRITY
+checks; errors instead of panics on malformed DTLS/SCTP/DCEP/ICE/SDP/RTCP input; NACK
+retransmission de-duplication and rate limit; bounded H.264 FU-A and AV1 reassembly, AV1 OBU
+checks, VP9 per-picture state; RTP extension blocks consumed whole; SLI on PT 206; bounded IVF and
+H.265 writer buffers; sha-256 fingerprint selection; fuzzing CI fixes and stateful SCTP targets.
+See CHANGELOG.md.
+
+Left as the RFCs require: the TURN client accepts 401 (Unauthorized) and 438 (Stale Nonce) error
+responses without MESSAGE-INTEGRITY (RFC 8489 §9.2.4; a server cannot sign a reply about the
+credential or nonce it would sign with). So a forged 438 can still end the request it answers
+with a stale-nonce error and replace the allocation's nonce; the server's own 438 on the next
+request restores it. Only a sender that passes the server-address filter can do this, and it
+cannot release the allocation or forge any other response.
+
+### Dependency audit (fork only)
+
+`.github/workflows/audit.yml` resolves dependencies afresh and runs `cargo deny check advisories`
+on every PR: first on the library's own graph with `.github/deny-library.toml` (normal and build
+dependencies, all features, no ignores), then on the whole workspace with `deny.toml`. Ignores are
+allowed only in `deny.toml`, only for advisories that cannot reach the library, each with its
+reason. Today there is one:
+
+| Advisory | Crate | Why it is ignored |
+| --- | --- | --- |
+| RUSTSEC-2026-0441 (unmaintained, no vulnerability) | `pin-utils` 0.1.1 | Dev-dependency only, interop tests: `webrtc` 0.17.3 -> `webrtc-util` -> `nix` 0.26. `webrtc` 0.17.3 is the last release of the independent implementation the interop tests exercise; 0.20+ is built on the upstream `rtc` crates. |
 
 ### Defaults the fork narrows on purpose
 

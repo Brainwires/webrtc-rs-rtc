@@ -91,6 +91,10 @@ pub mod extension;
 pub mod flight;
 /// Reassembly of handshake messages fragmented across datagrams.
 pub mod fragment_buffer;
+/// Entry points for stateful fuzz targets. Gated behind `cfg(fuzzing)`; not part of the
+/// supported API.
+#[cfg(all(fuzzing, any(feature = "crypto-ring", feature = "crypto-aws-lc-rs")))]
+pub mod fuzzing;
 /// The handshake message types and the cache that hashes them for `Finished`.
 pub mod handshake;
 /// Handshake orchestration: state, roles and the verification callbacks.

@@ -53,6 +53,13 @@ impl Unmarshal for DataChannelThreshold {
         Self: Sized,
         B: Buf,
     {
+        // `Buf::get_*` panics on a short buffer, and this is the peer's DCEP payload.
+        if buf.remaining() < 5 {
+            return Err(Error::UnexpectedEndOfBuffer {
+                expected: 5,
+                actual: buf.remaining(),
+            });
+        }
         let t = buf.get_u8();
         let v = buf.get_u32();
         if t == 0 {
