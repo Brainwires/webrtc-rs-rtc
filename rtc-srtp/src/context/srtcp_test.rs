@@ -342,3 +342,24 @@ fn test_unauthenticated_srtcp_packets_do_not_create_ssrc_state() -> Result<()> {
     );
     Ok(())
 }
+
+/// An SRTCP packet with the E flag clear is authenticated like any other: a forged one creates
+/// no per-SSRC state and is not accepted. It used to be returned as plaintext unchecked.
+#[test]
+fn test_unencrypted_srtcp_with_a_forged_tag_is_rejected() -> Result<()> {
+    let mut ctx = Context::new(
+        &RTCP_TEST_MASTER_KEY,
+        &RTCP_TEST_MASTER_SALT,
+        ProtectionProfile::Aes128CmHmacSha1_80,
+        None,
+        Some(srtcp_replay_protection(64)),
+        test_crypto_provider().crypto(),
+    )?;
+    // BYE for SSRC 0x11111111, E=0, index 0x7ffffff0 (far ahead), bogus tag.
+    let mut raw = vec![0x81, 0xcb, 0x00, 0x01, 0x11, 0x11, 0x11, 0x11];
+    raw.extend_from_slice(&[0x7f, 0xff, 0xff, 0xf0]);
+    raw.extend_from_slice(&[0u8; 10]);
+    assert!(ctx.decrypt_rtcp(&raw).is_err());
+    assert!(ctx.srtcp_ssrc_states.is_empty());
+    Ok(())
+}
