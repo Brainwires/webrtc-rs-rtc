@@ -11,6 +11,7 @@ below. It is what ReachMyDevice pins, and what the planned Deno WebRTC extension
 | Last upstream commit merged | `0fbcaa74` (after v0.21.1, 2026-11-12) |
 | Previous sync point (original fork point) | `bf30a00c` (2026-04-06) |
 | Fork master before this sync | `81bc7c6b` |
+| Fork release | `0.21.1+brainwires.1` (build metadata marks the fork; it orders with upstream 0.21.1) |
 
 The fork is kept in sync by **merging** upstream into a branch (never rebasing), so the fork's
 history stays intact.
@@ -45,6 +46,15 @@ history stays intact.
 | TURN client `turn_server_addr()` / `local_addr()` accessors, TCP TURN example | `rtc-turn` | The example now uses upstream's TURN stream framing (RFC 8656 §12.5); the fork's original example used RFC 4571 framing, which TURN does not use. |
 | `RTCCertificate::from_key_pair` | `src/peer_connection/certificate/mod.rs` | Kept (upstream removed it); wraps `generate_from_signing_key` with the built-in provider. |
 | CI: benchmarks, fuzzing, OSS-Fuzz, git-cliff release notes | `.github/workflows/{bench,fuzz,release}.yml`, `oss-fuzz/`, `cliff.toml` | |
+
+### Hardening (fork only)
+
+Peer-input hardening upstream does not have: bounded DTLS fragment reassembly, early-record queue
+and handshake cache; AEAD-only default DTLS suites; SRTP state only after authentication; ICE
+source filtering, authenticated role conflicts and consent, candidate caps; bounded SCTP
+FORWARD-TSN/SACK/receive window and stream-id checks; TURN client server-address filtering; NACK
+retransmission de-duplication and rate limit; bounded H.264 FU-A and AV1 OBU checks; sha-256
+fingerprint selection; fuzzing CI fixes and stateful SCTP targets. See CHANGELOG.md.
 
 ### Upstream changes not taken (reverted inside the merge)
 

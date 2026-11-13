@@ -5,7 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.1+brainwires.1] - 2026-11-13
+
+First Brainwires fork release on upstream 0.21. It merges webrtc-rs/rtc master through `0fbcaa74`
+(v0.21.1 plus later fixes; the upstream entries follow under "Upstream changes merged") and adds
+the fork's own hardening. `FORK.md` lists everything the fork carries over upstream.
+
+### Security
+
+- DTLS: handshake fragment reassembly is iterative and bounded (at most 256 fragments per message
+  and 32 buffered messages), so a peer can no longer overflow the stack or grow the buffer
+  without limit. The queue of records awaiting decryption (64) and the handshake cache (64) are
+  bounded.
+- DTLS: the default WebRTC cipher suites are AEAD only (AES-128-GCM, ChaCha20-Poly1305); the
+  AES-256-CBC-SHA suites are offered only when listed with `with_dtls_cipher_suites`.
+- SRTP/SRTCP: per-SSRC state is created only once a packet authenticates.
+- ICE: once a pair is selected, non-STUN datagrams from any address but its remote are dropped.
+  Role conflicts are handled only for requests that pass MESSAGE-INTEGRITY. Consent freshness is
+  judged on authenticated STUN only. Remote candidates (256) and pending mDNS queries (32) are
+  capped.
+- SCTP: FORWARD-TSN processing no longer steps one TSN at a time (a cumulative TSN 2^31 ahead
+  spun for billions of iterations); a SACK acknowledging never-sent DATA is ignored; DATA more than
+  65535 TSNs past the cumulative TSN, or on a stream id past the negotiated count, is dropped.
+- TURN client: STUN messages and ChannelData are accepted only from the configured servers.
+- NACK responder: each packet is resent at most once per 20 ms however often it is NACKed, and
+  the retransmission queue is bounded.
+- Depacketizers: H.264 FU-A reassembly needs a start fragment and is bounded at 4 MiB; a one-byte
+  AV1 OBU claiming an extension header is rejected instead of panicking.
+- SDP: the sha-256 `a=fingerprint` is used when a section lists several (it used to take the first
+  and could reject a valid peer); DTLS verification skips non-sha-256 entries.
+- Fuzzing CI fails on crashes again (`set -o pipefail`), runs with debug assertions and overflow
+  checks, and gains stateful SCTP targets (checksum-fixed packet parsing, a server endpoint and
+  association driven by datagram sequences).
+
+### Fork features kept across the sync
+
+- TWCC GCC interceptor with `GccHandle` (beside upstream's GCC), the adaptive jitter buffer
+  (`AdaptiveJitterBuffer*`), `rtc-interceptor-derive` and `Interceptor::with`, DTLS restart on ICE
+  restart (now only when the remote fingerprint or DTLS role changes), RRID association for RTX
+  simulcast, rejected m-lines in answers, `RTCConfiguration` serde, RTP marshal bounds checks,
+  TURN accessors and the TCP TURN example (now with TURN stream framing).
+
+### Upstream removals not taken
+
+- ULPFEC stays in the default codecs; `write_rtp` keeps its payload-type fallback and passes
+  un-negotiated header extensions through; a Relay policy without a TURN URL is accepted with a
+  warning; the `openssl` / `vendored-openssl` / `pem` features and `RTCCertificate::from_key_pair`
+  are kept.
+
+### Fixed
+
+- `test_ice_restart_by_rtc_interop` is no longer ignored and passes, with
+  `test_ice_restart_interop`: the DTLS session is kept across an ICE restart that changes nothing
+  DTLS depends on.
+- The release workflow finds `cliff.toml`. The GCC docs cite draft-ietf-rmcat-gcc-02, not RFC 8698.
+
+## Upstream changes merged (webrtc-rs/rtc 0.21.x through `0fbcaa74`)
 
 ### Added
 
