@@ -334,9 +334,19 @@ impl Client {
         // - stun.ClassSuccessResponse
         // - stun.ClassErrorResponse
 
-        if self.tr_map.find(&msg.transaction_id).is_none() {
+        let Some(tr) = self.tr_map.find(&msg.transaction_id) else {
             // silently discard
             debug!("no transaction for {}", msg);
+            return Ok(());
+        };
+
+        // A response to a signed request is believed only if it is signed with the same key
+        // (RFC 8489 §9.2.5); anything else is dropped as if never received, so the
+        // transaction stays open and its retransmissions continue.
+        if let Some(key) = &tr.integrity_key
+            && !response_is_authentic(&mut msg, key, self.crypto_provider.crypto())
+        {
+            debug!("discarding {}: MESSAGE-INTEGRITY missing or wrong", msg);
             return Ok(());
         }
 
@@ -497,7 +507,7 @@ impl Client {
         };
 
         debug!("client.SendBindingRequestTo call PerformTransaction 1");
-        Ok(self.perform_transaction(now, &msg, to, TransactionType::BindingRequest))
+        Ok(self.perform_transaction(now, &msg, to, TransactionType::BindingRequest, None))
     }
 
     /// send_binding_request sends a new STUN request to the STUN server
@@ -640,6 +650,7 @@ impl Client {
             &msg,
             self.turn_server_addr_or_err()?,
             TransactionType::AllocateAttempt,
+            None,
         );
         Ok(authenticated_allocate_id(tid))
     }
@@ -675,12 +686,16 @@ impl Client {
                     }
                 };
 
-                let integrity = MessageIntegrity::new_long_term_integrity_with_provider(
+                let integrity_key = MessageIntegrity::long_term_integrity_key(
                     self.username.text.clone(),
                     self.realm.text.clone(),
                     self.password.clone(),
                     self.crypto_provider.crypto(),
                 )?;
+                let integrity = MessageIntegrity::new_raw_integrity_with_provider(
+                    integrity_key.clone(),
+                    self.crypto_provider.crypto(),
+                );
 
                 let mut msg = Message::new();
 
@@ -711,6 +726,7 @@ impl Client {
                     &msg,
                     self.turn_server_addr_or_err()?,
                     TransactionType::AllocateRequest(nonce),
+                    Some(integrity_key),
                 );
             }
             TransactionType::AllocateRequest(nonce) => {
@@ -831,6 +847,7 @@ impl Client {
         msg: &Message,
         to: SocketAddr,
         transaction_type: TransactionType,
+        integrity_key: Option<Vec<u8>>,
     ) -> TransactionId {
         let tr = Transaction::new(TransactionConfig {
             now,
@@ -841,6 +858,7 @@ impl Client {
             peer_addr: to,
             transport_protocol: self.transport_protocol,
             interval: self.rto_in_ms,
+            integrity_key,
         });
 
         trace!(
@@ -853,4 +871,24 @@ impl Client {
 
         msg.transaction_id
     }
+}
+
+/// Whether a response to a request signed with `key` may be acted on.
+///
+/// It must carry a MESSAGE-INTEGRITY computed with that key. The one exception is a 401
+/// (Unauthorized) or 438 (Stale Nonce) error without one: the server cannot or must not sign
+/// those, since they report that the credential or nonce it would sign with is not accepted
+/// (RFC 8489 §9.2.4 and §10.2.3 put their handling before the integrity check). A 401 or 438
+/// that does carry a MESSAGE-INTEGRITY must still verify.
+fn response_is_authentic(msg: &mut Message, key: &[u8], crypto: &dyn crypto::RTCCrypto) -> bool {
+    if !msg.contains(ATTR_MESSAGE_INTEGRITY) {
+        if msg.typ.class != CLASS_ERROR_RESPONSE {
+            return false;
+        }
+        let mut code = ErrorCodeAttribute::default();
+        return code.get_from(msg).is_ok()
+            && (code.code == stun::error_code::CODE_UNAUTHORIZED
+                || code.code == stun::error_code::CODE_STALE_NONCE);
+    }
+    MessageIntegrity::check(msg, key, crypto).is_ok()
 }
