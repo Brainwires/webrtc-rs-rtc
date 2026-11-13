@@ -20,6 +20,14 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
 - DTLS: the default WebRTC cipher suites are AEAD only (AES-128-GCM, ChaCha20-Poly1305); the
   AES-256-CBC-SHA suites are offered only when listed with `with_dtls_cipher_suites`.
 - SRTP/SRTCP: per-SSRC state is created only once a packet authenticates.
+- SRTCP (AES-CM/HMAC profiles): a packet with the E flag clear was returned as plaintext
+  without checking its authentication tag, so anyone could inject RTCP (BYE, REMB, ...) with no
+  keys. The tag is now verified first, whatever the E flag says (RFC 3711 §3.4). The AEAD
+  profiles were not affected.
+- DTLS: a ChangeCipherSpec is acted on only for the handshake's 0 to 1 epoch transition, before
+  the handshake completes. A spoofed one after the handshake used to move the peer's epoch on,
+  after which every genuine record was dropped as old (a keyless denial of service), and each
+  claimed epoch added a replay detector.
 - ICE: once a pair is selected, non-STUN datagrams from any address but its remote are dropped.
   Role conflicts are handled only for requests that pass MESSAGE-INTEGRITY. Consent freshness is
   judged on authenticated STUN only. Remote candidates (256) and pending mDNS queries (32) are
@@ -33,9 +41,27 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
   long-term key the request was signed with. One that does not is dropped and the transaction
   keeps retransmitting. Only 401 and 438 error responses, which servers send unsigned, may lack
   it (RFC 8489 §9.2.4). A forged LIFETIME=0 Refresh response no longer releases an allocation.
+- DCEP: the stack's internal message types 0x00 (threshold) and 0x01 (close) are refused by
+  type when they arrive from the peer, before their body is read.
+- ICE: mDNS answers are taken only from the mDNS socket (the one bound to port 5353), not from
+  any datagram whose source port is 5353, which let a sender point a `.local` candidate at an
+  address of its choosing. mDNS-resolved candidates count against the 256-candidate cap.
 - Data channels: an in-band channel the peer opens on a stream id of this side's parity (even for
   the DTLS client, odd for the server, RFC 8832 §6) is refused and its stream reset, so the peer
   cannot take an id this side may assign. Negotiated channels are unaffected.
+- Depacketizers: AV1 reassembly across packets is bounded at 4 MiB and appends in place (it
+  copied the whole buffer for every packet, quadratic in the fragment count). VP9 reference
+  indices describe the current packet only (they accumulated, so a long-lived depacketizer
+  failed every flexible-mode packet after the second), and a scalability structure replaces the
+  previous picture-group description instead of appending to it.
+- RTP: the header extension block is always consumed whole, so a one-byte block containing
+  ID 15 no longer leaves its remainder at the front of the payload, and an item longer than its
+  block is an error instead of swallowing payload bytes. `Header::marshal_size()` now matches the
+  wire, which the SRTP keystream offset depends on.
+- RTCP: Slice Loss Indication is payload-specific feedback (PT 206, RFC 4585 §6.3.2); it was
+  marshalled as, and only parsed from, PT 205, so a received SLI never parsed.
+- Media writers: the IVF writer's frame buffer is bounded at 16 MiB and the H.265 writer's FU
+  reassembly at 4 MiB; an H.265 fragment with no start fragment is skipped.
 - Malformed peer input is an error instead of a panic: DTLS handshake message_seq exhaustion and
   a ChangeCipherSpec at the last epoch; SCTP error causes longer than their ABORT/ERROR chunk
   (reachable on an association's first packet) and TSN arithmetic at the u32 wrap (a peer initial

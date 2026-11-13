@@ -50,13 +50,24 @@ history stays intact.
 ### Hardening (fork only)
 
 Peer-input hardening upstream does not have: bounded DTLS fragment reassembly, early-record queue
-and handshake cache; AEAD-only default DTLS suites; SRTP state only after authentication; ICE
-source filtering, authenticated role conflicts and consent, candidate caps; bounded SCTP
-FORWARD-TSN/SACK/receive window and stream-id checks, DCEP stream-id parity; TURN client
-server-address filtering and response MESSAGE-INTEGRITY checks; errors instead of panics on
-malformed DTLS/SCTP/DCEP/ICE/SDP/RTCP input; NACK retransmission de-duplication and rate limit;
-bounded H.264 FU-A and AV1 OBU checks; sha-256 fingerprint selection; fuzzing CI fixes and
-stateful SCTP targets. See CHANGELOG.md.
+and handshake cache; AEAD-only default DTLS suites; ChangeCipherSpec honoured only for the
+handshake's one epoch transition; SRTP state only after authentication, and SRTCP authenticated
+whatever its E flag; ICE source filtering, authenticated role conflicts and consent, candidate
+caps (mDNS-resolved ones included), mDNS answers only from the mDNS socket; bounded SCTP
+FORWARD-TSN/SACK/receive window and stream-id checks; DCEP stream-id parity and internal message
+types refused from the wire; TURN client server-address filtering and response MESSAGE-INTEGRITY
+checks; errors instead of panics on malformed DTLS/SCTP/DCEP/ICE/SDP/RTCP input; NACK
+retransmission de-duplication and rate limit; bounded H.264 FU-A and AV1 reassembly, AV1 OBU
+checks, VP9 per-picture state; RTP extension blocks consumed whole; SLI on PT 206; bounded IVF and
+H.265 writer buffers; sha-256 fingerprint selection; fuzzing CI fixes and stateful SCTP targets.
+See CHANGELOG.md.
+
+Left as the RFCs require: the TURN client accepts 401 (Unauthorized) and 438 (Stale Nonce) error
+responses without MESSAGE-INTEGRITY (RFC 8489 §9.2.4; a server cannot sign a reply about the
+credential or nonce it would sign with). So a forged 438 can still end the request it answers
+with a stale-nonce error and replace the allocation's nonce; the server's own 438 on the next
+request restores it. Only a sender that passes the server-address filter can do this, and it
+cannot release the allocation or forge any other response.
 
 ### Upstream changes not taken (reverted inside the merge)
 
