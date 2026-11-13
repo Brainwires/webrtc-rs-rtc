@@ -99,7 +99,6 @@ clap = { version = "4.6.1", features = ["derive"] }
 ctrlc = "3.5.2"
 criterion = "0.8.2"
 tokio = { version = "1.52.3", features = ["full"] }
-tokio-util = { version = "0.7.17", features = ["codec"] }
 tokio-tungstenite = "0.28.0"
 # HTTP/1 only: the examples' signaling servers and clients. No `http2`, so no `h2`.
 hyper = { version = "1", features = ["server", "client", "http1"] }
