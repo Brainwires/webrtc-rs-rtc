@@ -22,6 +22,19 @@ pub(crate) mod parameters;
 pub(crate) mod role;
 pub(crate) mod state;
 
+/// The DTLS cipher suites a peer connection offers when the application configures none: the
+/// `dtls` crate's defaults without the AES-256-CBC-SHA suites. Browsers negotiate GCM, and the
+/// CBC suites' MAC-then-encrypt record handling is the part of DTLS with a history of padding
+/// and length bugs (rtc#96 was one). An application that needs CBC can still list it with
+/// `SettingEngineBuilder::with_dtls_cipher_suites`.
+pub(crate) fn webrtc_default_cipher_suites() -> Vec<CipherSuiteId> {
+    vec![
+        CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_128_Gcm_Sha256,
+        CipherSuiteId::Tls_Ecdhe_Rsa_With_Aes_128_Gcm_Sha256,
+        CipherSuiteId::Tls_Ecdhe_Ecdsa_With_ChaCha20_Poly1305_Sha256,
+    ]
+}
+
 /// Whether two remote fingerprint lists name the same certificates (order and hex case aside).
 fn same_fingerprints(a: &[RTCDtlsFingerprint], b: &[RTCDtlsFingerprint]) -> bool {
     let normalize = |list: &[RTCDtlsFingerprint]| {
@@ -74,7 +87,7 @@ pub(crate) struct DtlsTransport {
     // From SettingEngine
     pub(crate) answering_dtls_role: RTCDtlsRole,
     pub(crate) srtp_protection_profiles: Vec<SrtpProtectionProfile>,
-    /// Empty means "use the `dtls` crate's default set" (see
+    /// Empty means "use the WebRTC default set", [`webrtc_default_cipher_suites`] (see
     /// [`SettingEngineBuilder::with_dtls_cipher_suites`](crate::peer_connection::configuration::setting_engine::SettingEngineBuilder::with_dtls_cipher_suites)).
     pub(crate) dtls_cipher_suites: Vec<CipherSuiteId>,
     pub(crate) allow_insecure_verification_algorithm: bool,
@@ -224,9 +237,17 @@ impl DtlsTransport {
                             return Err(Error::ErrNonCertificate);
                         }
 
+                        // Only sha-256 is checked; other algorithms the peer lists are skipped
+                        // rather than failing the whole check while a sha-256 one may follow.
+                        if !remote_fingerprints
+                            .iter()
+                            .any(|fp| fp.algorithm.eq_ignore_ascii_case("sha-256"))
+                        {
+                            return Err(Error::ErrUnsupportedFingerprintAlgorithm);
+                        }
                         for fp in &remote_fingerprints {
-                            if fp.algorithm != "sha-256" {
-                                return Err(Error::ErrUnsupportedFingerprintAlgorithm);
+                            if !fp.algorithm.eq_ignore_ascii_case("sha-256") {
+                                continue;
                             }
 
                             let hashed = fingerprint_crypto
@@ -262,8 +283,12 @@ impl DtlsTransport {
                 .with_crypto_provider(self.crypto_provider.clone())
                 .with_certificates(vec![certificate])
                 .with_srtp_protection_profiles(profiles)
-                // Empty leaves `dtls`'s default set in place; a non-empty list replaces it.
-                .with_cipher_suites(self.dtls_cipher_suites.clone())
+                // Empty means the WebRTC default set (AEAD only); a non-empty list replaces it.
+                .with_cipher_suites(if self.dtls_cipher_suites.is_empty() {
+                    webrtc_default_cipher_suites()
+                } else {
+                    self.dtls_cipher_suites.clone()
+                })
                 .with_client_auth(ClientAuthType::RequireAnyClientCert)
                 .with_insecure_skip_verify(true)
                 .with_insecure_verification(self.allow_insecure_verification_algorithm)
@@ -971,5 +996,81 @@ mod tests {
         t.restart(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
             .unwrap();
         assert_eq!(t.state, RTCDtlsTransportState::Connecting);
+    }
+
+    /// A peer that offers only AES-256-CBC-SHA must not get a session with the default
+    /// configuration: the WebRTC defaults are AEAD only.
+    #[test]
+    fn default_cipher_suites_do_not_negotiate_cbc() -> Result<()> {
+        use ::dtls::config::ConfigBuilder;
+        use ::dtls::endpoint::{Endpoint, EndpointEvent};
+        use std::net::SocketAddr;
+
+        let provider = crypto::default_provider().map_err(|e| Error::Other(e.to_string()))?;
+        let client_certificate = ::dtls::crypto::Certificate::generate_self_signed(
+            vec!["localhost".into()],
+            provider.crypto(),
+        )?;
+        let hashed = provider
+            .crypto()
+            .hash(HashAlgorithm::Sha256, &client_certificate.certificate[0])
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let client_fingerprint: Vec<String> = hashed.iter().map(|b| format!("{b:02x}")).collect();
+
+        // Our side: a default-configured transport, answering as the DTLS server.
+        let mut transport = transport(vec![]);
+        let server_config = transport.prepare_transport(
+            RTCIceRole::Controlling,
+            RTCDtlsParameters {
+                role: RTCDtlsRole::Client,
+                fingerprints: vec![RTCDtlsFingerprint {
+                    algorithm: "sha-256".to_owned(),
+                    value: client_fingerprint.join(":"),
+                }],
+            },
+        )?;
+
+        let client_config = ConfigBuilder::default()
+            .with_crypto_provider(provider)
+            .with_certificates(vec![client_certificate])
+            .with_cipher_suites(vec![CipherSuiteId::Tls_Ecdhe_Ecdsa_With_Aes_256_Cbc_Sha])
+            .with_srtp_protection_profiles(default_srtp_protection_profiles())
+            .with_insecure_skip_verify(true)
+            .with_extended_master_secret(::dtls::config::ExtendedMasterSecretType::Require)
+            .build(true, None)?;
+
+        let client_addr: SocketAddr = "127.0.0.1:45001".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:45002".parse().unwrap();
+        let mut client = Endpoint::new(client_addr, TransportProtocol::UDP, None);
+        let mut server = Endpoint::new(server_addr, TransportProtocol::UDP, Some(server_config));
+        let now = std::time::Instant::now();
+        client.connect(now, server_addr, Arc::new(client_config), None)?;
+
+        let mut completed = false;
+        for _ in 0..6 {
+            while let Some(packet) = client.poll_transmit() {
+                if let Ok(events) =
+                    server.read(now, client_addr, packet.transport.ecn, packet.message)
+                {
+                    completed |= events
+                        .iter()
+                        .any(|e| matches!(e, EndpointEvent::HandshakeComplete));
+                }
+            }
+            while let Some(packet) = server.poll_transmit() {
+                if let Ok(events) =
+                    client.read(now, server_addr, packet.transport.ecn, packet.message)
+                {
+                    completed |= events
+                        .iter()
+                        .any(|e| matches!(e, EndpointEvent::HandshakeComplete));
+                }
+            }
+        }
+        assert!(
+            !completed,
+            "a CBC-only peer completed a handshake against the default WebRTC configuration"
+        );
+        Ok(())
     }
 }

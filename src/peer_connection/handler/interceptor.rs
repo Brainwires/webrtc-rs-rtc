@@ -547,17 +547,18 @@ impl<'a> InterceptorHandler<'a> {
             return false;
         };
 
-        let primary_ssrc = match receiver.get_coding_parameter_mut_by_rid(rrid) {
+        let (primary_ssrc, replaced_ssrc) = match receiver.get_coding_parameter_mut_by_rid(rrid) {
             Some(coding) => {
                 if coding.rtx.as_ref().is_some_and(|rtx| rtx.ssrc == ssrc) {
                     // Already associated and bound.
                     return true;
                 }
+                let replaced = coding.rtx.as_ref().map(|rtx| rtx.ssrc);
                 match coding.rtx.as_mut() {
                     Some(rtx) => rtx.ssrc = ssrc,
                     None => coding.rtx = Some(RTCRtpRtxParameters { ssrc }),
                 }
-                coding.ssrc
+                (coding.ssrc, replaced)
             }
             None => {
                 log::warn!(
@@ -569,6 +570,24 @@ impl<'a> InterceptorHandler<'a> {
         };
 
         let parameters = receiver.get_parameters(self.media_engine);
+        // A repair SSRC this one replaces (the sender restarted its RTX stream) is unbound, so
+        // interceptors do not keep state for a stream that no longer exists.
+        if let Some(replaced) = replaced_ssrc
+            && replaced != 0
+        {
+            RTCRtpReceiverInternal::interceptor_remote_stream_op(
+                self.interceptor,
+                false,
+                replaced,
+                None,
+                None,
+                codec.payload_type,
+                None,
+                None,
+                &codec.rtp_codec,
+                &parameters.rtp_parameters.header_extensions,
+            );
+        }
         RTCRtpReceiverInternal::interceptor_remote_stream_op(
             self.interceptor,
             true,

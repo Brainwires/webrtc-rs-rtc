@@ -5,6 +5,11 @@ use crate::util::*;
 use rustc_hash::FxHashMap;
 use std::collections::{VecDeque, hash_map::Entry};
 
+/// How far past the cumulative TSN a received DATA chunk may be. A SACK's gap blocks carry
+/// 16-bit offsets from the cumulative TSN, so a chunk further ahead cannot be reported (its
+/// offset would wrap); such chunks are dropped, as chunks outside the receive window are.
+pub(crate) const MAX_RECEIVE_TSN_WINDOW: u32 = u16::MAX as u32;
+
 /// Repeats kept between SACKs, as Chrome's dcSCTP and usrsctp keep.
 pub(crate) const MAX_DUPLICATE_TSNS: usize = 20;
 
@@ -99,7 +104,9 @@ impl PayloadQueue {
     }
 
     pub(crate) fn can_push(&self, p: &ChunkPayloadData, cumulative_tsn: u32) -> bool {
-        !(self.chunk_map.contains_key(&p.tsn) || sna32lte(p.tsn, cumulative_tsn))
+        !(self.chunk_map.contains_key(&p.tsn)
+            || sna32lte(p.tsn, cumulative_tsn)
+            || p.tsn.wrapping_sub(cumulative_tsn) > MAX_RECEIVE_TSN_WINDOW)
     }
 
     fn abandonment_id(p: &ChunkPayloadData) -> Option<MessageId> {
@@ -212,7 +219,7 @@ impl PayloadQueue {
             if i == 0 {
                 b.start = diff;
                 b.end = b.start;
-            } else if b.end + 1 == diff {
+            } else if b.end.checked_add(1) == Some(diff) {
                 b.end += 1;
             } else {
                 gap_ack_blocks.push(b);

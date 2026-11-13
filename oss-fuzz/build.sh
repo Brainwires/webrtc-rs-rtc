@@ -37,6 +37,7 @@ for CRATE in "${FUZZ_CRATES[@]}"; do
         cargo fuzz build \
             --fuzz-dir . \
             --release \
+            --debug-assertions \
             "$TARGET"
 
         # Copy the compiled binary to $OUT

@@ -153,6 +153,10 @@ impl Depacketizer for Av1Depacketizer {
             let has_size_field = (obu_buffer[0] & OBU_HAS_SIZE_BIT) != 0;
             let has_extension = (obu_buffer[0] & 0x04) != 0;
             let header_size = if has_extension { 2 } else { 1 };
+            // A one-byte OBU that claims an extension header has no room for it.
+            if obu_buffer.len() < header_size {
+                return Err(Error::ErrShortPacket);
+            }
 
             if has_size_field {
                 // OBU already has size field, validate it
@@ -241,6 +245,19 @@ fn write_leb128(buf: &mut BytesMut, mut value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-byte OBU whose header sets the extension flag must be rejected, not sliced past its
+    /// end (`[2..]` on a one-byte buffer) or underflow the payload-size computation.
+    #[test]
+    fn one_byte_obu_with_extension_flag_is_rejected() {
+        for obu_header in [0x36u8, 0x34] {
+            // W=1 (one OBU, no length field); a FRAME OBU header with the extension bit, with
+            // and without the size-field bit.
+            let payload = Bytes::from(vec![0x10, obu_header]);
+            let mut depacketizer = Av1Depacketizer::new();
+            assert!(depacketizer.depacketize(&payload).is_err());
+        }
+    }
 
     #[test]
     fn test_depacketizer_basic() {

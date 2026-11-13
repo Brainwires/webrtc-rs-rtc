@@ -702,3 +702,13 @@ fn test_handshake_cache_session_hash() -> Result<()> {
 
     Ok(())
 }
+
+/// Messages under ever new sequence numbers stop being cached at the cap.
+#[test]
+fn handshake_cache_is_bounded() {
+    let mut cache = HandshakeCache::new();
+    for seq in 0..(MAX_HANDSHAKE_CACHE_ITEMS as u16 + 10) {
+        cache.push(vec![0u8; 16], 0, seq, HandshakeType::Certificate, true);
+    }
+    assert_eq!(cache.cache.len(), MAX_HANDSHAKE_CACHE_ITEMS);
+}

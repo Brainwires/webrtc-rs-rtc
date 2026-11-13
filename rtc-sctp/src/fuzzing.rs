@@ -296,3 +296,68 @@ mod tests {
         assert!(bench_packet_marshal(&pkt, 3).is_ok());
     }
 }
+
+/// Rewrites the CRC-32C field (bytes 8..12) of a raw SCTP packet so it verifies. Without this a
+/// fuzzer almost never gets past the checksum to the chunk parsers.
+pub fn fix_checksum(data: &[u8]) -> Vec<u8> {
+    let mut packet = data.to_vec();
+    if packet.len() >= 12 {
+        packet[8..12].fill(0);
+        let checksum = crc32c::crc32c(&packet);
+        packet[8..12].copy_from_slice(&checksum.to_le_bytes());
+    }
+    packet
+}
+
+/// [`packet_unmarshal`] on a packet whose checksum has been made valid.
+pub fn packet_unmarshal_fixed_checksum(data: &[u8]) -> Result<()> {
+    packet_unmarshal(&fix_checksum(data))
+}
+
+/// Stateful target: drives a server endpoint, and the association it accepts, with a sequence of
+/// datagrams. The input is split into datagrams by a 2-byte big-endian length prefix; each gets
+/// a valid checksum. Every association event, timer and transmit is drained so the whole receive
+/// path (INIT handling, DATA, SACK, FORWARD-TSN, RECONFIG, ...) is reachable. `start` is the
+/// base instant (sans-I/O: the harness supplies the time).
+pub fn endpoint_handle_datagrams(mut data: &[u8], start: std::time::Instant) {
+    use crate::{DatagramEvent, Endpoint, EndpointConfig, ServerConfig};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let remote: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+    let mut endpoint = Endpoint::new(
+        local,
+        shared::TransportProtocol::UDP,
+        Arc::new(EndpointConfig::default()),
+        Some(Arc::new(ServerConfig::default())),
+    );
+    let mut association = None;
+    let mut step = 0u64;
+
+    while data.len() >= 2 {
+        let len = u16::from_be_bytes([data[0], data[1]]) as usize;
+        data = &data[2..];
+        let len = len.min(data.len());
+        let datagram = fix_checksum(&data[..len]);
+        data = &data[len..];
+        step += 1;
+        let now = start + Duration::from_millis(step * 10);
+
+        match endpoint.handle(now, remote, None, Bytes::from(datagram)) {
+            Some((_, DatagramEvent::NewAssociation(a))) => association = Some(a),
+            Some((_, DatagramEvent::AssociationEvent(event))) => {
+                if let Some(a) = association.as_mut() {
+                    a.handle_event(event);
+                }
+            }
+            None => {}
+        }
+        if let Some(a) = association.as_mut() {
+            a.handle_timeout(now);
+            while a.poll().is_some() {}
+            while a.poll_transmit(now).is_some() {}
+        }
+    }
+}

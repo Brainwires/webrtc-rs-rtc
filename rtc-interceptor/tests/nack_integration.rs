@@ -1323,3 +1323,53 @@ fn a_retransmission_is_tagged_and_an_original_is_not() {
         "the responder should have retransmitted exactly the packet that was asked for"
     );
 }
+
+/// A packet named several times in one NACK, or NACKed again right away, is retransmitted once:
+/// otherwise a peer can turn every RTCP packet it sends into a burst of resent media.
+#[test]
+fn test_nack_responder_does_not_amplify_repeated_nacks() {
+    let mut chain = Registry::new()
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(512).build(),
+        )
+        .build();
+    let ssrc = 0xABCDEF01;
+    chain.bind_local_stream(&nack_stream_info(ssrc));
+    let base_time = Instant::now();
+    for seq in 0..10u16 {
+        let pkt = create_rtp_packet_with_time(base_time, ssrc, seq, seq as u32 * 3000, 500);
+        chain.handle_write(pkt).unwrap();
+    }
+    while chain.poll_write().is_some() {}
+
+    let pair = rtcp::transport_feedbacks::transport_layer_nack::NackPair {
+        packet_id: 3,
+        lost_packets: 0,
+    };
+    // One NACK naming packet 3 fifty times, then the same NACK twice more at once.
+    for _ in 0..3 {
+        chain
+            .handle_read(create_nack_packet(
+                base_time,
+                0x11111111,
+                ssrc,
+                vec![pair; 50],
+            ))
+            .unwrap();
+    }
+    while chain.poll_read().is_some() {}
+
+    let mut retransmitted = 0;
+    while let Some(pkt) = chain.poll_write() {
+        if let Packet::Rtp(rtp) = &pkt.message.packet
+            && rtp.header.sequence_number == 3
+        {
+            retransmitted += 1;
+        }
+    }
+    assert_eq!(
+        retransmitted, 1,
+        "packet 3 was resent {retransmitted} times"
+    );
+}

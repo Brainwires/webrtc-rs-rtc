@@ -507,8 +507,10 @@ impl SettingEngineBuilder {
 
     /// Restricts the DTLS cipher suites offered during the handshake.
     ///
-    /// An empty list (the default) uses the `dtls` crate's built-in set, which offers
-    /// **both** ECDHE_ECDSA and ECDHE_RSA suites. That is deliberate — the local
+    /// An empty list (the default) uses the WebRTC default set: the `dtls` crate's built-in
+    /// suites without AES-256-CBC-SHA (AES-128-GCM and ChaCha20-Poly1305; browsers negotiate
+    /// GCM). List a CBC suite here to offer it. The default offers **both** ECDHE_ECDSA and
+    /// ECDHE_RSA suites. That is deliberate — the local
     /// certificate is not known when the list is compiled — but it means a remote peer may
     /// select an ECDHE_RSA suite that an ECDSA certificate cannot satisfy, and the
     /// handshake then stalls with the connection stuck in `Connecting`.

@@ -95,6 +95,13 @@ fn assert_inbound_username(m: &Message, expected_username: &str) -> Result<()> {
     Ok(())
 }
 
+/// Most remote candidates an agent holds. Browsers signal a few dozen at most; each one is paired
+/// with every local candidate, so an unbounded list is quadratic work for whoever sends it.
+pub(crate) const MAX_REMOTE_CANDIDATES: usize = 256;
+
+/// Most mDNS (`.local`) remote candidates waiting on a query at once.
+pub(crate) const MAX_PENDING_MDNS_QUERIES: usize = 32;
+
 fn assert_inbound_message_integrity(
     m: &mut Message,
     key: &[u8],
@@ -448,6 +455,19 @@ impl Agent {
 
     /// Adds a new remote candidate.
     pub fn add_remote_candidate(&mut self, c: Candidate) -> Result<bool> {
+        // Bound what the remote description (or a stream of peer-reflexive checks) can make us
+        // hold: every remote candidate is paired with every local one, and each `.local` name
+        // is an mDNS query kept until it resolves.
+        if self.remote_candidates.len() >= MAX_REMOTE_CANDIDATES {
+            warn!(
+                "[{}]: ignoring remote candidate {}: already holding {} (the cap)",
+                self.get_name(),
+                c.address(),
+                MAX_REMOTE_CANDIDATES
+            );
+            return Ok(false);
+        }
+
         // Filter by network type if network_types is configured
         if !self.network_types.is_empty() {
             let candidate_network_type = c.network_type();
@@ -483,6 +503,16 @@ impl Agent {
 
             if c.candidate_type() != CandidateType::Host {
                 return Err(Error::ErrAddressParseFailed);
+            }
+
+            if self.mdns_queries.len() >= MAX_PENDING_MDNS_QUERIES {
+                warn!(
+                    "[{}]: ignoring mDNS candidate {}: {} queries already pending (the cap)",
+                    self.get_name(),
+                    c.address(),
+                    MAX_PENDING_MDNS_QUERIES
+                );
+                return Ok(false);
             }
 
             if let Some(mdns_conn) = &mut self.mdns {
@@ -930,8 +960,10 @@ impl Agent {
                 |&pair_index| {
                     let remote_index = self.candidate_pairs[pair_index].remote_index;
 
+                    // Consent (RFC 7675) is refreshed only by authenticated STUN: non-STUN
+                    // datagrams and unauthenticated indications from the address do not count.
                     let last_received = self.remote_candidates[remote_index]
-                        .last_received()
+                        .last_authenticated()
                         .unwrap_or(self.start_time);
                     let disconnected_time = now.saturating_duration_since(last_received);
                     (true, disconnected_time)
@@ -1251,30 +1283,15 @@ impl Agent {
     }
 
     /// Processes STUN traffic from a remote candidate.
-    pub(crate) fn handle_inbound(
+    /// RFC 8445 Section 7.3.1.1 - Detecting and Repairing Role Conflicts, for an authenticated
+    /// Binding request.
+    fn handle_role_conflict(
         &mut self,
         now: Instant,
-        m: &mut Message,
+        m: &Message,
         local_index: usize,
         remote_addr: SocketAddr,
     ) -> Result<()> {
-        if m.typ.method != METHOD_BINDING
-            || !(m.typ.class == CLASS_SUCCESS_RESPONSE
-                || m.typ.class == CLASS_REQUEST
-                || m.typ.class == CLASS_INDICATION)
-        {
-            trace!(
-                "[{}]: unhandled STUN from {} to {} class({}) method({})",
-                self.get_name(),
-                remote_addr,
-                self.local_candidates[local_index],
-                m.typ.class,
-                m.typ.method
-            );
-            return Err(Error::ErrUnhandledStunpacket);
-        }
-
-        // RFC 8445 Section 7.3.1.1 - Detecting and Repairing Role Conflicts
         if self.is_controlling {
             if m.contains(ATTR_ICE_CONTROLLING) {
                 // Both agents are controlling - role conflict detected
@@ -1360,6 +1377,32 @@ impl Agent {
             // Continue processing the message after handling role conflict
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn handle_inbound(
+        &mut self,
+        now: Instant,
+        m: &mut Message,
+        local_index: usize,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        if m.typ.method != METHOD_BINDING
+            || !(m.typ.class == CLASS_SUCCESS_RESPONSE
+                || m.typ.class == CLASS_REQUEST
+                || m.typ.class == CLASS_INDICATION)
+        {
+            trace!(
+                "[{}]: unhandled STUN from {} to {} class({}) method({})",
+                self.get_name(),
+                remote_addr,
+                self.local_candidates[local_index],
+                m.typ.class,
+                m.typ.method
+            );
+            return Err(Error::ErrUnhandledStunpacket);
+        }
+
         let Some(remote_credentials) = &self.ufrag_pwd.remote_credentials else {
             debug!(
                 "[{}]: ufrag_pwd.remote_credentials.is_none",
@@ -1422,6 +1465,11 @@ impl Agent {
                 }
             }
 
+            // Role conflicts are acted on only for a request that passed the username and
+            // MESSAGE-INTEGRITY checks above: an unauthenticated datagram must not be able to
+            // flip our ICE role, re-prioritise every pair and clear the nomination.
+            self.handle_role_conflict(now, m, local_index, remote_addr)?;
+
             if remote_candidate_index.is_none() {
                 // Use the local candidate's network type for the peer-reflexive candidate
                 let network_type = self.local_candidates[local_index].network_type();
@@ -1482,6 +1530,11 @@ impl Agent {
 
         if let Some(remote_index) = remote_candidate_index {
             self.remote_candidates[remote_index].seen(now, false);
+            // Requests and responses reaching here passed MESSAGE-INTEGRITY; indications did not
+            // and carry none.
+            if m.typ.class != CLASS_INDICATION {
+                self.remote_candidates[remote_index].last_authenticated = Some(now);
+            }
         }
 
         Ok(())

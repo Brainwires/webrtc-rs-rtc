@@ -251,9 +251,24 @@ impl Client {
         //  - STUN message was a request
         //  - Non-STUN message from the STUN server
 
+        // TURN and STUN messages are only ever sent to us by the servers we talk to. Anything
+        // else that looks like one — a spoofed Data indication, ChannelData or a forged
+        // response — is not from the server and must not be acted on or relayed as peer data.
+        let from_turn_server = self.turn_serv_addr == Some(from);
+        let from_a_server = from_turn_server || self.stun_serv_addr == Some(from);
         if is_stun_message(data) {
+            // A response to a request sent to some other address (`send_binding_request_to`)
+            // is accepted from that address only.
+            if !from_a_server && !self.is_response_from_transaction_peer(data, from) {
+                debug!("discarding STUN message from {from}: not a configured server");
+                return Ok(());
+            }
             self.handle_stun_message(now, data)
         } else if ChannelData::is_channel_data(data) {
+            if !from_turn_server {
+                debug!("discarding ChannelData from {from}: not the TURN server");
+                return Ok(());
+            }
             self.handle_channel_data(data)
         } else if self.stun_serv_addr.is_some() && &from == self.stun_serv_addr.as_ref().unwrap() {
             // received from STUN server, but it is not a STUN message
@@ -263,6 +278,21 @@ impl Client {
             trace!("non-STUN/TURN packet, unhandled");
             Ok(())
         }
+    }
+
+    /// Whether `data` is a STUN response to an outstanding transaction whose request went to
+    /// `from`.
+    fn is_response_from_transaction_peer(&self, data: &[u8], from: SocketAddr) -> bool {
+        let mut msg = Message::new();
+        msg.raw = data.to_vec();
+        if msg.decode().is_err() {
+            return false;
+        }
+        (msg.typ.class == CLASS_SUCCESS_RESPONSE || msg.typ.class == CLASS_ERROR_RESPONSE)
+            && self
+                .tr_map
+                .find(&msg.transaction_id)
+                .is_some_and(|tr| tr.peer_addr == from)
     }
 
     fn handle_stun_message(&mut self, now: Instant, data: &[u8]) -> Result<()> {

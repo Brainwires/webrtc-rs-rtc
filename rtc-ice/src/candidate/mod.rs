@@ -193,6 +193,10 @@ pub struct Candidate {
     pub(crate) last_sent: Option<Instant>,
     /// When traffic was last received on this candidate, or `None` if none ever has been.
     pub(crate) last_received: Option<Instant>,
+    /// When an authenticated (MESSAGE-INTEGRITY checked) Binding request or response last
+    /// arrived from this candidate. Consent freshness (RFC 7675) is judged on this alone, so
+    /// unauthenticated traffic from the address cannot keep a dead pair alive.
+    pub(crate) last_authenticated: Option<Instant>,
 
     pub(crate) foundation_override: String,
     pub(crate) priority_override: u32,
@@ -219,6 +223,7 @@ impl Default for Candidate {
 
             last_sent: None,
             last_received: None,
+            last_authenticated: None,
 
             foundation_override: String::new(),
             priority_override: 0,
@@ -466,6 +471,11 @@ impl Candidate {
 }
 
 impl Candidate {
+    /// When an authenticated Binding request or response last arrived from this candidate.
+    pub fn last_authenticated(&self) -> Option<Instant> {
+        self.last_authenticated
+    }
+
     /// Records that traffic was received on this candidate at `now`.
     pub fn set_last_received(&mut self, now: Instant) {
         self.last_received = Some(now);

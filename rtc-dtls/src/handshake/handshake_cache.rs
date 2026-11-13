@@ -7,6 +7,10 @@ use crate::handshake::*;
 use std::collections::HashMap;
 use std::io::BufReader;
 
+/// Most messages the cache holds. A full DTLS 1.2 handshake caches about ten; the cap stops a
+/// peer that sends handshake messages under ever new sequence numbers from growing it.
+pub(crate) const MAX_HANDSHAKE_CACHE_ITEMS: usize = 64;
+
 #[derive(Clone, Debug)]
 pub(crate) struct HandshakeCacheItem {
     typ: HandshakeType,
@@ -46,6 +50,9 @@ impl HandshakeCache {
             if i.message_sequence == message_sequence && i.is_client == is_client {
                 return false;
             }
+        }
+        if self.cache.len() >= MAX_HANDSHAKE_CACHE_ITEMS {
+            return false;
         }
 
         self.cache.push(HandshakeCacheItem {

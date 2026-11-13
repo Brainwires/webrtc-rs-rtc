@@ -74,13 +74,21 @@ impl<'a>
                 transport: msg.transport,
                 message,
             })?;
-        } else if self
-            .ctx
-            .ice_transport
-            .agent
-            .get_selected_candidate_pair()
-            .is_some()
+        } else if let Some((_, remote)) = self.ctx.ice_transport.agent.get_selected_candidate_pair()
         {
+            // Only the selected pair's remote may send DTLS/SRTP: a datagram from any other
+            // address is not part of this connection (ICE consent covers that one address), so
+            // drop it rather than hand it to DTLS, where it would cost a decrypt attempt or
+            // reach handshake processing.
+            let remote_addr = remote.addr();
+            if msg.transport.peer_addr != remote_addr {
+                trace!(
+                    "drop non-STUN message from {:?}: not the selected pair's remote {:?}",
+                    msg.transport.peer_addr, remote_addr
+                );
+                return Ok(());
+            }
+
             // only ICE connection is ready and bypass it
             debug!("bypass ice read {:?}", msg.transport.peer_addr);
 

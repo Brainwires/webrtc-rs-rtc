@@ -66,7 +66,19 @@ struct LocalStream {
     payload_type_rtx: Option<u8>,
     /// Sequence number counter for RTX packets.
     rtx_sequence_number: u16,
+    /// When each sequence number was last retransmitted, so a repeated NACK within
+    /// [`MIN_RETRANSMIT_INTERVAL`] does not resend it again.
+    last_retransmit: HashMap<u16, Instant>,
 }
+
+/// A sequence number is retransmitted at most once per this interval, however often it is
+/// NACKed. Receivers repeat NACKs while the repair is in flight; without this a peer can make
+/// us resend the same packets as fast as it can send RTCP (an amplifier).
+pub const MIN_RETRANSMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Most retransmissions queued and not yet taken by `poll_write`. Past it further NACKed
+/// packets are not queued until the queue drains.
+pub const MAX_QUEUED_RETRANSMISSIONS: usize = 1024;
 
 /// Interceptor that responds to NACK requests by retransmitting packets.
 ///
@@ -81,6 +93,8 @@ pub struct NackResponderInterceptor {
 
     /// Queue for retransmitted packets
     write_queue: VecDeque<TaggedPacket>,
+    /// Retransmissions in `write_queue` not yet taken by `poll_write`.
+    retransmissions_queued: usize,
     /// Inbound packets ready for the next interceptor.
     read_queue: VecDeque<TaggedPacket>,
 }
@@ -92,6 +106,7 @@ impl NackResponderInterceptor {
             size,
             streams: HashMap::new(),
             write_queue: VecDeque::new(),
+            retransmissions_queued: 0,
         }
     }
 
@@ -121,11 +136,27 @@ impl NackResponderInterceptor {
             return;
         };
 
+        // A NACK may name the same packet in several pairs; resend each once.
+        seqs_to_retransmit.sort_unstable();
+        seqs_to_retransmit.dedup();
+        // Forget suppression entries old enough not to matter.
+        stream
+            .last_retransmit
+            .retain(|_, at| now.saturating_duration_since(*at) < MIN_RETRANSMIT_INTERVAL);
+
         // Queue retransmissions
         for seq in seqs_to_retransmit {
+            if self.retransmissions_queued >= MAX_QUEUED_RETRANSMISSIONS {
+                break;
+            }
+            if stream.last_retransmit.contains_key(&seq) {
+                continue;
+            }
             let Some(original_packet) = stream.send_buffer.get(seq) else {
                 continue;
             };
+            stream.last_retransmit.insert(seq, now);
+            self.retransmissions_queued += 1;
 
             let packet = if let (Some(ssrc_rtx), Some(pt_rtx)) =
                 (stream.ssrc_rtx, stream.payload_type_rtx)
@@ -221,7 +252,11 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
 
     fn poll_write(&mut self) -> Option<TaggedPacket> {
         // First drain retransmitted packets
-        self.write_queue.pop_front()
+        let packet = self.write_queue.pop_front()?;
+        if packet.message.has(&Attribute::Retransmission) {
+            self.retransmissions_queued = self.retransmissions_queued.saturating_sub(1);
+        }
+        Some(packet)
     }
 
     fn handle_timeout(&mut self, _now: Instant) -> Result<(), Self::Error> {
@@ -245,6 +280,7 @@ impl Interceptor for NackResponderInterceptor {
                     ssrc_rtx: info.ssrc_rtx,
                     payload_type_rtx: info.payload_type_rtx,
                     rtx_sequence_number: 0,
+                    last_retransmit: HashMap::new(),
                 },
             );
         }

@@ -178,3 +178,27 @@ fn test_rtp_lifecyle() -> Result<()> {
 //TODO: BenchmarkEncryptRTP
 //TODO: BenchmarkEncryptRTPInPlace
 //TODO: BenchmarkDecryptRTP
+
+/// Packets that fail authentication must not create per-SSRC state: otherwise a peer (or
+/// anyone who can reach the socket) can grow the state map with made-up SSRCs.
+#[test]
+fn test_unauthenticated_packets_do_not_create_ssrc_state() -> Result<()> {
+    let mut ctx = build_test_context()?;
+    for ssrc in 0..1000u32 {
+        let header = rtp::header::Header {
+            version: 2,
+            sequence_number: 1,
+            ssrc,
+            ..Default::default()
+        };
+        let mut raw = header.marshal()?.to_vec();
+        raw.extend_from_slice(&[0u8; 30]); // payload + a bogus auth tag
+        assert!(ctx.decrypt_rtp_with_header(&raw, &header).is_err());
+    }
+    assert!(
+        ctx.srtp_ssrc_states.is_empty(),
+        "{} SSRC states were created by unauthenticated packets",
+        ctx.srtp_ssrc_states.len()
+    );
+    Ok(())
+}

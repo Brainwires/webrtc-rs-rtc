@@ -315,3 +315,30 @@ fn test_rtcp_short_packet_errors() -> Result<()> {
 
     Ok(())
 }
+
+/// SRTCP packets that fail authentication must not create per-SSRC state.
+#[test]
+fn test_unauthenticated_srtcp_packets_do_not_create_ssrc_state() -> Result<()> {
+    let mut ctx = Context::new(
+        &RTCP_TEST_MASTER_KEY,
+        &RTCP_TEST_MASTER_SALT,
+        ProtectionProfile::Aes128CmHmacSha1_80,
+        None,
+        None,
+        test_crypto_provider().crypto(),
+    )?;
+    for ssrc in 0..1000u32 {
+        // RTCP receiver report header (V=2, PT=201, length=1) + SSRC + E|index + bogus tag.
+        let mut raw = vec![0x80, 0xc9, 0x00, 0x01];
+        raw.extend_from_slice(&ssrc.to_be_bytes());
+        raw.extend_from_slice(&[0x80, 0x00, 0x00, 0x01]);
+        raw.extend_from_slice(&[0u8; 10]);
+        assert!(ctx.decrypt_rtcp(&raw).is_err());
+    }
+    assert!(
+        ctx.srtcp_ssrc_states.is_empty(),
+        "{} SSRC states were created by unauthenticated packets",
+        ctx.srtcp_ssrc_states.len()
+    );
+    Ok(())
+}

@@ -1341,6 +1341,19 @@ impl Association {
         );
         self.stats.inc_datas();
 
+        // A stream id at or past the inbound stream count negotiated in INIT/INIT-ACK is not
+        // one the peer may use (RFC 9260 6.5); creating state for it would let a peer make us
+        // hold up to 65536 streams.
+        if self.my_max_num_inbound_streams != 0
+            && d.stream_identifier >= self.my_max_num_inbound_streams
+        {
+            debug!(
+                "[{}] discard DATA on stream {} (negotiated inbound streams: {})",
+                self.side, d.stream_identifier, self.my_max_num_inbound_streams
+            );
+            return Ok(vec![]);
+        }
+
         let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
         let mut stream_handle_data = false;
         if can_push {
@@ -1462,6 +1475,16 @@ impl Association {
                 self.side, d.cumulative_tsn_ack, self.cumulative_tsn_ack_point
             );
 
+            return Ok(vec![]);
+        }
+
+        // A SACK may not acknowledge DATA this side never sent (RFC 9260 6.2.1). Ignore one
+        // that does instead of walking toward its cumulative TSN.
+        if sna32gte(d.cumulative_tsn_ack, self.my_next_tsn) {
+            debug!(
+                "[{}] SACK Cumulative ACK {} is beyond the next TSN {}; ignored",
+                self.side, d.cumulative_tsn_ack, self.my_next_tsn
+            );
             return Ok(vec![]);
         }
 
@@ -1588,11 +1611,15 @@ impl Association {
         //   its cumulative TSN point to the value carried in the FORWARD TSN
         //   chunk,
 
-        // Advance peer_last_tsn
-        while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1); // may not exist
-            self.peer_last_tsn += 1;
+        // Advance peer_last_tsn. Drop only the chunks actually queued below the new point and
+        // jump straight to it: stepping one TSN at a time let a FORWARD-TSN about 2^31 ahead
+        // spin for billions of iterations.
+        while let Some(&front) = self.payload_queue.sorted.front() {
+            if !sna32lte(front, c.new_cumulative_tsn) || self.payload_queue.pop(front).is_none() {
+                break;
+            }
         }
+        self.peer_last_tsn = c.new_cumulative_tsn;
 
         // Report new peer_last_tsn value and abandoned largest SSN value to
         // corresponding streams so that the abandoned chunks can be removed

@@ -3575,3 +3575,190 @@ fn test_controlling_rechecks_failed_pair_on_inbound_binding_request() -> Result<
     a.close()?;
     Ok(())
 }
+
+/// A role conflict is acted on only for an authenticated request: a forged Binding request
+/// carrying ICE-CONTROLLING with a larger tiebreaker must not make us switch roles.
+#[test]
+fn test_role_conflict_needs_message_integrity() -> Result<()> {
+    // Create agent with controlling role
+    let mut config = AgentConfig::default();
+    config.is_controlling = true;
+    let mut agent = Agent::new(Instant::now(), Arc::new(config), test_crypto_provider())?;
+
+    // Set a specific tiebreaker value
+    agent.tie_breaker = 100;
+
+    // Add local candidate
+    let host_config = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: "192.168.0.2".to_owned(),
+            port: 7777,
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let local_candidate = host_config.new_candidate_host()?;
+    let local_index = 0;
+    agent.add_local_candidate(local_candidate)?;
+
+    // Add remote candidate
+    let remote_addr = SocketAddr::from_str("172.17.0.3:9999")?;
+    let remote_host_config = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: "172.17.0.3".to_owned(),
+            port: 9999,
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let remote_candidate = remote_host_config.new_candidate_host()?;
+    agent.add_remote_candidate(remote_candidate)?;
+
+    // Set remote credentials
+    agent.ufrag_pwd.remote_credentials = Some(Credentials {
+        ufrag: "remote_ufrag".to_string(),
+        pwd: "remote_pwd".to_string(),
+    });
+
+    let username = agent.ufrag_pwd.local_credentials.ufrag.clone() + ":remote_ufrag";
+    let local_pwd = agent.ufrag_pwd.local_credentials.pwd.clone();
+
+    // Create STUN binding request from remote agent (also controlling, with larger tiebreaker)
+    let remote_tiebreaker = 200; // Larger than ours (100)
+    let mut msg = Message::new();
+    msg.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username)),
+        Box::new(AttrControlling(remote_tiebreaker)), // Remote is also controlling
+        Box::new(PriorityAttr(1000)),
+        // Signed with the wrong password: the request does not authenticate.
+        Box::new(MessageIntegrity::new_short_term_integrity_with_provider(
+            local_pwd + "-forged",
+            test_crypto_provider().crypto(),
+        )),
+        Box::new(FINGERPRINT),
+    ])?;
+
+    // Agent should be controlling before handling the message
+    assert!(
+        agent.is_controlling,
+        "Agent should be controlling before role conflict"
+    );
+
+    // Handle the inbound message - should detect role conflict
+    let result = agent.handle_inbound(Instant::now(), &mut msg, local_index, remote_addr);
+
+    assert!(
+        result.is_err(),
+        "an unauthenticated request must be rejected"
+    );
+    assert!(
+        agent.is_controlling,
+        "an unauthenticated request must not flip the ICE role"
+    );
+    assert!(
+        agent
+            .candidate_pairs
+            .iter()
+            .all(|pair| pair.ice_role_controlling),
+        "pair roles must be unchanged"
+    );
+
+    agent.close()?;
+    Ok(())
+}
+
+/// Consent freshness (RFC 7675) is kept only by authenticated STUN. Non-STUN datagrams from
+/// the remote's address (which anyone can spoof) must not keep a pair whose peer stopped
+/// answering consent checks from failing.
+#[test]
+fn test_unauthenticated_traffic_does_not_refresh_consent() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+
+    let mut a = Agent::new(
+        t(0),
+        Arc::new(AgentConfig::default()),
+        test_crypto_provider(),
+    )?;
+    let local_addr = SocketAddr::from_str("192.168.0.2:1000")?;
+    let remote_addr = SocketAddr::from_str("1.2.3.4:12340")?;
+    a.add_local_candidate(
+        CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_owned(),
+                address: local_addr.ip().to_string(),
+                port: local_addr.port(),
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    )?;
+    a.add_remote_candidate(
+        CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_owned(),
+                address: remote_addr.ip().to_string(),
+                port: remote_addr.port(),
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    )?;
+    a.add_pair(0, 0);
+    a.set_selected_pair(Some(t(1)), Some(0));
+
+    let transport = TransportContext {
+        local_addr,
+        peer_addr: remote_addr,
+        ecn: None,
+        transport_protocol: TransportProtocol::UDP,
+    };
+    for secs in 2..60 {
+        // A spoofed media/DTLS datagram every second, and nothing authenticated.
+        // (Once the pair fails the agent forgets its candidates, so the traffic is refused.)
+        let _ = a.is_valid_non_stun_traffic(t(secs), transport);
+        a.validate_selected_pair(t(secs));
+    }
+    assert_eq!(
+        a.connection_state,
+        ConnectionState::Failed,
+        "unauthenticated traffic kept consent alive"
+    );
+    Ok(())
+}
+
+/// The remote candidate list is bounded.
+#[test]
+fn test_remote_candidates_are_capped() -> Result<()> {
+    let mut a = Agent::new(
+        Instant::now(),
+        Arc::new(AgentConfig::default()),
+        test_crypto_provider(),
+    )?;
+    for i in 0..(MAX_REMOTE_CANDIDATES as u16 + 50) {
+        let c = CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "udp".to_owned(),
+                address: "10.0.0.1".to_owned(),
+                port: 1000 + i,
+                component: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?;
+        let _ = a.add_remote_candidate(c);
+    }
+    assert_eq!(a.remote_candidates.len(), MAX_REMOTE_CANDIDATES);
+    Ok(())
+}

@@ -1791,3 +1791,66 @@ mod duplicate_report_test;
 
 #[path = "stream_scheduler_test.rs"]
 mod stream_scheduler_test;
+
+/// A FORWARD-TSN about 2^31 ahead of the cumulative TSN must be handled in time proportional
+/// to what is queued, not to the TSN distance (the old loop stepped one TSN at a time).
+#[test]
+fn test_handle_forward_tsn_far_ahead_is_bounded() -> Result<()> {
+    let mut a = Association::default();
+    a.use_forward_tsn = true;
+    let target = a.peer_last_tsn.wrapping_add((1u32 << 31) - 1);
+    let fwdtsn = ChunkForwardTsn {
+        new_cumulative_tsn: target,
+        streams: vec![],
+    };
+    let start = std::time::Instant::now();
+    a.handle_forward_tsn(&fwdtsn)?;
+    assert_eq!(a.peer_last_tsn, target);
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "FORWARD-TSN processing took {:?}",
+        start.elapsed()
+    );
+    Ok(())
+}
+
+/// A SACK whose cumulative TSN acknowledges DATA this side never sent is ignored.
+#[test]
+fn test_handle_sack_beyond_sent_tsns_is_ignored() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    a.set_state(AssociationState::Established);
+    let before = a.cumulative_tsn_ack_point;
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: a.my_next_tsn.wrapping_add(1_000_000),
+        advertised_receiver_window_credit: 65535,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+    a.handle_sack(&sack, Instant::now())?;
+    assert_eq!(
+        a.cumulative_tsn_ack_point, before,
+        "a SACK for never-sent DATA must not move the ack point"
+    );
+    Ok(())
+}
+
+/// DATA on a stream id past the negotiated inbound stream count creates no stream.
+#[test]
+fn test_handle_data_beyond_stream_limit_is_discarded() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    a.my_max_num_inbound_streams = 16;
+    let d = ChunkPayloadData {
+        tsn: a.peer_last_tsn.wrapping_add(1),
+        stream_identifier: 1000,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"x"),
+        ..Default::default()
+    };
+    a.handle_data(&d)?;
+    assert!(
+        !a.streams.contains_key(&1000),
+        "a stream past the negotiated limit was created"
+    );
+    Ok(())
+}

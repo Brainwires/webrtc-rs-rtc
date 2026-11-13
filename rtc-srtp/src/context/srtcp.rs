@@ -28,7 +28,10 @@ impl Context {
         let index = self.cipher.get_rtcp_index(encrypted);
         let ssrc = u32::from_be_bytes([encrypted[4], encrypted[5], encrypted[6], encrypted[7]]);
 
-        if let Some(replay_detector) = &mut self.get_srtcp_ssrc_state(ssrc).replay_detector
+        // Per-SSRC state is created only once a packet for that SSRC authenticates, so packets
+        // under made-up SSRCs cannot grow the state map.
+        if let Some(state) = self.srtcp_ssrc_states.get_mut(&ssrc)
+            && let Some(replay_detector) = &mut state.replay_detector
             && !replay_detector.check(index as u64)
         {
             return Err(Error::SrtcpSsrcDuplicated(ssrc, index));
@@ -36,8 +39,12 @@ impl Context {
 
         let dst = self.cipher.decrypt_rtcp(encrypted, index, ssrc)?;
 
+        let is_new = !self.srtcp_ssrc_states.contains_key(&ssrc);
         if let Some(replay_detector) = &mut self.get_srtcp_ssrc_state(ssrc).replay_detector {
-            replay_detector.accept();
+            // A new SSRC's detector has not seen this index yet: check, then accept.
+            if !is_new || replay_detector.check(index as u64) {
+                replay_detector.accept();
+            }
         }
 
         Ok(dst)

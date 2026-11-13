@@ -232,3 +232,17 @@ path = "fuzz_targets/param_param_unknown_unmarshal.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "packet_unmarshal_fixed_checksum"
+path = "fuzz_targets/packet_unmarshal_fixed_checksum.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "endpoint_handle_datagrams"
+path = "fuzz_targets/endpoint_handle_datagrams.rs"
+test = false
+doc = false
+bench = false

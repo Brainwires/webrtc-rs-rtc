@@ -38,6 +38,10 @@ pub const FILLER_NALU_TYPE: u8 = 12;
 
 /// Bytes of FU-A header prefixed to each fragment.
 pub const FUA_HEADER_SIZE: usize = 2;
+
+/// Largest NAL unit reassembled from FU-A fragments. Far above any real slice (a 4K intra frame
+/// is a few hundred KiB); a reassembly that would grow past it is dropped.
+pub const MAX_FUA_NALU_SIZE: usize = 4 * 1024 * 1024;
 /// Bytes of STAP-A header prefixed to an aggregate.
 pub const STAPA_HEADER_SIZE: usize = 1;
 /// Bytes of length prefix before each NAL unit inside a STAP-A.
@@ -357,12 +361,23 @@ impl Depacketizer for H264Packet {
                     return Err(Error::ErrShortPacket);
                 }
 
-                if packet[1] & FU_START_BITMASK != 0 || self.fua_buffer.is_none() {
+                if packet[1] & FU_START_BITMASK != 0 {
                     self.fua_buffer = Some(BytesMut::new());
+                } else if self.fua_buffer.is_none() {
+                    // A fragment whose start was lost cannot be reassembled into a NAL unit;
+                    // drop it rather than splice it onto nothing.
+                    return Ok(Bytes::new());
                 }
 
                 if let Some(fua_buffer) = &mut self.fua_buffer {
-                    fua_buffer.put(&*packet.slice(FUA_HEADER_SIZE..));
+                    let fragment = &packet[FUA_HEADER_SIZE..];
+                    if fua_buffer.len() + fragment.len() > MAX_FUA_NALU_SIZE {
+                        // Bounded: a peer that never sends the end fragment must not grow this
+                        // without limit. Drop the partial NAL unit.
+                        self.fua_buffer = None;
+                        return Err(Error::ErrShortPacket);
+                    }
+                    fua_buffer.put(fragment);
                 }
 
                 let b1 = packet[1];

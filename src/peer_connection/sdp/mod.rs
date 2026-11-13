@@ -1395,15 +1395,34 @@ pub(crate) fn get_peer_direction(media: &MediaDescription) -> RTCRtpTransceiverD
 }
 
 pub(crate) fn extract_fingerprint(desc: &SessionDescription) -> Result<(String, String)> {
+    // A section may carry several `a=fingerprint` lines (RFC 8122 §5), one per hash function.
+    // From each level take the sha-256 one — the algorithm DTLS verification uses — if there is
+    // one, else the first: picking the first alone rejected a peer whose first line was, say,
+    // sha-384, even though it also offered sha-256.
+    let pick = |attributes: &[sdp::description::common::Attribute]| -> Option<String> {
+        let values: Vec<&str> = attributes
+            .iter()
+            .filter(|a| a.key == "fingerprint")
+            .filter_map(|a| a.value.as_deref())
+            .collect();
+        values
+            .iter()
+            .find(|v| {
+                v.split(' ')
+                    .next()
+                    .is_some_and(|alg| alg.eq_ignore_ascii_case("sha-256"))
+            })
+            .or_else(|| values.first())
+            .map(|v| (*v).to_owned())
+    };
+
     let mut fingerprints = vec![];
-
-    if let Some(fingerprint) = desc.attribute("fingerprint") {
-        fingerprints.push(fingerprint.clone());
+    if let Some(fingerprint) = pick(&desc.attributes) {
+        fingerprints.push(fingerprint);
     }
-
     for m in &desc.media_descriptions {
-        if let Some(fingerprint) = m.attribute("fingerprint").and_then(|o| o) {
-            fingerprints.push(fingerprint.to_owned());
+        if let Some(fingerprint) = pick(&m.attributes) {
+            fingerprints.push(fingerprint);
         }
     }
 
@@ -1778,4 +1797,36 @@ pub(crate) fn has_ice_trickle_option(desc: &SessionDescription) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use sdp::description::common::Attribute;
+    use sdp::description::media::MediaDescription;
+
+    /// With several `a=fingerprint` lines, the sha-256 one is used even when it is not the first.
+    #[test]
+    fn test_extract_fingerprint_prefers_sha256() -> Result<()> {
+        let s = SessionDescription {
+            media_descriptions: vec![MediaDescription {
+                attributes: vec![
+                    Attribute {
+                        key: "fingerprint".to_owned(),
+                        value: Some("sha-384 AA:BB".to_owned()),
+                    },
+                    Attribute {
+                        key: "fingerprint".to_owned(),
+                        value: Some("sha-256 CC:DD".to_owned()),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (fingerprint, hash) = extract_fingerprint(&s)?;
+        assert_eq!(hash, "sha-256");
+        assert_eq!(fingerprint, "CC:DD");
+        Ok(())
+    }
 }

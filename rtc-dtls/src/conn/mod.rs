@@ -45,6 +45,9 @@ pub(crate) const DEFAULT_NAMED_CURVE: NamedCurve = NamedCurve::X25519;
 pub(crate) const INBOUND_BUFFER_SIZE: usize = 8192;
 // Default replay protection window is specified by RFC 6347 Section 4.1.2.6
 pub(crate) const DEFAULT_REPLAY_PROTECTION_WINDOW: usize = 64;
+/// Most not-yet-decryptable records held for later (next epoch / cipher suite not ready).
+/// A flight needs only a few; the rest are unauthenticated until decrypted.
+pub(crate) const MAX_EARLY_ENCRYPTED_PACKETS: usize = 64;
 /// How many times a handshake flight may be retransmitted before the handshake fails.
 ///
 /// Zero means "no retries at all": the first firing of the retransmit timer ends the handshake,
@@ -579,6 +582,21 @@ impl DTLSConn {
         Ok(is_handshake)
     }
 
+    /// Holds a record that arrived before it can be decrypted (next epoch, cipher suite not ready
+    /// yet). The queue is bounded: these records are unauthenticated until decrypted, so past
+    /// [`MAX_EARLY_ENCRYPTED_PACKETS`] the newest is dropped, as a lost datagram would be.
+    fn enqueue_early_encrypted(&mut self, pkt: Vec<u8>) {
+        if self.incoming_encrypted_packets.len() >= MAX_EARLY_ENCRYPTED_PACKETS {
+            debug!(
+                "{}: early encrypted queue full ({}), dropping packet",
+                srv_cli_str(self.is_client),
+                MAX_EARLY_ENCRYPTED_PACKETS
+            );
+            return;
+        }
+        self.incoming_encrypted_packets.push_back(pkt);
+    }
+
     fn handle_incoming_packet(
         &mut self,
         mut pkt: Vec<u8>,
@@ -618,7 +636,7 @@ impl DTLSConn {
                     "{}: received packet of next epoch, queuing packet",
                     srv_cli_str(self.is_client)
                 );
-                self.incoming_encrypted_packets.push_back(pkt);
+                self.enqueue_early_encrypted(pkt);
             }
             return (false, None, None);
         }
@@ -680,7 +698,7 @@ impl DTLSConn {
                         "{}: handshake not finished, queuing packet",
                         srv_cli_str(self.is_client)
                     );
-                    self.incoming_encrypted_packets.push_back(pkt);
+                    self.enqueue_early_encrypted(pkt);
                 }
                 return (false, None, None);
             }
@@ -825,7 +843,7 @@ impl DTLSConn {
                             "{}: CipherSuite not initialized, queuing packet",
                             srv_cli_str(self.is_client)
                         );
-                        self.incoming_encrypted_packets.push_back(pkt);
+                        self.enqueue_early_encrypted(pkt);
                     }
                     return (false, None, None);
                 }

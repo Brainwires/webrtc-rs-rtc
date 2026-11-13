@@ -172,3 +172,74 @@ fn test_fragment_buffer_overflow() -> Result<()> {
 
     Ok(())
 }
+
+/// One DTLS handshake record carrying `count` one-byte fragments of a message of `length` bytes,
+/// starting at `first_offset`.
+fn tiny_fragments_record(
+    message_sequence: u16,
+    length: u32,
+    first_offset: u32,
+    count: u32,
+) -> Vec<u8> {
+    let mut body = vec![];
+    for i in 0..count {
+        let offset = first_offset + i;
+        body.push(0x0b); // certificate
+        body.extend_from_slice(&length.to_be_bytes()[1..]);
+        body.extend_from_slice(&message_sequence.to_be_bytes());
+        body.extend_from_slice(&offset.to_be_bytes()[1..]);
+        body.extend_from_slice(&1u32.to_be_bytes()[1..]);
+        body.push(0xaa);
+    }
+    let mut record = vec![
+        0x16, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    record.extend_from_slice(&body);
+    record
+}
+
+/// A peer that splits one handshake message into very many one-byte fragments (one per record)
+/// must not make us buffer them all: the buffer used to grow without bound (and reassembly
+/// recursed once per fragment, so a long enough chain overflowed the stack).
+#[test]
+fn test_fragment_buffer_many_tiny_fragments_are_capped() -> Result<()> {
+    const LENGTH: u32 = 20_000;
+    let mut f = FragmentBuffer::new();
+    for offset in 0..LENGTH {
+        f.push(&tiny_fragments_record(0, LENGTH, offset, 1))?;
+    }
+    let buffered = f.cache.get(&0).map_or(0, |frags| frags.len());
+    assert!(
+        buffered <= MAX_FRAGMENTS_PER_MESSAGE,
+        "fragments past the per-message cap must be dropped ({buffered} buffered)"
+    );
+    // Incomplete (the cap dropped the rest), so nothing can be popped.
+    assert!(f.pop().is_err());
+    Ok(())
+}
+
+/// Reassembly is iterative: a message of the most fragments the cap allows reassembles.
+#[test]
+fn test_fragment_buffer_reassembles_a_message_at_the_fragment_cap() -> Result<()> {
+    let length = MAX_FRAGMENTS_PER_MESSAGE as u32;
+    let mut f = FragmentBuffer::new();
+    for offset in 0..length {
+        f.push(&tiny_fragments_record(0, length, offset, 1))?;
+    }
+    let (message, _) = f.pop()?;
+    assert_eq!(message.len(), 12 + length as usize);
+    Ok(())
+}
+
+/// Fragments for more distinct message sequences than a flight can hold are dropped.
+#[test]
+fn test_fragment_buffer_caps_buffered_messages() -> Result<()> {
+    let mut f = FragmentBuffer::new();
+    for seq in 0..(MAX_BUFFERED_MESSAGES as u16 + 8) {
+        // Two-byte messages, first byte only: never complete.
+        f.push(&tiny_fragments_record(seq, 2, 0, 1))?;
+    }
+    assert_eq!(f.cache.len(), MAX_BUFFERED_MESSAGES);
+    Ok(())
+}

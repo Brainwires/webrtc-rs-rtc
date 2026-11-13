@@ -1012,3 +1012,53 @@ fn test_an_error_reply_without_a_nonce_is_reported_under_the_id_allocate_returne
     }
     Ok(())
 }
+
+/// A Data indication (or ChannelData) that does not come from the TURN server is not relayed
+/// peer data: anyone could send one to the client's socket.
+#[test]
+fn test_data_from_a_non_server_address_is_ignored() -> Result<()> {
+    let (conn, mut client) = create_test_client_with_turn_server()?;
+    let local_addr = conn.local_addr()?;
+    let server_addr = client.turn_server_addr().expect("configured");
+    let stray: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    assert_ne!(stray, server_addr);
+
+    let indication = |from: SocketAddr| -> Result<TransportMessage<BytesMut>> {
+        let mut msg = Message::new();
+        msg.build(&[
+            Box::new(MessageType::new(METHOD_DATA, CLASS_INDICATION)),
+            Box::new(TransactionId::new()),
+            Box::new(PeerAddress {
+                ip: "10.0.0.1".parse().unwrap(),
+                port: 5000,
+            }),
+            Box::new(Data(b"hello".to_vec())),
+        ])?;
+        Ok(TransportMessage {
+            now: Instant::now(),
+            transport: TransportContext {
+                local_addr,
+                peer_addr: from,
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: BytesMut::from(&msg.raw[..]),
+        })
+    };
+
+    client.handle_read(indication(stray)?)?;
+    assert!(
+        client.poll_event().is_none(),
+        "a Data indication from a stray address was delivered as relayed data"
+    );
+
+    client.handle_read(indication(server_addr)?)?;
+    assert!(
+        matches!(
+            client.poll_event(),
+            Some(Event::DataIndicationOrChannelData(..))
+        ),
+        "a Data indication from the TURN server is still delivered"
+    );
+    client.close()
+}

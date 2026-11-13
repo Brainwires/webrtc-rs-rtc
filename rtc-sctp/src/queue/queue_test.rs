@@ -1172,3 +1172,25 @@ fn test_message_index_survives_cumulative_prefix_and_tsn_wrap() {
     assert!(queue.message_tsns(MessageId::new(11).unwrap()).is_empty());
     assert_eq!(vec![1], queue.message_tsns(MessageId::new(12).unwrap()));
 }
+
+/// DATA too far past the cumulative TSN to be reported in a SACK gap block is refused.
+#[test]
+fn test_payload_queue_refuses_tsns_beyond_the_receive_window() {
+    let pq = PayloadQueue::new();
+    let cumulative_tsn = 1000u32;
+    let near = ChunkPayloadData {
+        tsn: cumulative_tsn + MAX_RECEIVE_TSN_WINDOW,
+        ..Default::default()
+    };
+    let far = ChunkPayloadData {
+        tsn: cumulative_tsn + MAX_RECEIVE_TSN_WINDOW + 1,
+        ..Default::default()
+    };
+    let very_far = ChunkPayloadData {
+        tsn: cumulative_tsn.wrapping_add((1u32 << 31) - 1),
+        ..Default::default()
+    };
+    assert!(pq.can_push(&near, cumulative_tsn));
+    assert!(!pq.can_push(&far, cumulative_tsn));
+    assert!(!pq.can_push(&very_far, cumulative_tsn));
+}

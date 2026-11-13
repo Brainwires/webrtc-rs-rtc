@@ -2706,3 +2706,29 @@ fn test_old_epoch_alert_honoured_until_handshake_completes() {
         "a discarded alert was answered"
     );
 }
+
+/// The queue of records that arrive before they can be decrypted is bounded: an unauthenticated
+/// sender must not be able to make it grow without limit during the handshake.
+#[test]
+fn test_early_encrypted_queue_is_bounded() {
+    let config = Arc::new(HandshakeConfig::new(
+        crypto::default_provider().expect("a built-in crypto provider is enabled for tests"),
+    ));
+    let mut conn = DTLSConn::new(config, false, None);
+    for sequence in 0..(MAX_EARLY_ENCRYPTED_PACKETS as u8 + 50) {
+        let datagram = vec![
+            0x16, // content_type: Handshake
+            0xfe, 0xfd, // protocol_version: DTLS 1.2
+            0x00, 0x01, // epoch: 1 (one ahead of remote_epoch=0)
+            0x00, 0x00, 0x00, 0x00, 0x00, sequence, // sequence_number
+            0x00, 0x01, // content_len: 1
+            0x00, // payload
+        ];
+        let _ = conn.read(&datagram);
+    }
+    assert_eq!(
+        conn.incoming_encrypted_packets.len(),
+        MAX_EARLY_ENCRYPTED_PACKETS,
+        "the early encrypted queue must stop growing at its cap"
+    );
+}

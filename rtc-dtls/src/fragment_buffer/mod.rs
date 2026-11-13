@@ -12,6 +12,15 @@ use std::io::{BufWriter, Cursor};
 // 2 mb max buffer size
 const FRAGMENT_BUFFER_MAX_SIZE: usize = 2_000_000;
 
+/// Most fragments one handshake message may arrive in. A peer fragments at its path MTU, so
+/// even a large certificate chain needs a few dozen; anything past this is dropped rather than
+/// buffered, so a stream of tiny fragments cannot grow the reassembly work without bound.
+pub(crate) const MAX_FRAGMENTS_PER_MESSAGE: usize = 256;
+
+/// Most handshake messages buffered at once, counted by message sequence. A flight holds a
+/// handful; fragments for further sequence numbers are dropped until earlier ones are popped.
+pub(crate) const MAX_BUFFERED_MESSAGES: usize = 32;
+
 pub(crate) struct Fragment {
     record_layer_header: RecordLayerHeader,
     handshake_header: HandshakeHeader,
@@ -58,9 +67,15 @@ impl FragmentBuffer {
             let mut reader = Cursor::new(buf);
             let handshake_header = HandshakeHeader::unmarshal(&mut reader)?;
 
-            self.cache
-                .entry(handshake_header.message_sequence)
-                .or_default();
+            // Bound what an unauthenticated sender can make us hold: drop (rather than fail on)
+            // fragments past the per-message and per-buffer caps, so spoofed records cannot
+            // tear the handshake down either.
+            let at_message_cap = !self.cache.contains_key(&handshake_header.message_sequence)
+                && self.cache.len() >= MAX_BUFFERED_MESSAGES;
+            let at_fragment_cap = self
+                .cache
+                .get(&handshake_header.message_sequence)
+                .is_some_and(|frags| frags.len() >= MAX_FRAGMENTS_PER_MESSAGE);
 
             // end index should be the length of handshake header but if the handshake
             // was fragmented, we should keep them all
@@ -69,15 +84,17 @@ impl FragmentBuffer {
                 end = buf.len();
             }
 
-            // Discard all headers, when rebuilding the packet we will re-build
-            let data = buf[HANDSHAKE_HEADER_LENGTH..end].to_vec();
-
-            if let Some(x) = self.cache.get_mut(&handshake_header.message_sequence) {
-                x.push(Fragment {
-                    record_layer_header,
-                    handshake_header,
-                    data,
-                });
+            if !(at_message_cap || at_fragment_cap) {
+                // Discard all headers, when rebuilding the packet we will re-build
+                let data = buf[HANDSHAKE_HEADER_LENGTH..end].to_vec();
+                self.cache
+                    .entry(handshake_header.message_sequence)
+                    .or_default()
+                    .push(Fragment {
+                        record_layer_header,
+                        handshake_header,
+                        data,
+                    });
             }
             buf = &buf[end..];
         }
@@ -92,11 +109,9 @@ impl FragmentBuffer {
         }
 
         let (content, epoch) = if let Some(frags) = self.cache.get_mut(&seq_num) {
-            let mut raw_message = vec![];
-            // Recursively collect up
-            if !append_message(0, frags, &mut raw_message) {
+            let Some(raw_message) = assemble_message(frags) else {
                 return Err(Error::ErrEmptyFragment);
-            }
+            };
 
             let mut first_header = frags[0].handshake_header;
             first_header.fragment_offset = 0;
@@ -133,28 +148,35 @@ impl FragmentBuffer {
     }
 }
 
-fn append_message(target_offset: u32, frags: &[Fragment], raw_message: &mut Vec<u8>) -> bool {
+/// Reassembles one handshake message from its fragments: start at offset 0 and follow each
+/// fragment's end to the next, until the message length is reached (or a zero-length fragment
+/// ends it). The first fragment buffered for an offset wins, as before.
+///
+/// Iterative: the previous recursive version used one stack frame per fragment, so a peer that
+/// sent enough tiny fragments could overflow the stack and abort the process.
+fn assemble_message(frags: &[Fragment]) -> Option<Vec<u8>> {
+    let mut by_offset: HashMap<u32, &Fragment> = HashMap::with_capacity(frags.len());
     for f in frags {
-        if f.handshake_header.fragment_offset == target_offset {
-            let fragment_end =
-                f.handshake_header.fragment_offset + f.handshake_header.fragment_length;
-
-            // NB: Order here is important, the `f.handshake_header.fragment_length != 0`
-            // MUST come before the recursive call.
-            if fragment_end != f.handshake_header.length
-                && f.handshake_header.fragment_length != 0
-                && !append_message(fragment_end, frags, raw_message)
-            {
-                return false;
-            }
-
-            let mut message = vec![];
-            message.extend_from_slice(&f.data);
-            message.extend_from_slice(raw_message);
-            *raw_message = message;
-            return true;
-        }
+        by_offset
+            .entry(f.handshake_header.fragment_offset)
+            .or_insert(f);
     }
 
-    false
+    let mut raw_message = vec![];
+    let mut target_offset = 0u32;
+    // Each step consumes a distinct offset, so this ends within `frags.len()` steps even if
+    // fragment lengths point back at an offset already visited.
+    for _ in 0..frags.len() {
+        let f = by_offset.remove(&target_offset)?;
+        raw_message.extend_from_slice(&f.data);
+        let fragment_end = f
+            .handshake_header
+            .fragment_offset
+            .checked_add(f.handshake_header.fragment_length)?;
+        if fragment_end == f.handshake_header.length || f.handshake_header.fragment_length == 0 {
+            return Some(raw_message);
+        }
+        target_offset = fragment_end;
+    }
+    None
 }

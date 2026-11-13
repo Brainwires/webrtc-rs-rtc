@@ -414,3 +414,33 @@ fn test_h264_emit_single_or_fragment_empty_nalu() {
     H264Payloader::emit_single_or_fragment(&nalu, 10, &mut payloads);
     assert!(payloads.is_empty(), "empty NALU should produce no packets");
 }
+
+/// FU-A reassembly is bounded: a stream of start + middle fragments with no end stops being
+/// buffered at `MAX_FUA_NALU_SIZE`, and a fragment whose start was lost is dropped.
+#[test]
+fn test_h264_fua_reassembly_is_bounded_and_needs_a_start() -> Result<()> {
+    let mut pck = H264Packet::default();
+    let chunk = vec![0xaa; 60_000];
+    let fragment = |header: u8| {
+        let mut p = vec![FUA_NALU_TYPE, header];
+        p.extend_from_slice(&chunk);
+        Bytes::from(p)
+    };
+
+    // A middle fragment with no start before it is dropped.
+    assert!(pck.depacketize(&fragment(0x05))?.is_empty());
+    assert!(pck.fua_buffer.is_none());
+
+    // Start, then middles until well past the cap: the buffer never exceeds it.
+    pck.depacketize(&fragment(FU_START_BITMASK | 0x05))?;
+    for _ in 0..((MAX_FUA_NALU_SIZE / chunk.len()) + 10) {
+        let _ = pck.depacketize(&fragment(0x05));
+        assert!(
+            pck.fua_buffer
+                .as_ref()
+                .is_none_or(|b| b.len() <= MAX_FUA_NALU_SIZE),
+            "FU-A buffer grew past its cap"
+        );
+    }
+    Ok(())
+}

@@ -26,22 +26,40 @@ impl Context {
             return Err(Error::ErrTooShortRtp);
         }
 
-        let state = self.get_srtp_ssrc_state(header.ssrc);
-        let (roc, diff, _) = state.next_rollover_count(header.sequence_number);
-        if let Some(replay_detector) = &mut state.replay_detector
-            && !replay_detector.check(header.sequence_number as u64)
-        {
-            return Err(Error::SrtpSsrcDuplicated(
-                header.ssrc,
-                header.sequence_number,
-            ));
-        }
+        // Per-SSRC state is created only once a packet for that SSRC authenticates, so packets
+        // under made-up SSRCs cannot grow the state map.
+        let (roc, diff) = match self.srtp_ssrc_states.get_mut(&header.ssrc) {
+            Some(state) => {
+                let (roc, diff, _) = state.next_rollover_count(header.sequence_number);
+                if let Some(replay_detector) = &mut state.replay_detector
+                    && !replay_detector.check(header.sequence_number as u64)
+                {
+                    return Err(Error::SrtpSsrcDuplicated(
+                        header.ssrc,
+                        header.sequence_number,
+                    ));
+                }
+                (roc, diff)
+            }
+            None => {
+                let fresh = SrtpSsrcState {
+                    ssrc: header.ssrc,
+                    ..Default::default()
+                };
+                let (roc, diff, _) = fresh.next_rollover_count(header.sequence_number);
+                (roc, diff)
+            }
+        };
 
         let dst = self.cipher.decrypt_rtp(encrypted, header, roc)?;
         {
+            let is_new = !self.srtp_ssrc_states.contains_key(&header.ssrc);
             let state = self.get_srtp_ssrc_state(header.ssrc);
             if let Some(replay_detector) = &mut state.replay_detector {
-                replay_detector.accept();
+                // A new SSRC's detector has not seen this sequence number yet: check, then accept.
+                if !is_new || replay_detector.check(header.sequence_number as u64) {
+                    replay_detector.accept();
+                }
             }
             state.update_rollover_count(header.sequence_number, diff);
         }
