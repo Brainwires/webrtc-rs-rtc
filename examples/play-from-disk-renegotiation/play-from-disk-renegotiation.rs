@@ -2,8 +2,8 @@ use anyhow::Result;
 use bytes::BytesMut;
 use clap::Parser;
 use env_logger::Target;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use log::{debug, error, trace};
 use rtc::interceptor::Registry;
 use rtc::media::io::ivf_reader::IVFReader;
@@ -30,6 +30,7 @@ use rtc::rtp_transceiver::{RTCRtpSenderId, SSRC};
 use rtc::sansio::Protocol;
 use rtc::shared::error::Error;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use signal::http::{Body, BodyExt, Incoming};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
@@ -44,7 +45,6 @@ use tokio::sync::{
     Notify,
     mpsc::{Receiver, Sender, channel},
 };
-use tokio_util::codec::{BytesCodec, FramedRead};
 
 const DEFAULT_TIMEOUT_DURATION: Duration = Duration::from_secs(86400); // 1 day duration
 const RTP_OUTBOUND_MTU: usize = 1200;
@@ -82,12 +82,9 @@ fn not_found() -> Response<Body> {
 }
 
 async fn simple_file_send(filename: &str) -> Result<Response<Body>, hyper::Error> {
-    // Serve a file by asynchronously reading it by chunks using tokio-util crate.
-
-    if let Ok(file) = tokio::fs::File::open(filename).await {
-        let stream = FramedRead::new(file, BytesCodec::new());
-        let body = Body::wrap_stream(stream);
-        return Ok(Response::new(body));
+    // The demo pages are small: read the whole file.
+    if let Ok(content) = tokio::fs::read(filename).await {
+        return Ok(Response::new(Body::from(content)));
     }
 
     Ok(not_found())
@@ -95,7 +92,7 @@ async fn simple_file_send(filename: &str) -> Result<Response<Body>, hyper::Error
 
 // HTTP Listener to get ICE Credentials/Candidate from remote Peer
 async fn remote_handler(
-    req: Request<Body>,
+    req: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Body>, hyper::Error> {
     match (req.method(), req.uri().path()) {
@@ -119,10 +116,10 @@ async fn remote_handler(
 // do_signaling exchanges all state of the local PeerConnection and is called
 // every time a video is added or removed
 async fn do_signaling(
-    req: Request<Body>,
+    req: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Body>, hyper::Error> {
-    let sdp_str = match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?) {
+    let sdp_str = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes()) {
         Ok(s) => s.to_owned(),
         Err(err) => panic!("{}", err),
     };
@@ -186,7 +183,7 @@ async fn do_signaling(
 
 // Create peer connection
 async fn create_peer_connection(
-    r: Request<Body>,
+    r: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Body>, hyper::Error> {
     println!("PeerConnection has been created");
@@ -194,7 +191,10 @@ async fn create_peer_connection(
 }
 
 // Add a single video track
-async fn add_video(r: Request<Body>, state: Arc<AppState>) -> Result<Response<Body>, hyper::Error> {
+async fn add_video(
+    r: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<Body>, hyper::Error> {
     // Generate a new SSRC for this track
     let ssrc = rand::random::<u32>();
 
@@ -275,7 +275,7 @@ async fn add_video(r: Request<Body>, state: Arc<AppState>) -> Result<Response<Bo
 
 // Remove a single sender
 async fn remove_video(
-    r: Request<Body>,
+    r: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Body>, hyper::Error> {
     // Send command to remove track
@@ -501,13 +501,11 @@ async fn run(
         println!("Open http://localhost:8080 to access this demo");
 
         let addr = SocketAddr::from_str("0.0.0.0:8080").unwrap();
-        let service = make_service_fn(move |_| {
+        let service = {
             let state = app_state_clone.clone();
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |req| remote_handler(req, state.clone())))
-            }
-        });
-        let server = Server::bind(&addr).serve(service);
+            service_fn(move |req| remote_handler(req, state.clone()))
+        };
+        let server = signal::http::serve(addr, service);
         if let Err(e) = server.await {
             eprintln!("server error: {e}");
         }

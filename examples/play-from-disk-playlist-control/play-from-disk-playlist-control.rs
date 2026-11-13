@@ -19,8 +19,8 @@ use anyhow::Result;
 use bytes::BytesMut;
 use clap::Parser;
 use env_logger::Target;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use log::{debug, error, trace};
 use rtc::data_channel::RTCDataChannelId;
 use rtc::interceptor::Registry;
@@ -51,6 +51,7 @@ use rtc::rtp_transceiver::{RTCRtpSenderId, SSRC};
 use rtc::sansio::Protocol;
 use rtc::shared::error::Error;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use signal::http::{Body, BodyExt, Incoming};
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
 use std::str::FromStr;
@@ -352,17 +353,15 @@ fn page_duration(header: &OggHeader, granule: u64, last: u64) -> Duration {
 async fn run_http_server(addr: &str, whep_tx: Sender<WhepRequest>) -> Result<()> {
     let addr: SocketAddr = addr.parse()?;
 
-    let make_svc = make_service_fn(move |_conn| {
+    let make_svc = {
         let whep_tx = whep_tx.clone();
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                let whep_tx = whep_tx.clone();
-                async move { handle_request(req, whep_tx).await }
-            }))
-        }
-    });
+        service_fn(move |req| {
+            let whep_tx = whep_tx.clone();
+            async move { handle_request(req, whep_tx).await }
+        })
+    };
 
-    let server = Server::bind(&addr).serve(make_svc);
+    let server = signal::http::serve(addr, make_svc);
     server.await?;
 
     Ok(())
@@ -370,12 +369,12 @@ async fn run_http_server(addr: &str, whep_tx: Sender<WhepRequest>) -> Result<()>
 
 /// Handle HTTP requests
 async fn handle_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     whep_tx: Sender<WhepRequest>,
 ) -> Result<Response<Body>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/whep") => {
-            let body = hyper::body::to_bytes(req.into_body()).await?;
+            let body = req.into_body().collect().await?.to_bytes();
             let offer_sdp = String::from_utf8_lossy(&body).to_string();
 
             if offer_sdp.trim().is_empty() {

@@ -8,8 +8,8 @@
 
 use anyhow::Result;
 use bytes::BytesMut;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use log::{error, info, trace};
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::event::RTCDataChannelEvent;
@@ -22,6 +22,7 @@ use rtc::peer_connection::transport::{RTCIceCandidateInit, RTCIceServer};
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use signal::http::{Body, BodyExt, Incoming};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,14 +63,12 @@ async fn main() -> Result<()> {
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let make_svc = make_service_fn(move |_| {
+        let make_svc = {
             let state = state_clone.clone();
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |req| handle_request(req, state.clone())))
-            }
-        });
+            service_fn(move |req| handle_request(req, state.clone()))
+        };
 
-        let server = Server::bind(&addr).serve(make_svc);
+        let server = signal::http::serve(addr, make_svc);
         if let Err(e) = server.await {
             error!("HTTP server error: {}", e);
         }
@@ -81,7 +80,7 @@ async fn main() -> Result<()> {
 
 /// Handle HTTP requests
 async fn handle_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     state: Arc<Mutex<AppState>>,
 ) -> Result<Response<Body>, hyper::Error> {
     match (req.method(), req.uri().path()) {
@@ -93,7 +92,7 @@ async fn handle_request(
 
         // Handle SDP offer
         (&Method::POST, "/offer") => {
-            let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
+            let body_bytes = req.into_body().collect().await?.to_bytes();
             let body_str = String::from_utf8_lossy(&body_bytes);
 
             let offer: RTCSessionDescription = match serde_json::from_str(&body_str) {
@@ -142,7 +141,7 @@ async fn handle_request(
 
         // Handle ICE candidate
         (&Method::POST, "/candidate") => {
-            let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
+            let body_bytes = req.into_body().collect().await?.to_bytes();
             let body_str = String::from_utf8_lossy(&body_bytes);
 
             let candidate: RTCIceCandidateInit = match serde_json::from_str(&body_str) {
@@ -165,7 +164,7 @@ async fn handle_request(
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
-                .body(Body::empty())
+                .body(signal::http::empty())
                 .unwrap())
         }
 

@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::BytesMut;
 use clap::Parser;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use log::error;
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use signal::http::{Body, BodyExt, Incoming};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -55,27 +56,27 @@ async fn signal_candidate(addr: &str, c: &RTCIceCandidateInit) -> Result<()> {
         .header("content-type", "application/json; charset=utf-8")
         .body(Body::from(payload))?;
 
-    let _ = Client::new().request(req).await?;
+    let _ = signal::http::request(req).await?;
     Ok(())
 }
 
 // HTTP Listener to get ICE Credentials/Candidate from remote Peer
 async fn remote_handler(
-    req: Request<Body>,
+    req: Request<Incoming>,
     cmd_tx: mpsc::Sender<Command>,
 ) -> Result<Response<Body>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/candidate") => {
-            let candidate =
-                match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?) {
-                    Ok(s) => s.to_owned(),
-                    Err(e) => {
-                        eprintln!("Failed to parse candidate: {}", e);
-                        let mut response = Response::new(Body::from(format!("Bad Request: {}", e)));
-                        *response.status_mut() = StatusCode::BAD_REQUEST;
-                        return Ok(response);
-                    }
-                };
+            let candidate = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes())
+            {
+                Ok(s) => s.to_owned(),
+                Err(e) => {
+                    eprintln!("Failed to parse candidate: {}", e);
+                    let mut response = Response::new(Body::from(format!("Bad Request: {}", e)));
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
+                    return Ok(response);
+                }
+            };
 
             let _ = cmd_tx
                 .send(Command::AddIceCandidate(RTCIceCandidateInit {
@@ -84,14 +85,13 @@ async fn remote_handler(
                 }))
                 .await;
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(signal::http::empty());
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
 
         (&Method::POST, "/sdp") => {
-            let sdp_str = match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?)
-            {
+            let sdp_str = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes()) {
                 Ok(s) => s.to_owned(),
                 Err(e) => {
                     eprintln!("Failed to parse SDP: {}", e);
@@ -113,7 +113,7 @@ async fn remote_handler(
 
             let _ = cmd_tx.send(Command::SetRemoteDescription(sdp)).await;
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(signal::http::empty());
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
@@ -188,13 +188,11 @@ async fn main() -> Result<()> {
     println!("Listening on http://{answer_addr}");
     let http_server = tokio::spawn(async move {
         let addr = SocketAddr::from_str(&answer_addr).unwrap();
-        let make_svc = make_service_fn(move |_| {
+        let make_svc = {
             let cmd_tx = cmd_tx.clone();
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |req| remote_handler(req, cmd_tx.clone())))
-            }
-        });
-        let server = Server::bind(&addr).serve(make_svc);
+            service_fn(move |req| remote_handler(req, cmd_tx.clone()))
+        };
+        let server = signal::http::serve(addr, make_svc);
         if let Err(e) = server.await {
             eprintln!("server error: {e}");
         }
@@ -337,7 +335,7 @@ async fn main() -> Result<()> {
                                             }
                                         };
 
-                                        if let Err(e) = Client::new().request(req).await {
+                                        if let Err(e) = signal::http::request(req).await {
                                             eprintln!("Failed to send answer: {}", e);
                                         } else {
                                             println!("Answer sent successfully");

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::BytesMut;
 use clap::Parser;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use log::{error, info};
 use rtc::data_channel::RTCDataChannelId;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
@@ -32,6 +32,7 @@ use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use shared::tcp_framing::{TcpFrameDecoder, frame_packet};
+use signal::http::{Body, BodyExt, Incoming};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -71,25 +72,25 @@ async fn signal_candidate(addr: &str, c: &RTCIceCandidateInit) -> Result<()> {
         .header("content-type", "application/json; charset=utf-8")
         .body(Body::from(payload))?;
 
-    let _ = Client::new().request(req).await?;
+    let _ = signal::http::request(req).await?;
     Ok(())
 }
 
 async fn remote_handler(
-    req: Request<Body>,
+    req: Request<Incoming>,
     cmd_tx: mpsc::Sender<Command>,
 ) -> Result<Response<Body>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/candidate") => {
-            let candidate =
-                match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?) {
-                    Ok(s) => s.to_owned(),
-                    Err(e) => {
-                        let mut response = Response::new(Body::from(format!("Bad Request: {}", e)));
-                        *response.status_mut() = StatusCode::BAD_REQUEST;
-                        return Ok(response);
-                    }
-                };
+            let candidate = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes())
+            {
+                Ok(s) => s.to_owned(),
+                Err(e) => {
+                    let mut response = Response::new(Body::from(format!("Bad Request: {}", e)));
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
+                    return Ok(response);
+                }
+            };
 
             let _ = cmd_tx
                 .send(Command::AddIceCandidate(RTCIceCandidateInit {
@@ -98,14 +99,13 @@ async fn remote_handler(
                 }))
                 .await;
 
-            let mut response = Response::new(Body::empty());
+            let mut response = Response::new(signal::http::empty());
             *response.status_mut() = StatusCode::OK;
             Ok(response)
         }
 
         (&Method::POST, "/sdp") => {
-            let sdp_str = match std::str::from_utf8(&hyper::body::to_bytes(req.into_body()).await?)
-            {
+            let sdp_str = match std::str::from_utf8(&req.into_body().collect().await?.to_bytes()) {
                 Ok(s) => s.to_owned(),
                 Err(e) => {
                     let mut response = Response::new(Body::from(format!("Bad Request: {}", e)));
@@ -188,13 +188,11 @@ async fn main() -> Result<()> {
     println!("HTTP server listening on http://{}", cli.http_address);
     let http_addr = SocketAddr::from_str(&cli.http_address)?;
     tokio::spawn(async move {
-        let make_svc = make_service_fn(move |_| {
+        let make_svc = {
             let cmd_tx = cmd_tx.clone();
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |req| remote_handler(req, cmd_tx.clone())))
-            }
-        });
-        let server = Server::bind(&http_addr).serve(make_svc);
+            service_fn(move |req| remote_handler(req, cmd_tx.clone()))
+        };
+        let server = signal::http::serve(http_addr, make_svc);
         if let Err(e) = server.await {
             eprintln!("HTTP server error: {e}");
         }

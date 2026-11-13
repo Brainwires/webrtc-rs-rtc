@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::BytesMut;
 use clap::Parser;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use log::{error, info};
 use rtc::data_channel::RTCDataChannelId;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
@@ -36,6 +36,7 @@ use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use shared::tcp_framing::{TcpFrameDecoder, frame_packet};
+use signal::http::{Body, BodyExt, Incoming};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -106,18 +107,16 @@ async fn main() -> Result<()> {
 async fn run_http_server(signaling_tx: mpsc::Sender<SignalingMessage>) {
     let signaling_tx = Arc::new(signaling_tx);
 
-    let make_svc = make_service_fn(move |_| {
+    let make_svc = {
         let signaling_tx = Arc::clone(&signaling_tx);
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                let signaling_tx = Arc::clone(&signaling_tx);
-                async move { handle_http_request(req, signaling_tx).await }
-            }))
-        }
-    });
+        service_fn(move |req| {
+            let signaling_tx = Arc::clone(&signaling_tx);
+            async move { handle_http_request(req, signaling_tx).await }
+        })
+    };
 
     let addr = SocketAddr::from_str(&format!("0.0.0.0:{}", HTTP_PORT)).unwrap();
-    let server = Server::bind(&addr).serve(make_svc);
+    let server = signal::http::serve(addr, make_svc);
 
     if let Err(e) = server.await {
         eprintln!("HTTP server error: {}", e);
@@ -125,7 +124,7 @@ async fn run_http_server(signaling_tx: mpsc::Sender<SignalingMessage>) {
 }
 
 async fn handle_http_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     signaling_tx: Arc<mpsc::Sender<SignalingMessage>>,
 ) -> Result<Response<Body>, hyper::Error> {
     match (req.method(), req.uri().path()) {
@@ -143,7 +142,7 @@ async fn handle_http_request(
         }
         (&Method::POST, "/doSignaling") => {
             // Read request body
-            let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
+            let body_bytes = req.into_body().collect().await?.to_bytes();
             let offer: RTCSessionDescription = match serde_json::from_slice(&body_bytes) {
                 Ok(o) => o,
                 Err(e) => {

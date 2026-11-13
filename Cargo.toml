@@ -101,7 +101,10 @@ criterion = "0.8.2"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.17", features = ["codec"] }
 tokio-tungstenite = "0.28.0"
-hyper = { version = "0.14.28", features = ["full"] }
+# HTTP/1 only: the examples' signaling servers and clients. No `http2`, so no `h2`.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+http-body-util = "0.1"
 lazy_static = "1.4.0"
 hex = "0.4.3"
 crossbeam-channel = "0.5"
@@ -182,7 +185,6 @@ env_logger.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hyper.workspace = true
-tokio-util.workspace = true
 chrono.workspace = true
 log.workspace = true
 ctrlc.workspace = true
