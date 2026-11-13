@@ -40,6 +40,9 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
 - RTP: a header extension element that runs past the extension length its header declares is
   rejected. It used to be read out of the payload, and `Header::marshal_size` then exceeded the
   packet, so SRTP's AEAD cipher panicked splitting it (found by `context_decrypt`).
+- Data channels: a DCEP message of the internal threshold type (`0x00`) shorter than its body
+  is a parse error; one byte from the peer on any stream used to panic the receiver (found by
+  `data_channel_handle_dcep`).
 
 ### Fork features kept across the sync
 

@@ -53,6 +53,15 @@ impl Unmarshal for DataChannelThreshold {
         Self: Sized,
         B: Buf,
     {
+        // The type byte is already consumed; what remains comes from the peer, so check it
+        // holds the whole body before `get_*` (which panics on a short buffer).
+        let required = 1 + 4;
+        if buf.remaining() < required {
+            return Err(Error::UnexpectedEndOfBuffer {
+                expected: required,
+                actual: buf.remaining(),
+            });
+        }
         let t = buf.get_u8();
         let v = buf.get_u32();
         if t == 0 {

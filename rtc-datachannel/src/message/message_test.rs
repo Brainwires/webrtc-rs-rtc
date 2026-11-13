@@ -94,3 +94,19 @@ fn test_message_marshal() {
 
     assert_eq!(actual, expected);
 }
+
+/// Fuzz regression (`data_channel_handle_dcep`): a DCEP payload of the internal threshold type
+/// (0x00) shorter than its 5-byte body panicked in `get_u32` instead of failing to parse. Any
+/// peer could send it on any stream.
+#[test]
+fn test_short_threshold_message_is_an_error() {
+    for raw in [&[0x00][..], &[0x00, 0x01], &[0x00, 0x00, 0x00, 0x00, 0x00]] {
+        let mut buf = raw;
+        assert!(Message::unmarshal(&mut buf).is_err(), "{raw:?}");
+    }
+    let mut full: &[u8] = &[0x00, 0x01, 0x00, 0x00, 0x00, 0x07];
+    assert_eq!(
+        Message::unmarshal(&mut full).unwrap(),
+        Message::DataChannelThreshold(DataChannelThreshold::High(7))
+    );
+}
