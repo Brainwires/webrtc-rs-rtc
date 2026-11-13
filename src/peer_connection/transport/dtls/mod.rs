@@ -1,6 +1,7 @@
 use crate::peer_connection::certificate::RTCCertificate;
 use crate::peer_connection::configuration::setting_engine::ReplayProtection;
 use crate::peer_connection::transport::RTCTransportId;
+use crate::peer_connection::transport::dtls::fingerprint::RTCDtlsFingerprint;
 use crate::peer_connection::transport::dtls::parameters::RTCDtlsParameters;
 use crate::peer_connection::transport::dtls::role::{DEFAULT_DTLS_ROLE_ANSWER, RTCDtlsRole};
 use crate::peer_connection::transport::dtls::state::RTCDtlsTransportState;
@@ -20,6 +21,19 @@ pub(crate) mod fingerprint;
 pub(crate) mod parameters;
 pub(crate) mod role;
 pub(crate) mod state;
+
+/// Whether two remote fingerprint lists name the same certificates (order and hex case aside).
+fn same_fingerprints(a: &[RTCDtlsFingerprint], b: &[RTCDtlsFingerprint]) -> bool {
+    let normalize = |list: &[RTCDtlsFingerprint]| {
+        let mut v: Vec<(String, String)> = list
+            .iter()
+            .map(|fp| (fp.algorithm.to_lowercase(), fp.value.to_lowercase()))
+            .collect();
+        v.sort();
+        v
+    };
+    normalize(a) == normalize(b)
+}
 
 pub(crate) fn default_srtp_protection_profiles() -> Vec<SrtpProtectionProfile> {
     vec![
@@ -52,6 +66,10 @@ pub(crate) struct DtlsTransport {
     // dropped; only the derived fingerprint id survived, which cannot be turned back into a
     // certificate.
     pub(crate) remote_certificates: Vec<Vec<u8>>,
+
+    // The remote DTLS parameters (fingerprints, `setup` role) the current session was built
+    // for, so an ICE restart that leaves them unchanged keeps the session (Brainwires fork).
+    pub(crate) remote_dtls_parameters: Option<RTCDtlsParameters>,
 
     // From SettingEngine
     pub(crate) answering_dtls_role: RTCDtlsRole,
@@ -118,6 +136,7 @@ impl DtlsTransport {
             state: RTCDtlsTransportState::New,
             certificates,
             remote_certificates: vec![],
+            remote_dtls_parameters: None,
 
             answering_dtls_role,
             srtp_protection_profiles,
@@ -267,14 +286,18 @@ impl DtlsTransport {
         self.dtls_role = self.derive_role(ice_role, remote_dtls_parameters.role);
         let dtls_handshake_config = self.make_handshake_config(&remote_dtls_parameters)?;
         self.state_change(RTCDtlsTransportState::Connecting);
+        self.remote_dtls_parameters = Some(remote_dtls_parameters);
         Ok(dtls_handshake_config)
     }
 
-    /// Re-initialise the DTLS transport for re-handshake after an ICE restart.
+    /// Re-initialise the DTLS transport for re-handshake after an ICE restart, when one is needed.
     ///
-    /// When DTLS is `Connected`, `Failed`, `Closed`, or `Connecting` (handshake was
-    /// in-flight and lost), the endpoint is replaced so the next
-    /// `ICESelectedCandidatePairChange` event triggers a fresh handshake.
+    /// An ICE restart alone does not need a new DTLS session (RFC 8842 §5 / RFC 8445: DTLS is
+    /// bound to the ICE transport, not to a 5-tuple), and browsers do not start one, so a
+    /// `Connected` or `Connecting` session whose remote fingerprints and derived role are
+    /// unchanged is kept. The session is replaced when those change (a new remote identity or
+    /// `setup` role), or when it is `Failed` or `Closed`; the next
+    /// `ICESelectedCandidatePairChange` event then starts a fresh handshake.
     /// No-ops if state is `New` (initial `start_transports` handles it).
     ///
     /// **Note on identity**: the local certificate and its fingerprint are *not*
@@ -293,10 +316,23 @@ impl DtlsTransport {
             return Ok(());
         }
 
+        let new_role = self.derive_role(local_ice_role, remote_dtls_parameters.role);
+        let healthy = matches!(
+            self.state,
+            RTCDtlsTransportState::Connected | RTCDtlsTransportState::Connecting
+        );
+        let same_remote = self.remote_dtls_parameters.as_ref().is_some_and(|previous| {
+            same_fingerprints(&previous.fingerprints, &remote_dtls_parameters.fingerprints)
+        });
+        if healthy && same_remote && new_role == self.dtls_role {
+            // Nothing DTLS depends on changed: keep the session over the restarted ICE path.
+            return Ok(());
+        }
+
         // Derive the role (it may differ if the ICE role swapped during restart), but only
         // commit it once the new handshake config has been built.
         let previous_role = self.dtls_role;
-        self.dtls_role = self.derive_role(local_ice_role, remote_dtls_parameters.role);
+        self.dtls_role = new_role;
         let dtls_handshake_config = match self.make_handshake_config(&remote_dtls_parameters) {
             Ok(config) => config,
             Err(err) => {
@@ -307,6 +343,7 @@ impl DtlsTransport {
 
         self.state_change(RTCDtlsTransportState::Connecting);
         self.install_endpoint(dtls_handshake_config);
+        self.remote_dtls_parameters = Some(remote_dtls_parameters);
         Ok(())
     }
 
@@ -593,11 +630,19 @@ mod tests {
         }
     }
 
+    /// A transport whose answering role is `Auto`, so `derive_role` falls through to the ICE
+    /// role (the fork's restart tests were written against that configuration).
+    fn auto_role_transport() -> DtlsTransport {
+        let mut t = transport(vec![]);
+        t.answering_dtls_role = RTCDtlsRole::Auto;
+        t
+    }
+
     // ── prepare_transport ────────────────────────────────────────────
 
     #[test]
     fn prepare_transport_transitions_to_connecting_after_config() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         assert_eq!(t.state, RTCDtlsTransportState::New);
 
         let result = t.prepare_transport(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto));
@@ -607,7 +652,7 @@ mod tests {
 
     #[test]
     fn prepare_transport_rejects_non_new_state() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.state_change(RTCDtlsTransportState::Connecting);
 
         let result = t.prepare_transport(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto));
@@ -618,7 +663,7 @@ mod tests {
 
     #[test]
     fn prepare_transport_stays_new_on_config_failure() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         // Empty fingerprints → make_handshake_config succeeds but verification
         // closure is built; however, an empty params with *no* fingerprints at
         // all still builds a config (the closure checks at handshake time).
@@ -635,7 +680,7 @@ mod tests {
 
     #[test]
     fn restart_noop_when_new() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         assert_eq!(t.state, RTCDtlsTransportState::New);
 
         let result = t.restart(RTCIceRole::Controlling, dummy_params(RTCDtlsRole::Auto));
@@ -647,7 +692,7 @@ mod tests {
 
     #[test]
     fn restart_from_connected_as_client() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         // Simulate a fully-connected transport.
         t.state_change(RTCDtlsTransportState::Connected);
 
@@ -667,7 +712,7 @@ mod tests {
 
     #[test]
     fn restart_from_connected_as_server() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.state_change(RTCDtlsTransportState::Connected);
 
         let result = t.restart(
@@ -686,7 +731,7 @@ mod tests {
 
     #[test]
     fn restart_from_failed() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.state_change(RTCDtlsTransportState::Failed);
 
         let result = t.restart(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto));
@@ -697,7 +742,7 @@ mod tests {
 
     #[test]
     fn restart_from_closed() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.state_change(RTCDtlsTransportState::Closed);
 
         let result = t.restart(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto));
@@ -708,7 +753,7 @@ mod tests {
 
     #[test]
     fn restart_from_connecting() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.state_change(RTCDtlsTransportState::Connecting);
 
         let result = t.restart(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto));
@@ -719,7 +764,7 @@ mod tests {
 
     #[test]
     fn restart_clears_stale_client_config_when_switching_to_server() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         // First start as client.
         t.state_change(RTCDtlsTransportState::Connected);
         t.dtls_handshake_config = Some(Arc::new(
@@ -744,7 +789,7 @@ mod tests {
 
     #[test]
     fn restart_preserves_certificates() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         let fingerprint_before: Vec<_> = t
             .certificates
             .first()
@@ -777,7 +822,7 @@ mod tests {
 
     #[test]
     fn restart_fails_without_certificates() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.state_change(RTCDtlsTransportState::Connected);
         t.certificates.clear();
 
@@ -791,7 +836,7 @@ mod tests {
 
     #[test]
     fn start_as_client_stores_config_and_endpoint() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         let result = t.start(
             RTCIceRole::Controlled, // controlled → client
             dummy_params(RTCDtlsRole::Auto),
@@ -805,7 +850,7 @@ mod tests {
 
     #[test]
     fn start_as_server_creates_endpoint_no_stored_config() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         let result = t.start(
             RTCIceRole::Controlling, // controlling → server
             dummy_params(RTCDtlsRole::Auto),
@@ -820,7 +865,7 @@ mod tests {
 
     #[test]
     fn start_rejects_double_start() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.start(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
             .unwrap();
 
@@ -832,7 +877,7 @@ mod tests {
 
     #[test]
     fn stop_transitions_to_closed() {
-        let mut t = transport(vec![]);
+        let mut t = auto_role_transport();
         t.state_change(RTCDtlsTransportState::Connected);
         t.stop().unwrap();
         assert_eq!(t.state, RTCDtlsTransportState::Closed);
@@ -842,7 +887,7 @@ mod tests {
 
     #[test]
     fn derive_role_from_remote_client() {
-        let t = transport(vec![]);
+        let t = auto_role_transport();
         assert_eq!(
             t.derive_role(RTCIceRole::Controlled, RTCDtlsRole::Client),
             RTCDtlsRole::Server
@@ -851,7 +896,7 @@ mod tests {
 
     #[test]
     fn derive_role_from_remote_server() {
-        let t = transport(vec![]);
+        let t = auto_role_transport();
         assert_eq!(
             t.derive_role(RTCIceRole::Controlled, RTCDtlsRole::Server),
             RTCDtlsRole::Client
@@ -860,7 +905,7 @@ mod tests {
 
     #[test]
     fn derive_role_auto_controlling_becomes_server() {
-        let t = transport(vec![]);
+        let t = auto_role_transport();
         assert_eq!(
             t.derive_role(RTCIceRole::Controlling, RTCDtlsRole::Auto),
             RTCDtlsRole::Server
@@ -869,10 +914,53 @@ mod tests {
 
     #[test]
     fn derive_role_auto_controlled_becomes_client() {
-        let t = transport(vec![]);
+        let t = auto_role_transport();
         assert_eq!(
             t.derive_role(RTCIceRole::Controlled, RTCDtlsRole::Auto),
             DEFAULT_DTLS_ROLE_ANSWER
         );
+    }
+
+    #[test]
+    fn restart_keeps_a_connected_session_when_the_remote_is_unchanged() {
+        let mut t = auto_role_transport();
+        t.start(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
+            .unwrap();
+        t.state_change(RTCDtlsTransportState::Connected);
+        t.dtls_handshake_config = None; // a completed client handshake has consumed it
+
+        // An ICE restart with the same remote fingerprint and setup role.
+        t.restart(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
+            .unwrap();
+        assert_eq!(t.state, RTCDtlsTransportState::Connected, "the session must be kept");
+        assert!(
+            t.dtls_handshake_config.is_none(),
+            "no new handshake may be prepared"
+        );
+    }
+
+    #[test]
+    fn restart_rehandshakes_when_the_remote_fingerprint_changes() {
+        let mut t = auto_role_transport();
+        t.start(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
+            .unwrap();
+        t.state_change(RTCDtlsTransportState::Connected);
+
+        let mut params = dummy_params(RTCDtlsRole::Auto);
+        params.fingerprints[0].value = params.fingerprints[0].value.replace("00", "11");
+        t.restart(RTCIceRole::Controlled, params).unwrap();
+        assert_eq!(t.state, RTCDtlsTransportState::Connecting);
+        assert!(t.dtls_handshake_config.is_some());
+    }
+
+    #[test]
+    fn restart_rehandshakes_a_failed_session_even_when_unchanged() {
+        let mut t = auto_role_transport();
+        t.start(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
+            .unwrap();
+        t.state_change(RTCDtlsTransportState::Failed);
+        t.restart(RTCIceRole::Controlled, dummy_params(RTCDtlsRole::Auto))
+            .unwrap();
+        assert_eq!(t.state, RTCDtlsTransportState::Connecting);
     }
 }

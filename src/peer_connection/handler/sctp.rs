@@ -957,15 +957,6 @@ impl<'a>
     }
 
     fn close(&mut self) -> Result<()> {
-        // PeerConnection::close() has already aborted every association and flushed the ABORTs
-        // (see `request_abort`). Release the associations and the endpoint so nothing is held
-        // after close. (Brainwires fork; see FORK.md.)
-        let sctp = &mut self.ctx.sctp_transport;
-        sctp.sctp_associations.clear();
-        sctp.sctp_endpoint = None;
-        self.ctx.pending_readable.clear();
-        self.ctx.peer_opened_streams.clear();
-        self.ctx.unannounced.clear();
         Ok(())
     }
 }

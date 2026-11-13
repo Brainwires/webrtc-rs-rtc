@@ -417,7 +417,8 @@ impl MediaEngine {
         // type) fmtp parameter points at the primary codec this RTX stream
         // repairs. Browsers offer an RTX codec for every video codec by default
         // and drop RTX negotiation for any primary we do not pair one with, so
-        // register one RTX codec per primary video codec.
+        // register one RTX codec per primary video codec. ulpfec is a FEC codec, not a media
+        // codec, and does not get an RTX pairing.
         let rtx_codec = |payload_type: PayloadType, apt: PayloadType| RTCRtpCodecParameters {
             rtp_codec: RTCRtpCodec {
                 mime_type: MIME_TYPE_RTX.to_owned(),
@@ -1306,7 +1307,11 @@ mod default_rtx_codec_test {
                 let apt = parse_rtx_apt(&codec.rtp_codec.sdp_fmtp_line)
                     .expect("rtx codec must carry an apt= parameter");
                 rtx_apts.push(apt);
-            } else {
+            } else if UniCase::new(codec.rtp_codec.mime_type.as_str())
+                != UniCase::new(MIME_TYPE_ULP_FEC)
+            {
+                // ULPFEC (kept in the defaults by the Brainwires fork) is a FEC codec, not a
+                // media codec, and does not get an RTX pairing.
                 primary_payload_types.push(codec.payload_type);
             }
         }

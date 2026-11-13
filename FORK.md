@@ -38,7 +38,7 @@ history stays intact.
 | Repair codecs never establish a layer | `src/peer_connection/handler/endpoint.rs` (`is_repair_mime_type`) | RTX/FEC payload types are not used as a layer's primary codec. |
 | Rejected m-lines reflected in answers (RFC 8829 §5.3.1) | `src/peer_connection/internal.rs`, `src/peer_connection/sdp/mod.rs` | Port 0 in the offer stays port 0 in the answer. |
 | `RTCConfiguration` Serialize/Deserialize | `src/peer_connection/configuration/mod.rs` | W3C camelCase; certificates are skipped. |
-| PeerConnection close collects every handler's error, closes in reverse order, and releases SCTP state | `src/peer_connection/handler/mod.rs`, `handler/sctp.rs` | On top of upstream's ABORT + close_notify. |
+| PeerConnection close collects every handler's error and closes in reverse order | `src/peer_connection/handler/mod.rs` | On top of upstream's ABORT + close_notify. The fork's per-channel closing procedure and SCTP state release were dropped: upstream aborts the association (W3C `close()`) and derives `SctpTransport.state` from the aborted association. |
 | Duplicate negotiated DATA_CHANNEL_OPEN is not fatal | `src/peer_connection/handler/sctp.rs` | Both peers may open the same pre-negotiated stream. |
 | RTP marshal bounds checks | `rtc-rtp/src/header/mod.rs`, `codec/h264`, `codec/h265` | CSRC count, one/two-byte extension lengths, total extension length, NALU sizes. |
 | `DataChannelMessage::new` | `rtc-datachannel` | |
@@ -65,7 +65,7 @@ history stays intact.
 | `check_partial_reliability_status` `>=` → `>` fix (PR-SCTP max_retransmits) | Upstream's message-based reliability (`retransmission_policy_exhausted`, #242) uses `nsent > max_retransmits` and also defers abandonment to retransmission. |
 | DTLS `CryptoPrivateKey` private fields + panic-free `Clone` | Upstream's provider-neutral `SigningKey` (no DER re-parse, no panic). |
 | `HandshakeConfig::default()` placeholder verifier | Upstream has no `Default`; the verifier is an `Option` built by `ConfigBuilder`. |
-| Negotiated data channels (#61) and `set_direction` renegotiation (#51) | Upstream #101 and #102 implement the same behaviour; the fork's tests are kept. |
+| Negotiated data channels (#61) and `set_direction` renegotiation (#51) | Upstream #101 and #102 implement the same behaviour; the fork's integration tests are kept. |
 | RTX/FEC SSRC routing to the primary track | Upstream de-encapsulates RTX onto the primary (#120) and binds declared repair SSRCs (#197); the fork's RRID part is kept. |
 | `total_lost` clamp | Merged cleanly with upstream; the fork's clamp to the signed 24-bit maximum stays. |
 
