@@ -193,7 +193,10 @@ impl Unmarshal for Header {
                             break;
                         }
 
-                        if len > raw_packet.remaining() {
+                        // The element must fit in the extension block the header declares, or
+                        // it would be read out of the payload and `marshal_size` would no
+                        // longer match the wire.
+                        if len > raw_packet.remaining() || curr_offset + len > end {
                             return Err(Error::ErrHeaderSizeInsufficientForExtension);
                         }
 
@@ -226,7 +229,8 @@ impl Unmarshal for Header {
                         let len = raw_packet.get_u8() as usize;
                         curr_offset += 1;
 
-                        if len > raw_packet.remaining() {
+                        // As for the one-byte profile: the element must fit in the block.
+                        if len > raw_packet.remaining() || curr_offset + len > end {
                             return Err(Error::ErrHeaderSizeInsufficientForExtension);
                         }
 

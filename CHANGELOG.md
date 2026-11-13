@@ -37,6 +37,9 @@ the fork's own hardening. `FORK.md` lists everything the fork carries over upstr
 - Fuzzing CI fails on crashes again (`set -o pipefail`), runs with debug assertions and overflow
   checks, and gains stateful SCTP targets (checksum-fixed packet parsing, a server endpoint and
   association driven by datagram sequences).
+- RTP: a header extension element that runs past the extension length its header declares is
+  rejected. It used to be read out of the payload, and `Header::marshal_size` then exceeded the
+  packet, so SRTP's AEAD cipher panicked splitting it (found by `context_decrypt`).
 
 ### Fork features kept across the sync
 

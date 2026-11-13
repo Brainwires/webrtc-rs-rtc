@@ -202,3 +202,45 @@ fn test_unauthenticated_packets_do_not_create_ssrc_state() -> Result<()> {
     );
     Ok(())
 }
+
+/// Fuzz regression (`context_decrypt`): a header extension element that runs past the declared
+/// extension length made `Header::marshal_size` exceed the packet, and the AEAD cipher's
+/// `split_at_mut(header_len)` panicked. The packet is the minimised fuzz input.
+#[test]
+fn test_encrypt_rtp_extension_overrunning_header_is_an_error() -> Result<()> {
+    const PACKET: [&str; 6] = [
+        "92009000000000f89292b60201000000000000961000003b005a5a5a16009292920000920000f892b6ffffffffffffff",
+        "ffffffffffffffffffffffffffffffffffffffffffffffff00000000000026ab00080000042800005a5a5a5a5a5a5a5a",
+        "5a003b00000000000a00040000000a00005a5a0000929200ffffffffffffffffffffffffffffffffffffffffffffffff",
+        "ffffffffffffffffffffffffffffffffffff00000000000026ab0008000b00042800005a5a5a5a5a5a5a5a5a003b0000",
+        "0000000a00040000000a00005a5affffffffffffffffffffffffffffff00000000000026ab0008000b00042800005a5a",
+        "5a5a5a5a5a5a5a003b00000000000a00040000000a00005a5a",
+    ];
+    let packet: Vec<u8> = PACKET
+        .concat()
+        .as_bytes()
+        .chunks(2)
+        .map(|h| u8::from_str_radix(std::str::from_utf8(h).unwrap(), 16).unwrap())
+        .collect();
+    // A small packet with the same flaw: a two-byte extension block of one word holding an
+    // element whose 11-byte payload runs into the RTP payload.
+    let mut small = vec![
+        0x90, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 0x10, 0x00, 0x00, 0x01, 0x01, 0x0b,
+    ];
+    small.extend_from_slice(&[0xab; 11]);
+
+    let provider = test_crypto_provider();
+    for profile in [
+        ProtectionProfile::AeadAes256Gcm,
+        ProtectionProfile::AeadAes128Gcm,
+        ProtectionProfile::Aes128CmHmacSha1_80,
+    ] {
+        let key = vec![1u8; profile.key_len()];
+        let salt = vec![2u8; profile.salt_len()];
+        let mut ctx = Context::new(&key, &salt, profile, None, None, provider.crypto())?;
+        assert!(ctx.encrypt_rtp(&packet).is_err(), "{profile:?}");
+        assert!(ctx.encrypt_rtp(&small).is_err(), "{profile:?}");
+        assert!(ctx.decrypt_rtp(&small).is_err(), "{profile:?}");
+    }
+    Ok(())
+}
