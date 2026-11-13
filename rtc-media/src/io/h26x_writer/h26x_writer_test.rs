@@ -82,3 +82,35 @@ fn test_h26x_writer_h265_fragmentation_preserves_layer_and_tid_bits() {
 
     assert_eq!(header, [0x28, 0x09]);
 }
+
+/// An H.265 FU NAL unit is bounded at `MAX_H265_FU_NALU_SIZE`: one whose end fragment never
+/// comes used to grow the buffer without limit. A fragment with no start before it is skipped.
+#[test]
+fn test_h26x_writer_h265_fragment_buffer_is_bounded() {
+    let mut writer = H26xWriter::new(Vec::<u8>::new(), true);
+    let fragment = |fu_header: u8| {
+        let mut payload = vec![0x62, 0x01, fu_header]; // PayloadHdr type 49 (FU), FU header
+        payload.extend_from_slice(&[0xab; 1200]);
+        Packet {
+            payload: Bytes::from(payload),
+            ..Default::default()
+        }
+    };
+
+    // A middle fragment with no start is not buffered.
+    writer.write_rtp(&fragment(0x01)).unwrap();
+    assert!(writer.buffer.is_empty());
+
+    writer.write_rtp(&fragment(0x81)).unwrap(); // S=1, type 1
+    let mut refused = false;
+    for _ in 0..(MAX_H265_FU_NALU_SIZE / 1200 + 2) {
+        if writer.write_rtp(&fragment(0x01)).is_err() {
+            refused = true;
+            break;
+        }
+        assert!(writer.buffer.len() <= MAX_H265_FU_NALU_SIZE);
+    }
+    assert!(refused, "the NAL unit grew past MAX_H265_FU_NALU_SIZE");
+    assert!(writer.buffer.is_empty(), "the partial NAL unit is dropped");
+    assert!(writer.writer.is_empty());
+}

@@ -184,3 +184,50 @@ fn test_ivf_writer_add_packet_and_close() -> Result<()> {
 
     Ok(())
 }
+
+/// A frame assembled from RTP packets is bounded at `MAX_IVF_FRAME_SIZE`: a peer that never
+/// sets the marker bit used to grow it without limit.
+#[test]
+fn test_ivf_writer_frame_buffer_is_bounded() -> Result<()> {
+    let header = IVFFileHeader {
+        signature: *b"DKIF",
+        version: 0,
+        header_size: 32,
+        four_cc: *b"VP80",
+        width: 640,
+        height: 480,
+        timebase_denominator: 30,
+        timebase_numerator: 1,
+        num_frames: 0,
+        unused: 0,
+    };
+    let mut writer = IVFWriter::new(Cursor::new(Vec::<u8>::new()), &header)?;
+    let packet = |first: &[u8]| {
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(&[0xab; 1200]);
+        rtp::Packet {
+            header: rtp::Header {
+                marker: false,
+                ..Default::default()
+            },
+            payload: Bytes::from(payload),
+        }
+    };
+    // VP8 descriptor with S=1, then a key frame's first byte.
+    writer.write_rtp(&packet(&[0x10, 0x00]))?;
+    let mut refused = false;
+    for _ in 0..(MAX_IVF_FRAME_SIZE / 1200 + 2) {
+        if writer.write_rtp(&packet(&[0x00])).is_err() {
+            refused = true;
+            break;
+        }
+        assert!(writer.current_frame_len() <= MAX_IVF_FRAME_SIZE);
+    }
+    assert!(refused, "the frame grew past MAX_IVF_FRAME_SIZE");
+    assert_eq!(
+        writer.current_frame_len(),
+        0,
+        "the partial frame is dropped"
+    );
+    Ok(())
+}
