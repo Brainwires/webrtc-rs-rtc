@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.1+brainwires.2] - 2026-11-14
+
+ICE over TCP between two `rtc` peers in both role assignments, mDNS host candidates published one
+name per address (IPv4 and IPv6), and inbound key-frame requests delivered to the application.
+`FORK.md` lists what the fork carries over upstream.
+
+### Features
+
+- **interceptor**: `KeyFrameRequestInterceptor` marks inbound RTCP PLI (RFC 4585 §6.3.1) and FIR
+  (RFC 5104 §4.3.1) `DeliverToApplication`, so they pass the chain's terminus and reach the
+  application as `RTCMessage::RtcpPacket`: only the encoder can answer them, and upstream's
+  terminus swallowed them. It sits at the new `Slot::KeyFrameRequests` (14 000, past every
+  default interceptor). `configure_key_frame_requests(registry)` registers it, and
+  `register_default_interceptors` now does too: an application using the defaults gets the
+  compound RTCP packets that carry a PLI or FIR (other RTCP still ends at the terminus).
+- **ice**: `MulticastDnsMode::QueryAndGather` without `multicast_dns_local_ip` publishes every
+  local address under its own `<uuid>.local` name, IPv4 and IPv6, UDP and TCP candidates alike,
+  as browsers do. Each name is made when the address's first host candidate is added and kept for
+  its other candidates and across ICE restarts; at most `rtc_mdns::MAX_LOCAL_NAMES` (64) are
+  published, and a host candidate past that is dropped rather than sent with its address. Before,
+  this mode's one name pointed at 127.0.0.1 and no candidate was hidden. With
+  `multicast_dns_local_ip` set, that address's candidates are hidden behind
+  `multicast_dns_local_name` as before, now its TCP candidates too.
+- **mdns**: `Mdns::add_local_name(name, ip)` answers for a name with its own address: an A record
+  for IPv4, an AAAA record for IPv6, each only to a question for its type (or ANY). Queries ask
+  for both A and AAAA, and AAAA answers resolve (to IPv6 candidates).
+- **shared**: `try_frame_packet` (RFC 4571 framing without the panic) and
+  `TcpFrameDecoder::push`, which refuses data past the decoder's limit (`DEFAULT_MAX_BUFFERED`,
+  two whole frames, or `with_max_buffered`) instead of growing without bound.
+- **ice**: `TcpType::complement`.
+
+### Bug Fixes
+
+- **ice**: a peer-reflexive candidate learned over TCP takes the TCP type that pairs with the
+  local candidate its check arrived on (active for a check on a passive candidate). It had none,
+  so it paired with nothing; a controlling agent, which only checks and nominates pairs it has,
+  never connected to a peer that dialled its passive candidate (a browser answering with active
+  TCP candidates, for one). Signalled active candidates are still not added (they have no port).
+- **ice**: an inbound TCP packet's local address matches a candidate's exact address before an
+  active candidate's IP-only match, so a connection accepted on a passive candidate is no longer
+  credited to an active candidate on the same IP listed before it.
+- **peer_connection**: a datagram between port 5353 on both ends (the mDNS socket) goes to the
+  ICE agent whatever its first byte. RFC 7983's ranges don't apply to DNS: a message ID in the
+  DTLS or SRTP range sent the answer to DTLS or SRTP.
+- **mdns**: answers for registered names are sent from the IPv4 side for IPv6 records too (they go
+  to the IPv4 group).
+
+### Performance
+
+- **shared**: `TcpFrameDecoder::next_packet` is amortised O(1) in the buffered length (the consumed
+  prefix is compacted only once it outweighs the rest), not a shift of the whole buffer per packet.
+
+### Testing
+
+- `tests/ice_tcp_rtc2rtc.rs`: two peers over ICE-TCP on a simulated network (RFC 4571 frames
+  reassembled by `TcpFrameDecoder`, virtual time), active offerer with passive answerer and
+  passive controlling offerer with active answerer, carrying a 60 000-byte message and 50 ordered
+  ones over one connection. Agent tests for the peer-reflexive TCP type, signalled active
+  candidates and exact address matching; mDNS tests for per-address names, IPv4/IPv6 resolution
+  between two agents, the fixed-IP form's TCP candidates, A/AAAA questions and the name cap;
+  interceptor tests for PLI/FIR delivery; a demuxer test for mDNS routing; framing tests for the
+  bound and compaction.
+- Fuzzing: `rtc-ice/fuzz` target `agent_mdns_and_tcp`, an agent publishing mDNS names with
+  ICE-TCP candidates fed arbitrary mDNS datagrams, TCP traffic and remote candidate lines.
+
 ## [0.21.1+brainwires.1] - 2026-11-13
 
 First Brainwires fork release on upstream 0.21. It merges webrtc-rs/rtc master through `0fbcaa74`

@@ -1,7 +1,8 @@
 # Brainwires fork of webrtc-rs/rtc
 
 This repository is [webrtc-rs/rtc](https://github.com/webrtc-rs/rtc) plus the changes listed
-below. It is what ReachMyDevice pins, and what the planned Deno WebRTC extension will build on.
+below. It is what ReachMyDevice pins, and what the Deno WebRTC extension (Brainwires/deno
+`ext/webrtc`) builds on.
 
 ## Sync point
 
@@ -11,7 +12,7 @@ below. It is what ReachMyDevice pins, and what the planned Deno WebRTC extension
 | Last upstream commit merged | `0fbcaa74` (after v0.21.1, 2026-11-12) |
 | Previous sync point (original fork point) | `bf30a00c` (2026-04-06) |
 | Fork master before this sync | `81bc7c6b` |
-| Fork release | `0.21.1+brainwires.1` (build metadata marks the fork; it orders with upstream 0.21.1) |
+| Fork release | `0.21.1+brainwires.2` (build metadata marks the fork; it orders with upstream 0.21.1) |
 
 The fork is kept in sync by **merging** upstream into a branch (never rebasing), so the fork's
 history stays intact.
@@ -45,6 +46,11 @@ history stays intact.
 | `DataChannelMessage::new` | `rtc-datachannel` | |
 | TURN client `turn_server_addr()` / `local_addr()` accessors, TCP TURN example | `rtc-turn` | The example now uses upstream's TURN stream framing (RFC 8656 §12.5); the fork's original example used RFC 4571 framing, which TURN does not use. |
 | `RTCCertificate::from_key_pair` | `src/peer_connection/certificate/mod.rs` | Kept (upstream removed it); wraps `generate_from_signing_key` with the built-in provider. |
+| Inbound key-frame requests reach the application | `rtc-interceptor/src/keyframe.rs` (`KeyFrameRequestInterceptor`, `Slot::KeyFrameRequests`), `src/peer_connection/configuration/interceptor_registry.rs` (`configure_key_frame_requests`, in `register_default_interceptors`) | Upstream's terminus ends every inbound RTCP packet no interceptor vouches for, PLI and FIR included, though only the application (the encoder) can answer them. The fork marks them `DeliverToApplication` by default. |
+| ICE over TCP between `rtc` peers in both role assignments | `rtc-ice/src/agent/mod.rs` (`handle_inbound`, `add_remote_candidate`, `find_local_candidate`), `rtc-ice/src/tcp_type` (`complement`) | A peer-reflexive candidate learned over TCP takes the complementary TCP type, so a controlling agent with a passive candidate pairs with (and nominates) the peer that dialled it; exact local address matches win over an active candidate's IP-only match. `tests/ice_tcp_rtc2rtc.rs`. |
+| mDNS host candidates per address | `rtc-ice/src/agent/mod.rs` (`mdns_name_for`), `rtc-ice/src/mdns`, `rtc-mdns/src/proto` (`add_local_name`, AAAA) | `QueryAndGather` without a fixed IP publishes each local address (IPv4 and IPv6, UDP and TCP) under its own `<uuid>.local` name, as browsers do; queries ask for A and AAAA. The fixed-IP form also hides that address's TCP candidates. |
+| mDNS datagrams reach ICE whatever their first byte | `src/peer_connection/handler/demuxer.rs` | Port 5353 on both ends goes to the agent before RFC 7983 demultiplexing. |
+| Bounded RFC 4571 decoding | `rtc-shared/src/tcp_framing.rs` (`TcpFrameDecoder::push`, `try_frame_packet`) | `push` refuses data past two frames' worth; packets are taken without shifting the buffer each time. |
 | CI: benchmarks, fuzzing, OSS-Fuzz, git-cliff release notes | `.github/workflows/{bench,fuzz,release}.yml`, `oss-fuzz/`, `cliff.toml` | |
 
 ### Hardening (fork only)
@@ -53,7 +59,9 @@ Peer-input hardening upstream does not have: bounded DTLS fragment reassembly, e
 and handshake cache; AEAD-only default DTLS suites; ChangeCipherSpec honoured only for the
 handshake's one epoch transition; SRTP state only after authentication, and SRTCP authenticated
 whatever its E flag; ICE source filtering, authenticated role conflicts and consent, candidate
-caps (mDNS-resolved ones included), mDNS answers only from the mDNS socket; bounded SCTP
+caps (mDNS-resolved ones included), mDNS answers only from the mDNS socket, at most 64 published
+mDNS names (a host candidate past them is dropped, not sent with its address); bounded RFC 4571
+frame decoding; bounded SCTP
 FORWARD-TSN/SACK/receive window and stream-id checks; DCEP stream-id parity and internal message
 types refused from the wire; TURN client server-address filtering and response MESSAGE-INTEGRITY
 checks; errors instead of panics on malformed DTLS/SCTP/DCEP/ICE/SDP/RTCP input; NACK
@@ -80,6 +88,15 @@ reason. Today there is one:
 | Advisory | Crate | Why it is ignored |
 | --- | --- | --- |
 | RUSTSEC-2026-0441 (unmaintained, no vulnerability) | `pin-utils` 0.1.1 | Dev-dependency only, interop tests: `webrtc` 0.17.3 -> `webrtc-util` -> `nix` 0.26. `webrtc` 0.17.3 is the last release of the independent implementation the interop tests exercise; 0.20+ is built on the upstream `rtc` crates. |
+
+### Defaults the fork widens
+
+- `register_default_interceptors` includes `KeyFrameRequestInterceptor`: an application on the
+  defaults now receives the compound RTCP packets that carry a PLI or FIR as
+  `RTCMessage::RtcpPacket` (upstream delivers no RTCP by default). Build the chain without it to
+  keep upstream's behaviour.
+- `MulticastDnsMode::QueryAndGather` without `multicast_dns_local_ip` hides every host candidate
+  (upstream's points one name at 127.0.0.1 and hides none).
 
 ### Defaults the fork narrows on purpose
 
