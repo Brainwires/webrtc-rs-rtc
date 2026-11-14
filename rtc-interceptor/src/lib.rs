@@ -231,6 +231,7 @@ pub(crate) mod flexfec;
 pub(crate) mod gcc;
 pub(crate) mod intervalpli;
 pub(crate) mod jitterbuffer;
+pub(crate) mod keyframe;
 pub(crate) mod nack;
 pub(crate) mod pacing;
 pub(crate) mod packet;
@@ -295,6 +296,7 @@ pub use jitterbuffer::receiver::{
     DEFAULT_CAPACITY as JITTER_BUFFER_DEFAULT_CAPACITY,
     DEFAULT_DEPTH as JITTER_BUFFER_DEFAULT_DEPTH, JitterBufferBuilder, JitterBufferInterceptor,
 };
+pub use keyframe::KeyFrameRequestInterceptor;
 pub use nack::generator::{NackGeneratorBuilder, NackGeneratorInterceptor};
 pub use nack::responder::{NackResponderBuilder, NackResponderInterceptor};
 pub use noop::NoopInterceptor;

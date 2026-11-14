@@ -139,9 +139,9 @@ use crate::rtp_transceiver::rtp_sender::{
 };
 use crate::rtp_transceiver::{PayloadType, SSRC};
 use interceptor::{
-    BandwidthEstimator, CongestionControlBuilder, NackGeneratorBuilder, NackResponderBuilder,
-    PacerBuilder, ReceiverReportBuilder, Rfc8888Builder, SenderReportBuilder, TwccReceiverBuilder,
-    TwccSenderBuilder,
+    BandwidthEstimator, CongestionControlBuilder, KeyFrameRequestInterceptor, NackGeneratorBuilder,
+    NackResponderBuilder, PacerBuilder, ReceiverReportBuilder, Rfc8888Builder, SenderReportBuilder,
+    TwccReceiverBuilder, TwccSenderBuilder,
 };
 
 /// The chain registry these helpers take and return, and the positions they place interceptors at.
@@ -159,6 +159,8 @@ use shared::error::Result;
 /// - **RTCP Reports**: Generates Sender Reports (SR) and Receiver Reports (RR)
 /// - **Simulcast Headers**: Enables RTP extensions for multi-resolution streaming
 /// - **TWCC Receiver**: Generates transport-wide congestion control feedback
+/// - **Key-frame requests**: Delivers inbound PLI and FIR to the application, the encoder that
+///   has to answer them (fork addition; see [`configure_key_frame_requests`])
 ///
 /// # Parameters
 ///
@@ -207,7 +209,30 @@ pub fn register_default_interceptors(
 
     let registry = configure_rtcp_reports(registry);
 
+    let registry = configure_key_frame_requests(registry);
+
     Ok(registry)
+}
+
+/// Delivers inbound key-frame requests (RTCP PLI and FIR) to the application.
+///
+/// The chain's terminus ends every inbound RTCP packet no interceptor vouches for, and no
+/// interceptor can answer a key-frame request: only the encoder can, and the encoder is the
+/// application. This registers [`KeyFrameRequestInterceptor`] at
+/// [`Slot::KeyFrameRequests`], which marks them for delivery, so the application reads them as
+/// `RTCMessage::RtcpPacket` and can send a key frame. Part of
+/// [`register_default_interceptors`] (a fork addition: upstream swallows them).
+///
+/// # Examples
+///
+/// ```
+/// use rtc::interceptor::Registry;
+/// use rtc::peer_connection::configuration::interceptor_registry::configure_key_frame_requests;
+///
+/// let registry = configure_key_frame_requests(Registry::new());
+/// ```
+pub fn configure_key_frame_requests(registry: Registry) -> Registry {
+    registry.with(Slot::KeyFrameRequests, KeyFrameRequestInterceptor::new())
 }
 
 /// Configures NACK (Negative Acknowledgement) interceptors for packet loss recovery.
@@ -827,6 +852,7 @@ mod slot_order_tests {
                 Slot::TwccReceiver,
                 Slot::ReceiverReport,
                 Slot::SenderReport,
+                Slot::KeyFrameRequests,
             ],
             slots
         );
@@ -946,6 +972,10 @@ mod slot_order_tests {
                 (Slot::TwccReceiver, "TwccReceiverInterceptor".to_owned()),
                 (Slot::ReceiverReport, "ReceiverReportInterceptor".to_owned()),
                 (Slot::SenderReport, "SenderReportInterceptor".to_owned()),
+                (
+                    Slot::KeyFrameRequests,
+                    "KeyFrameRequestInterceptor".to_owned()
+                ),
             ],
             registry.slots()
         );
