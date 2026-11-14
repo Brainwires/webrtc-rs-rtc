@@ -153,15 +153,6 @@ pub enum Slot {
     /// see this endpoint's own buffering depth as network delay variation — a delay signal
     /// manufactured locally and indistinguishable, at the far end, from a congested path.
     JitterBuffer = 13_000,
-    /// `KeyFrameRequestInterceptor` — marks inbound PLI and FIR for delivery to the application,
-    /// which is the encoder that has to answer them.
-    ///
-    /// **Inbound only, and it only marks.**
-    ///
-    /// **Why here — application-most.** It neither holds, drops nor generates a packet, so it
-    /// constrains nothing; past every other interceptor, each of them has seen the request before
-    /// it leaves the chain. (Fork addition; see FORK.md.)
-    KeyFrameRequests = 14_000,
     /// Anywhere else, for an interceptor this crate knows nothing about.
     ///
     /// The named slots are spaced a thousand apart so one of your own fits between any two of them
@@ -189,6 +180,16 @@ pub enum Slot {
     /// the constraints of each, and those can pull in opposite directions:
     /// [`Slot::TwccReceiver`] is the worked example.
     Custom(usize),
+    /// `KeyFrameRequestInterceptor` — marks inbound PLI and FIR for delivery to the application,
+    /// which is the encoder that has to answer them.
+    ///
+    /// **Inbound only, and it only marks.**
+    ///
+    /// **Why here — application-most.** It neither holds, drops nor generates a packet, so it
+    /// constrains nothing; past every other interceptor, each of them has seen the request before
+    /// it leaves the chain. (Fork addition; see FORK.md. Declared after
+    /// [`Slot::Custom`] so that variant keeps its discriminant.)
+    KeyFrameRequests = 14_000,
 }
 
 impl Slot {
