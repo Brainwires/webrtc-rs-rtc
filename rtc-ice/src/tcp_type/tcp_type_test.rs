@@ -16,3 +16,14 @@ fn test_tcp_type() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_tcp_type_complement() {
+    assert_eq!(TcpType::Active.complement(), TcpType::Passive);
+    assert_eq!(TcpType::Passive.complement(), TcpType::Active);
+    assert_eq!(
+        TcpType::SimultaneousOpen.complement(),
+        TcpType::SimultaneousOpen
+    );
+    assert_eq!(TcpType::Unspecified.complement(), TcpType::Unspecified);
+}

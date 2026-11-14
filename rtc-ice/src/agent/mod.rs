@@ -197,6 +197,9 @@ pub struct Agent {
     pub(crate) mdns_mode: MulticastDnsMode,
     pub(crate) mdns_local_name: String,
     pub(crate) mdns_local_ip: Option<IpAddr>,
+    /// `QueryAndGather` without a fixed `mdns_local_ip`: the `<uuid>.local` name each local
+    /// address is published under, one per address, made when its first host candidate is added.
+    pub(crate) mdns_local_names: Vec<(IpAddr, String)>,
 
     pub(crate) candidate_types: Vec<CandidateType>,
     pub(crate) network_types: Vec<NetworkType>,
@@ -204,6 +207,16 @@ pub struct Agent {
 
     pub(crate) write_outs: VecDeque<TaggedBytesMut>,
     pub(crate) event_outs: VecDeque<TaggedEvent>,
+}
+
+/// What [`Agent::mdns_name_for`] decided for a host candidate.
+enum MdnsHostName {
+    /// Publish it under this name.
+    Hide(String),
+    /// Keep its address.
+    Literal,
+    /// Too many names are published already: dropping the candidate keeps its address private.
+    Refuse,
 }
 
 impl Agent {
@@ -360,6 +373,7 @@ impl Agent {
             mdns_mode,
             mdns_local_name,
             mdns_local_ip: config.multicast_dns_local_ip,
+            mdns_local_names: Vec::new(),
 
             ufrag_pwd: UfragPwd::default(),
 
@@ -417,18 +431,24 @@ impl Agent {
 
         if c.candidate_type() == CandidateType::Host
             && self.mdns_mode == MulticastDnsMode::QueryAndGather
-            && c.network_type == NetworkType::Udp4
-            && self
-                .mdns_local_ip
-                .is_some_and(|local_ip| local_ip == c.addr().ip())
+            && !c.address.ends_with(".local")
         {
-            // only one .local mDNS host candidate per IPv4 is supported
-            // when registered local ip matches, use mdns_local_name to hide local host ip
-            trace!(
-                "mDNS hides local ip {} with local name {}",
-                c.address, self.mdns_local_name
-            );
-            c.address = self.mdns_local_name.clone();
+            match self.mdns_name_for(c.addr().ip(), c.network_type()) {
+                MdnsHostName::Hide(name) => {
+                    trace!("mDNS hides local ip {} with local name {}", c.address, name);
+                    c.address = name;
+                }
+                MdnsHostName::Literal => {}
+                MdnsHostName::Refuse => {
+                    warn!(
+                        "[{}]: ignoring local host candidate {}: {} mDNS names already published (the cap)",
+                        self.get_name(),
+                        c.address,
+                        mdns::MAX_LOCAL_NAMES
+                    );
+                    return Ok(false);
+                }
+            }
         }
 
         for cand in &self.local_candidates {
@@ -451,6 +471,36 @@ impl Agent {
         self.request_connectivity_check();
 
         Ok(true)
+    }
+
+    /// The name a host candidate on `ip` is published under in `QueryAndGather` mode.
+    ///
+    /// With a fixed `mdns_local_ip` (the original behaviour), only that IPv4 address is hidden,
+    /// behind `mdns_local_name`, for UDP and TCP alike. Without one, every local address gets its
+    /// own `<uuid>.local` name, IPv4 and IPv6, as browsers publish host candidates: made when its
+    /// first candidate is added, registered with the mDNS responder, reused for the address's
+    /// other candidates (and across ICE restarts).
+    fn mdns_name_for(&mut self, ip: IpAddr, network_type: NetworkType) -> MdnsHostName {
+        if let Some(local_ip) = self.mdns_local_ip {
+            let v4 = matches!(network_type, NetworkType::Udp4 | NetworkType::Tcp4);
+            return if v4 && local_ip == ip {
+                MdnsHostName::Hide(self.mdns_local_name.clone())
+            } else {
+                MdnsHostName::Literal
+            };
+        }
+        if let Some((_, name)) = self.mdns_local_names.iter().find(|(i, _)| *i == ip) {
+            return MdnsHostName::Hide(name.clone());
+        }
+        let Some(mdns_conn) = &mut self.mdns else {
+            return MdnsHostName::Literal;
+        };
+        let name = generate_multicast_dns_name();
+        if !mdns_conn.add_local_name(&name, ip) {
+            return MdnsHostName::Refuse;
+        }
+        self.mdns_local_names.push((ip, name.clone()));
+        MdnsHostName::Hide(name)
     }
 
     /// Adds a new remote candidate.
@@ -480,10 +530,11 @@ impl Agent {
             }
         }
 
-        // TCP active candidates don't have a listening port - they initiate connections.
-        // The remote active side will probe our passive candidates, so we don't need
-        // to do anything with remote active candidates.
-        if c.tcp_type() == TcpType::Active {
+        // A signalled TCP active candidate has no listening port (RFC 6544 §4.5: port 9): it
+        // initiates connections and is reached as the peer-reflexive candidate its checks
+        // create on one of our passive candidates. That peer-reflexive one, which carries the
+        // connection's real source port, is kept.
+        if c.tcp_type() == TcpType::Active && c.candidate_type() != CandidateType::PeerReflexive {
             debug!(
                 "Ignoring remote candidate with tcptype active: {}",
                 c.address()
@@ -1071,17 +1122,21 @@ impl Agent {
         addr: SocketAddr,
         transport_protocol: TransportProtocol,
     ) -> Option<usize> {
+        // An exact address match wins over the TCP active candidates' IP-only match: a
+        // connection accepted on a passive candidate arrives on that candidate's own address,
+        // and must not be credited to an active candidate on the same IP that happens to be
+        // listed first.
+        let mut active_on_ip = None;
         for (index, c) in self.local_candidates.iter().enumerate() {
             if c.network_type().to_protocol() != transport_protocol {
                 continue;
             }
 
-            // For TCP active candidates, match by IP only (ignore port).
-            // TCP active candidates use port 9 as placeholder in signaling,
-            // but the actual connection uses an ephemeral port.
+            // TCP active candidates use port 9 as a placeholder in signalling, but each
+            // connection they open has its own ephemeral port: they match by IP alone.
             if c.tcp_type() == TcpType::Active && transport_protocol == TransportProtocol::TCP {
-                if c.addr().ip() == addr.ip() {
-                    return Some(index);
+                if active_on_ip.is_none() && c.addr().ip() == addr.ip() {
+                    active_on_ip = Some(index);
                 }
             } else if c.addr() == addr {
                 return Some(index);
@@ -1092,7 +1147,7 @@ impl Agent {
                 return Some(index);
             }
         }
-        None
+        active_on_ip
     }
 
     pub(crate) fn send_binding_request(
@@ -1499,7 +1554,14 @@ impl Agent {
                 };
 
                 match prflx_candidate_config.new_candidate_peer_reflexive() {
-                    Ok(prflx_candidate) => {
+                    Ok(mut prflx_candidate) => {
+                        // RFC 6544 §7: a peer-reflexive candidate learned over TCP takes
+                        // the TCP type that pairs with the local candidate the check arrived
+                        // on (a check on our passive candidate comes from an active one), or it
+                        // could never form a pair and the controlling agent would never
+                        // nominate the connection.
+                        prflx_candidate.tcp_type =
+                            self.local_candidates[local_index].tcp_type().complement();
                         if let Ok(added) = self.add_remote_candidate(prflx_candidate)
                             && added
                         {

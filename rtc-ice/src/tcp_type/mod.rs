@@ -34,6 +34,19 @@ impl From<&str> for TcpType {
     }
 }
 
+impl TcpType {
+    /// The TCP type a remote candidate needs to pair with a local one of this type: an
+    /// active candidate pairs with a passive one and the other way round, simultaneous-open
+    /// with simultaneous-open (RFC 6544 §6.2). `Unspecified` (UDP) stays `Unspecified`.
+    pub fn complement(self) -> Self {
+        match self {
+            Self::Active => Self::Passive,
+            Self::Passive => Self::Active,
+            other => other,
+        }
+    }
+}
+
 impl fmt::Display for TcpType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match *self {
