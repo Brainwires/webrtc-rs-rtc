@@ -536,3 +536,134 @@ mod tests {
         }
     }
 }
+
+/// Stateful target: an agent that publishes mDNS names (`QueryAndGather`) and has ICE-TCP
+/// candidates, fed arbitrary mDNS datagrams, TCP traffic and remote candidate lines.
+///
+/// The target has UDP and TCP (passive and active) host candidates on IPv4 and a UDP one on
+/// IPv6, so it has registered names to answer for, and is resolving a remote `.local`
+/// candidate. Each op is an op byte followed by a length-prefixed argument:
+///
+/// - 0: the argument as a datagram on the mDNS socket (local and source port 5353);
+/// - 1: the argument as TCP traffic on the passive candidate, from a source port the next two
+///   bytes of the argument pick;
+/// - 2: the argument as TCP traffic on an outbound connection of the active candidate;
+/// - 3: the argument as a remote candidate line;
+/// - 4: the clock advances by the argument's first byte, in 10 ms steps.
+pub fn agent_mdns_and_tcp(mut data: &[u8], start: Instant) {
+    let Ok(provider) = crypto::fuzzing::deterministic_provider(23, false) else {
+        return;
+    };
+    let config = AgentConfig {
+        local_ufrag: "targetufrag".to_owned(),
+        local_pwd: "target-password-for-fuzzing".to_owned(),
+        multicast_dns_mode: MulticastDnsMode::QueryAndGather,
+        check_interval: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let Ok(mut agent) = Agent::new(start, Arc::new(config), provider) else {
+        return;
+    };
+    let host = |network: &str, address: &str, port: u16, tcp_type| {
+        CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: network.to_owned(),
+                address: address.to_owned(),
+                port,
+                component: 1,
+                ..Default::default()
+            },
+            tcp_type,
+        }
+        .new_candidate_host()
+        .ok()
+    };
+    use crate::tcp_type::TcpType;
+    for c in [
+        host("udp", "10.0.0.1", 5000, TcpType::Unspecified),
+        host("tcp", "10.0.0.1", 5001, TcpType::Passive),
+        host("tcp", "10.0.0.1", 9, TcpType::Active),
+        host("udp", "2001:db8::1", 5000, TcpType::Unspecified),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = agent.add_local_candidate(c);
+    }
+    let _ = agent.set_remote_credentials(
+        "peerufrag".to_owned(),
+        "peer-password-for-fuzzing".to_owned(),
+    );
+    if let Ok(c) = unmarshal_candidate(
+        "1 1 udp 2113939711 61b445d2-6503-41ac-96ce-ee3edac00e9f.local 6000 typ host",
+    ) {
+        let _ = agent.add_remote_candidate(c);
+    }
+
+    let mut now = start;
+    let mut ops = 0;
+    while let Some((&op, rest)) = data.split_first() {
+        data = rest;
+        ops += 1;
+        if ops > 256 {
+            break;
+        }
+        let arg = take_arg(&mut data);
+        let deliver = |agent: &mut Agent, local: SocketAddr, peer: SocketAddr, tcp: bool| {
+            let _ = agent.handle_read(TaggedBytesMut {
+                now,
+                transport: TransportContext {
+                    local_addr: local,
+                    peer_addr: peer,
+                    ecn: None,
+                    transport_protocol: if tcp {
+                        TransportProtocol::TCP
+                    } else {
+                        TransportProtocol::UDP
+                    },
+                },
+                message: BytesMut::from(arg),
+            });
+        };
+        let port = |arg: &[u8]| {
+            u16::from_be_bytes([
+                arg.first().copied().unwrap_or(0),
+                arg.get(1).copied().unwrap_or(0),
+            ])
+        };
+        match op % 5 {
+            0 => deliver(
+                &mut agent,
+                SocketAddr::from(([0, 0, 0, 0], 5353)),
+                SocketAddr::from(([10, 0, 0, 9], 5353)),
+                false,
+            ),
+            1 => deliver(
+                &mut agent,
+                SocketAddr::from(([10, 0, 0, 1], 5001)),
+                SocketAddr::from(([10, 0, 0, 2], port(arg))),
+                true,
+            ),
+            2 => deliver(
+                &mut agent,
+                SocketAddr::from(([10, 0, 0, 1], 40000)),
+                SocketAddr::from(([10, 0, 0, 2], 5001)),
+                true,
+            ),
+            3 => {
+                if let Ok(line) = std::str::from_utf8(arg)
+                    && let Ok(c) = unmarshal_candidate(line)
+                {
+                    let _ = agent.add_remote_candidate(c);
+                }
+            }
+            _ => {
+                now += Duration::from_millis(10 * u64::from(arg.first().copied().unwrap_or(1)));
+                let _ = agent.handle_timeout(now);
+            }
+        }
+        while agent.poll_write().is_some() {}
+        while agent.poll_event().is_some() {}
+    }
+    let _ = agent.close();
+}
