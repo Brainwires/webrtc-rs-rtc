@@ -118,10 +118,39 @@ pub fn frame_packet_to(buf: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(total_len)
 }
 
+/// Like [`frame_packet`], without the panic: `None` when `buf` is longer than a frame can carry
+/// ([`MAX_FRAMED_PACKET_SIZE`]).
+///
+/// # Example
+///
+/// ```rust
+/// use rtc_shared::tcp_framing::{try_frame_packet, MAX_FRAMED_PACKET_SIZE};
+///
+/// assert_eq!(try_frame_packet(b"Hi"), Some(vec![0, 2, b'H', b'i']));
+/// assert_eq!(try_frame_packet(&vec![0; MAX_FRAMED_PACKET_SIZE + 1]), None);
+/// ```
+pub fn try_frame_packet(buf: &[u8]) -> Option<Vec<u8>> {
+    if buf.len() > MAX_FRAMED_PACKET_SIZE {
+        return None;
+    }
+    Some(frame_packet(buf))
+}
+
+/// What a [`TcpFrameDecoder`] holds at most by default: two whole frames, so a reader that takes
+/// every complete packet after each [`TcpFrameDecoder::push`] never reaches it, whatever its
+/// read size up to one frame.
+pub const DEFAULT_MAX_BUFFERED: usize = 2 * (FRAMING_HEADER_LEN + MAX_FRAMED_PACKET_SIZE);
+
 /// A stateful decoder for RFC 4571 framed TCP packets.
 ///
 /// This decoder buffers incoming TCP data and extracts complete framed packets.
 /// It handles partial reads gracefully - you can feed it data in any chunk size.
+///
+/// Input from a peer is bounded: [`push`](Self::push) refuses data that would take the buffer
+/// past its limit ([`DEFAULT_MAX_BUFFERED`], or [`with_max_buffered`](Self::with_max_buffered)),
+/// so a peer that sends faster than the reader takes packets cannot grow it without limit.
+/// Taking a packet is amortised O(1) in the buffered length: the consumed prefix is compacted
+/// away only once it outweighs what is left, rather than shifted out after every packet.
 ///
 /// # Example
 ///
@@ -140,27 +169,76 @@ pub fn frame_packet_to(buf: &[u8], out: &mut [u8]) -> Option<usize> {
 /// decoder.extend_from_slice(chunk2);
 /// assert_eq!(decoder.next_packet(), Some(b"Hello".to_vec()));
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TcpFrameDecoder {
     buffer: Vec<u8>,
+    /// Where the unconsumed bytes start in `buffer`.
+    start: usize,
+    max_buffered: usize,
+}
+
+impl Default for TcpFrameDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TcpFrameDecoder {
     /// Creates a new decoder with an empty buffer.
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: Vec::new(),
+            start: 0,
+            max_buffered: DEFAULT_MAX_BUFFERED,
+        }
     }
 
     /// Creates a new decoder with pre-allocated buffer capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             buffer: Vec::with_capacity(capacity),
+            ..Self::new()
         }
     }
 
-    /// Appends data to the internal buffer.
+    /// Sets how many unconsumed bytes [`push`](Self::push) lets the decoder hold. At least one
+    /// whole frame is always allowed, so every valid frame can complete.
+    pub fn with_max_buffered(mut self, max_buffered: usize) -> Self {
+        self.max_buffered = max_buffered.max(FRAMING_HEADER_LEN + MAX_FRAMED_PACKET_SIZE);
+        self
+    }
+
+    /// Appends data to the internal buffer, without a limit. For data from a peer, use
+    /// [`push`](Self::push).
     pub fn extend_from_slice(&mut self, data: &[u8]) {
+        self.compact();
         self.buffer.extend_from_slice(data);
+    }
+
+    /// Appends data from a peer, refusing it (and buffering none of it) when the unconsumed
+    /// bytes would exceed the limit: the reader is not keeping up, or the peer is flooding. A
+    /// refusal leaves the stream's framing unknowable, so the connection should be closed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ErrBufferFull`](crate::error::Error::ErrBufferFull) when the data does not fit.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use rtc_shared::tcp_framing::{TcpFrameDecoder, DEFAULT_MAX_BUFFERED};
+    ///
+    /// let mut decoder = TcpFrameDecoder::new();
+    /// assert!(decoder.push(&[0, 1, 7]).is_ok());
+    /// assert!(decoder.push(&vec![0; DEFAULT_MAX_BUFFERED]).is_err());
+    /// assert_eq!(decoder.next_packet(), Some(vec![7]));
+    /// ```
+    pub fn push(&mut self, data: &[u8]) -> crate::error::Result<()> {
+        if self.buffered_len().saturating_add(data.len()) > self.max_buffered {
+            return Err(crate::error::Error::ErrBufferFull);
+        }
+        self.extend_from_slice(data);
+        Ok(())
     }
 
     /// Attempts to extract the next complete packet from the buffer.
@@ -170,42 +248,55 @@ impl TcpFrameDecoder {
     ///
     /// The returned packet does not include the 2-byte length header.
     pub fn next_packet(&mut self) -> Option<Vec<u8>> {
+        let pending = &self.buffer[self.start..];
         // Need at least the header
-        if self.buffer.len() < FRAMING_HEADER_LEN {
+        if pending.len() < FRAMING_HEADER_LEN {
             return None;
         }
 
         // Parse the length
-        let length = u16::from_be_bytes([self.buffer[0], self.buffer[1]]) as usize;
+        let length = u16::from_be_bytes([pending[0], pending[1]]) as usize;
         let total_len = FRAMING_HEADER_LEN + length;
 
         // Check if we have the complete packet
-        if self.buffer.len() < total_len {
+        if pending.len() < total_len {
             return None;
         }
 
         // Extract the packet (skip header)
-        let packet = self.buffer[FRAMING_HEADER_LEN..total_len].to_vec();
-
-        // Remove processed data from buffer
-        self.buffer.drain(..total_len);
+        let packet = pending[FRAMING_HEADER_LEN..total_len].to_vec();
+        self.start += total_len;
+        if self.start == self.buffer.len() {
+            self.buffer.clear();
+            self.start = 0;
+        }
 
         Some(packet)
     }
 
+    /// Drops the consumed prefix once it is at least as long as what is left, so each byte is
+    /// moved a bounded number of times.
+    fn compact(&mut self) {
+        if self.start > 0 && self.start >= self.buffer.len() - self.start {
+            self.buffer.drain(..self.start);
+            self.start = 0;
+        }
+    }
+
     /// Returns the number of buffered bytes.
     pub fn buffered_len(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - self.start
     }
 
     /// Returns `true` if the buffer is empty.
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.buffered_len() == 0
     }
 
     /// Clears the internal buffer.
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.start = 0;
     }
 }
 
@@ -346,6 +437,73 @@ mod tests {
 
         assert_eq!(decoder.buffered_len(), 3);
         decoder.clear();
+        assert!(decoder.is_empty());
+    }
+
+    #[test]
+    fn test_try_frame_packet() {
+        assert_eq!(try_frame_packet(b"ab"), Some(vec![0, 2, b'a', b'b']));
+        assert_eq!(
+            try_frame_packet(&vec![0u8; MAX_FRAMED_PACKET_SIZE]).map(|f| f.len()),
+            Some(FRAMING_HEADER_LEN + MAX_FRAMED_PACKET_SIZE)
+        );
+        assert_eq!(
+            try_frame_packet(&vec![0u8; MAX_FRAMED_PACKET_SIZE + 1]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_push_is_bounded() {
+        let mut decoder = TcpFrameDecoder::new();
+        // A largest frame, header only so far: the peer has claimed 65535 bytes.
+        decoder.push(&[0xff, 0xff]).unwrap();
+        decoder.push(&vec![1u8; MAX_FRAMED_PACKET_SIZE]).unwrap();
+        // The next frame's bytes fit while one frame's worth of room remains...
+        decoder.push(&vec![2u8; MAX_FRAMED_PACKET_SIZE]).unwrap();
+        // ...and past the limit nothing is taken.
+        let before = decoder.buffered_len();
+        assert_eq!(
+            decoder.push(&[3u8; FRAMING_HEADER_LEN + 1]),
+            Err(crate::error::Error::ErrBufferFull)
+        );
+        assert_eq!(decoder.buffered_len(), before);
+        // Taking the complete frame makes room again.
+        assert_eq!(
+            decoder.next_packet().map(|p| p.len()),
+            Some(MAX_FRAMED_PACKET_SIZE)
+        );
+        decoder.push(&[3u8; 4]).unwrap();
+    }
+
+    #[test]
+    fn test_with_max_buffered_keeps_room_for_one_frame() {
+        let mut decoder = TcpFrameDecoder::new().with_max_buffered(10);
+        decoder.push(&[0xff, 0xff]).unwrap();
+        decoder.push(&vec![0u8; MAX_FRAMED_PACKET_SIZE]).unwrap();
+        assert!(decoder.push(&[0]).is_err());
+        assert_eq!(
+            decoder.next_packet().map(|p| p.len()),
+            Some(MAX_FRAMED_PACKET_SIZE)
+        );
+    }
+
+    #[test]
+    fn test_many_small_frames_keep_order_across_compaction() {
+        let mut decoder = TcpFrameDecoder::new();
+        let mut stream = Vec::new();
+        for i in 0..10_000u16 {
+            stream.extend_from_slice(&frame_packet(&i.to_be_bytes()));
+        }
+        let mut next = 0u16;
+        for chunk in stream.chunks(997) {
+            decoder.push(chunk).unwrap();
+            while let Some(packet) = decoder.next_packet() {
+                assert_eq!(packet, next.to_be_bytes());
+                next += 1;
+            }
+        }
+        assert_eq!(next, 10_000);
         assert!(decoder.is_empty());
     }
 }
