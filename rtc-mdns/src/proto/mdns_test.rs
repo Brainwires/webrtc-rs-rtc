@@ -356,3 +356,91 @@ fn test_query_timeout_config() {
     let conn = Mdns::new(now, config);
     assert_eq!(conn.query_timeout, None);
 }
+
+/// Carries every packet `from` queued to `to`, as the multicast group would, from `from_ip`.
+fn deliver(from: &mut Mdns, from_ip: IpAddr, to: &mut Mdns, now: Instant) -> usize {
+    let mut n = 0;
+    while let Some(packet) = from.poll_write() {
+        assert_eq!(packet.transport.peer_addr, MDNS_DEST_ADDR);
+        to.handle_read(TaggedBytesMut {
+            now,
+            transport: TransportContext {
+                local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), MDNS_PORT),
+                peer_addr: SocketAddr::new(from_ip, MDNS_PORT),
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: packet.message,
+        })
+        .unwrap();
+        n += 1;
+    }
+    n
+}
+
+fn answers(conn: &mut Mdns) -> Vec<(QueryId, IpAddr)> {
+    std::iter::from_fn(|| conn.poll_event())
+        .filter_map(|e| match e {
+            MdnsEvent::QueryAnswered(id, ip) => Some((id, ip)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_registered_names_resolve_to_their_own_addresses() {
+    let now = Instant::now();
+    let server_ip: IpAddr = "192.168.1.20".parse().unwrap();
+    let client_ip: IpAddr = "192.168.1.30".parse().unwrap();
+    let v4: IpAddr = "192.168.1.20".parse().unwrap();
+    let v6: IpAddr = "2001:db8::20".parse().unwrap();
+
+    let mut server = Mdns::new(now, MdnsConfig::default());
+    assert!(server.add_local_name("aaaaaaaa-0000-4000-8000-000000000001.local", v4));
+    assert!(server.add_local_name("aaaaaaaa-0000-4000-8000-000000000002.local.", v6));
+
+    let mut client = Mdns::new(now, MdnsConfig::default());
+    let q4 = client.query_now(now, "aaaaaaaa-0000-4000-8000-000000000001.local");
+    let q6 = client.query_now(now, "aaaaaaaa-0000-4000-8000-000000000002.local");
+    let q_unknown = client.query_now(now, "aaaaaaaa-0000-4000-8000-000000000003.local");
+
+    assert_eq!(deliver(&mut client, client_ip, &mut server, now), 3);
+    // One answer per known name, none for the unknown one.
+    assert_eq!(deliver(&mut server, server_ip, &mut client, now), 2);
+
+    let mut got = answers(&mut client);
+    got.sort();
+    assert_eq!(got, vec![(q4, v4), (q6, v6)]);
+    assert!(client.is_query_pending(q_unknown));
+}
+
+#[test]
+fn test_add_local_name_refuses_duplicates_and_caps() {
+    let now = Instant::now();
+    let mut conn = Mdns::new(now, MdnsConfig::default());
+    let ip: IpAddr = "10.0.0.1".parse().unwrap();
+    assert!(conn.add_local_name("dup.local", ip));
+    assert!(
+        !conn.add_local_name("dup.local.", ip),
+        "same name, either spelling"
+    );
+    for i in 1..MAX_LOCAL_NAMES {
+        assert!(conn.add_local_name(&format!("n{i}.local"), ip));
+    }
+    assert!(!conn.add_local_name("one-too-many.local", ip));
+    assert_eq!(conn.local_records.len(), MAX_LOCAL_NAMES);
+}
+
+#[test]
+fn test_queries_ask_for_both_families() {
+    let now = Instant::now();
+    let mut conn = Mdns::new(now, MdnsConfig::default());
+    conn.query_now(now, "x.local");
+    let packet = conn.poll_write().unwrap();
+    let mut parser = crate::message::parser::Parser::default();
+    parser.start(&packet.message).unwrap();
+    let types: Vec<DnsType> = std::iter::from_fn(|| parser.question().ok())
+        .map(|q| q.typ)
+        .collect();
+    assert_eq!(types, vec![DnsType::A, DnsType::Aaaa]);
+}

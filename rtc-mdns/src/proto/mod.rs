@@ -4,7 +4,7 @@
 //! documentation and examples live so that rustdoc renders them and their doctests run.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -17,6 +17,7 @@ use crate::message::name::Name;
 use crate::message::parser::Parser;
 use crate::message::question::Question;
 use crate::message::resource::a::AResource;
+use crate::message::resource::aaaa::AaaaResource;
 use crate::message::resource::{Resource, ResourceHeader};
 use crate::message::{DNSCLASS_INET, DnsType, Message};
 use shared::error::{Error, Result};
@@ -39,6 +40,10 @@ pub const MDNS_PORT: u16 = 5353;
 /// assert_eq!(MDNS_DEST_ADDR.to_string(), "224.0.0.251:5353");
 /// ```
 pub const MDNS_DEST_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(MDNS_MULTICAST_IPV4), MDNS_PORT);
+
+/// The most names [`Mdns::add_local_name`] registers: one per local address is the use, and a
+/// host has a handful.
+pub const MAX_LOCAL_NAMES: usize = 64;
 
 /// Unique identifier for tracking mDNS queries.
 ///
@@ -219,6 +224,10 @@ pub struct Mdns {
     /// Local names with trailing dots (for matching questions)
     local_names: Vec<String>,
 
+    /// Names registered with [`Mdns::add_local_name`], each answered with its own address
+    /// (trailing dots).
+    local_records: Vec<(String, IpAddr)>,
+
     /// Scheduled queries
     scheduled_queries: VecDeque<(QueryId, String)>,
 
@@ -300,6 +309,7 @@ impl Mdns {
         Self {
             config,
             local_names,
+            local_records: Vec::new(),
             scheduled_queries: VecDeque::new(),
             queries: Vec::new(),
             next_query_id: 1,
@@ -311,6 +321,41 @@ impl Mdns {
             last_now: now,
             closed: false,
         }
+    }
+
+    /// Answers queries for `name` with `ip` from now on: an A record for an IPv4 address, an
+    /// AAAA record for an IPv6 one. Unlike [`MdnsConfig::with_local_names`], whose names all
+    /// answer with the one [`MdnsConfig::local_ip`], each name registered here has its own
+    /// address, so a host can publish one name per interface address (what WebRTC's mDNS host
+    /// candidates do).
+    ///
+    /// Returns `false`, registering nothing, when `name` is already registered or
+    /// [`MAX_LOCAL_NAMES`] are.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use std::time::Instant;
+    /// use rtc_mdns::{Mdns, MdnsConfig};
+    /// use std::net::IpAddr;
+    ///
+    /// let mut mdns = Mdns::new(Instant::now(), MdnsConfig::default());
+    /// assert!(mdns.add_local_name("v4-name.local", "192.168.1.10".parse::<IpAddr>().unwrap()));
+    /// assert!(mdns.add_local_name("v6-name.local", "2001:db8::10".parse::<IpAddr>().unwrap()));
+    /// ```
+    pub fn add_local_name(&mut self, name: &str, ip: IpAddr) -> bool {
+        let name = if name.ends_with('.') {
+            name.to_string()
+        } else {
+            format!("{name}.")
+        };
+        if self.local_records.len() >= MAX_LOCAL_NAMES
+            || self.local_records.iter().any(|(n, _)| *n == name)
+        {
+            return false;
+        }
+        self.local_records.push((name, ip));
+        true
     }
 
     /// Start a new mDNS query for the given name.
@@ -487,11 +532,20 @@ impl Mdns {
         let raw_query = {
             let mut msg = Message {
                 header: Header::default(),
-                questions: vec![Question {
-                    typ: DnsType::A,
-                    class: DNSCLASS_INET,
-                    name: packed_name,
-                }],
+                // Both families: a `.local` name carries no hint of which it resolves to, and
+                // a host publishes its IPv6 addresses under names of their own.
+                questions: vec![
+                    Question {
+                        typ: DnsType::A,
+                        class: DNSCLASS_INET,
+                        name: packed_name.clone(),
+                    },
+                    Question {
+                        typ: DnsType::Aaaa,
+                        class: DNSCLASS_INET,
+                        name: packed_name,
+                    },
+                ],
                 ..Default::default()
             };
 
@@ -526,6 +580,11 @@ impl Mdns {
             }
         };
 
+        let (typ, body): (DnsType, Box<dyn crate::message::resource::ResourceBody>) = match local_ip
+        {
+            IpAddr::V4(ip) => (DnsType::A, Box::new(AResource { a: ip.octets() })),
+            IpAddr::V6(ip) => (DnsType::Aaaa, Box::new(AaaaResource { aaaa: ip.octets() })),
+        };
         let raw_answer = {
             let mut msg = Message {
                 header: Header {
@@ -535,22 +594,13 @@ impl Mdns {
                 },
                 answers: vec![Resource {
                     header: ResourceHeader {
-                        typ: DnsType::A,
+                        typ,
                         class: DNSCLASS_INET,
                         name: packed_name,
                         ttl: RESPONSE_TTL,
                         ..Default::default()
                     },
-                    body: Some(Box::new(AResource {
-                        a: match local_ip {
-                            IpAddr::V4(ip) => ip.octets(),
-                            IpAddr::V6(_) => {
-                                log::warn!("Cannot send IPv6 address in A record");
-                                //TODO: How to support IPv6 mDNS?
-                                return;
-                            }
-                        },
-                    })),
+                    body: Some(body),
                 }],
                 ..Default::default()
             };
@@ -565,10 +615,16 @@ impl Mdns {
         };
 
         log::trace!("mDNS Queuing answer for {name} -> {local_ip}");
+        // Answers go to the IPv4 group whatever the record's family, so they leave from the
+        // IPv4 side.
+        let from_ip = match local_ip {
+            IpAddr::V4(_) => local_ip,
+            IpAddr::V6(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        };
         self.write_outs.push_back(TransportMessage {
             now,
             transport: TransportContext {
-                local_addr: SocketAddr::new(local_ip, MDNS_PORT),
+                local_addr: SocketAddr::new(from_ip, MDNS_PORT),
                 peer_addr: MDNS_DEST_ADDR,
                 transport_protocol: TransportProtocol::UDP,
                 ecn: None,
@@ -596,6 +652,7 @@ impl Mdns {
     fn process_questions(&mut self, parser: &mut Parser<'_>, _src: SocketAddr, now: Instant) {
         // Collect names that need answers first to avoid borrow issues
         let mut names_to_answer: Vec<String> = Vec::new();
+        let mut records_to_answer: Vec<(String, IpAddr)> = Vec::new();
 
         for _ in 0..=MAX_MESSAGE_RECORDS {
             let q = match parser.question() {
@@ -616,10 +673,26 @@ impl Mdns {
                     break;
                 }
             }
+            // A registered name answers a question for its own record type (or any): A for an
+            // IPv4 address, AAAA for an IPv6 one. A question for the other type gets no answer.
+            if let Some((name, ip)) = self.local_records.iter().find(|(n, _)| *n == q.name.data) {
+                let wanted = match ip {
+                    IpAddr::V4(_) => q.typ == DnsType::A,
+                    IpAddr::V6(_) => q.typ == DnsType::Aaaa,
+                } || q.typ == DnsType::All;
+                if wanted && !records_to_answer.iter().any(|(n, _)| n == name) {
+                    records_to_answer.push((name.clone(), *ip));
+                }
+            }
         }
 
         // Skip remaining questions
         let _ = parser.skip_all_questions();
+
+        for (name, ip) in records_to_answer {
+            log::trace!("mDNS Found question for registered name: {name}, responding with {ip}");
+            self.send_answer(ip, &name, now);
+        }
 
         // Now send answers
         if let Some(local_ip) = self.config.local_ip {
@@ -663,7 +736,18 @@ impl Mdns {
                 }
             };
 
-            let local_ip = if let Some(body) = answer_resource.body
+            let aaaa = answer_resource
+                .body
+                .as_ref()
+                .and_then(|body| body.as_any().downcast_ref::<AaaaResource>())
+                .map(|r| IpAddr::V6(Ipv6Addr::from(r.aaaa)));
+            let local_ip = if let Some(ip) = aaaa {
+                trace!(
+                    "mDNS answers with the IPv6 address {} for query {}",
+                    ip, answer_header.name.data
+                );
+                ip
+            } else if let Some(body) = answer_resource.body
                 && let Some(a) = body.as_any().downcast_ref::<AResource>()
             {
                 let local_ip = Ipv4Addr::from_octets(a.a).into();
