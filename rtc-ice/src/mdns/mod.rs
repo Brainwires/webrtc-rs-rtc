@@ -3,7 +3,7 @@
 
 use mdns::Mdns;
 use mdns::MdnsConfig;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -20,7 +20,10 @@ pub enum MulticastDnsMode {
     #[default]
     QueryOnly,
 
-    /// Means remote mDNS candidates will be accepted, and local host candidates will use mDNS.
+    /// Means remote mDNS candidates will be accepted, and local host candidates will use mDNS:
+    /// with `multicast_dns_local_ip` set, the candidates on that IPv4 address are published
+    /// under `multicast_dns_local_name`; without it, every local address (IPv4 and IPv6) under
+    /// a `<uuid>.local` name of its own, as browsers do.
     QueryAndGather,
 }
 
@@ -44,19 +47,17 @@ pub(crate) fn create_multicast_dns(
         return Ok(None);
     }
 
-    let mut config = if mdns_mode == MulticastDnsMode::QueryAndGather {
-        let local_ip = if let Some(local_ip) = mdns_local_ip {
-            *local_ip
-        } else {
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
-        };
-        log::info!("mDNS is using {local_ip} as local ip");
-
-        MdnsConfig::new()
-            .with_local_names(vec![mdns_local_name.to_owned()])
-            .with_local_ip(local_ip)
-    } else {
-        MdnsConfig::new()
+    // With a fixed local IP, its one name answers with it. Without one, each local address is
+    // published under a name of its own as its host candidates are added
+    // (`Mdns::add_local_name`), so the responder starts with none.
+    let mut config = match (mdns_mode, mdns_local_ip) {
+        (MulticastDnsMode::QueryAndGather, Some(local_ip)) => {
+            log::info!("mDNS is using {local_ip} as local ip");
+            MdnsConfig::new()
+                .with_local_names(vec![mdns_local_name.to_owned()])
+                .with_local_ip(*local_ip)
+        }
+        _ => MdnsConfig::new(),
     };
 
     if let Some(query_timeout) = mdns_query_timeout {

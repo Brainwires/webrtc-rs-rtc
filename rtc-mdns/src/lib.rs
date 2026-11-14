@@ -196,7 +196,9 @@ pub(crate) mod proto;
 pub(crate) mod socket;
 
 pub use config::MdnsConfig;
-pub use proto::{MDNS_DEST_ADDR, MDNS_MULTICAST_IPV4, MDNS_PORT, Mdns, MdnsEvent, QueryId};
+pub use proto::{
+    MAX_LOCAL_NAMES, MDNS_DEST_ADDR, MDNS_MULTICAST_IPV4, MDNS_PORT, Mdns, MdnsEvent, QueryId,
+};
 
 // Re-export socket utilities for convenience
 pub use shared::ifaces;

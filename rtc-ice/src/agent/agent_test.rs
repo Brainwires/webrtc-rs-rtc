@@ -5,7 +5,8 @@ use stun::textattrs::Username;
 
 use super::*;
 use crate::attributes::{
-    control::AttrControlling, priority::PriorityAttr, use_candidate::UseCandidateAttr,
+    control::AttrControlled, control::AttrControlling, priority::PriorityAttr,
+    use_candidate::UseCandidateAttr,
 };
 use crate::candidate::candidate_host::*;
 use crate::candidate::candidate_peer_reflexive::*;
@@ -3865,5 +3866,292 @@ fn test_mdns_resolved_candidates_respect_the_remote_candidate_cap() -> Result<()
         message: answer.message,
     })?;
     assert_eq!(agent.remote_candidates.len(), MAX_REMOTE_CANDIDATES);
+    Ok(())
+}
+
+/// A Binding request that passes `handle_inbound`'s username and MESSAGE-INTEGRITY checks, as
+/// the controlled peer sends it.
+fn authenticated_check_from_controlled(a: &mut Agent) -> Result<Message> {
+    a.ufrag_pwd.remote_credentials = Some(Credentials {
+        ufrag: "remote".to_string(),
+        pwd: "remotepasswordremotepassword".to_string(),
+    });
+    let username = a.ufrag_pwd.local_credentials.ufrag.clone() + ":remote";
+    let mut msg = Message::new();
+    msg.build(&[
+        Box::new(BINDING_REQUEST),
+        Box::new(TransactionId::new()),
+        Box::new(Username::new(ATTR_USERNAME, username)),
+        Box::new(AttrControlled(a.tie_breaker.wrapping_add(1))),
+        Box::new(PriorityAttr(1)),
+        Box::new(MessageIntegrity::new_short_term_integrity_with_provider(
+            a.ufrag_pwd.local_credentials.pwd.clone(),
+            test_crypto_provider().crypto(),
+        )),
+        Box::new(FINGERPRINT),
+    ])?;
+    Ok(msg)
+}
+
+// A browser offering ICE-TCP as the controlled side connects from an active candidate (port 9 in
+// its SDP) to our passive one. Its checks arrive from the connection's ephemeral port and create
+// a peer-reflexive candidate. That candidate must be active, so it pairs with the passive one
+// (RFC 6544): left without a TCP type it paired with nothing, and a controlling agent, which only
+// checks and nominates pairs it has, never connected.
+#[test]
+fn test_tcp_peer_reflexive_candidate_pairs_with_passive_local() -> Result<()> {
+    let mut a = Agent::new(
+        Instant::now(),
+        Arc::new(AgentConfig {
+            network_types: vec![NetworkType::Tcp4],
+            ..Default::default()
+        }),
+        test_crypto_provider(),
+    )?;
+    a.set_role(true);
+
+    let passive = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "tcp".to_owned(),
+            address: "192.168.1.3".to_owned(),
+            port: 5000,
+            component: 1,
+            ..Default::default()
+        },
+        tcp_type: TcpType::Passive,
+    }
+    .new_candidate_host()?;
+    a.add_local_candidate(passive)?;
+
+    let remote_addr = SocketAddr::from_str("192.168.1.4:45678")?;
+    let mut msg = authenticated_check_from_controlled(&mut a)?;
+    a.handle_inbound(Instant::now(), &mut msg, 0, remote_addr)?;
+
+    let remote_index = a
+        .find_remote_candidate(remote_addr)
+        .expect("the check's source becomes a peer-reflexive candidate");
+    let remote = &a.remote_candidates[remote_index];
+    assert_eq!(remote.candidate_type(), CandidateType::PeerReflexive);
+    assert_eq!(remote.network_type(), NetworkType::Tcp4);
+    assert_eq!(remote.tcp_type(), TcpType::Active);
+    assert!(
+        a.find_pair(0, remote_index).is_some(),
+        "the peer-reflexive active candidate pairs with the passive local one"
+    );
+
+    a.close()?;
+    Ok(())
+}
+
+// A signalled active candidate still forms no pair of its own: it has no port to connect to.
+#[test]
+fn test_signalled_tcp_active_remote_candidate_is_not_added() -> Result<()> {
+    let mut a = Agent::new(
+        Instant::now(),
+        Arc::new(AgentConfig::default()),
+        test_crypto_provider(),
+    )?;
+    let active = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "tcp".to_owned(),
+            address: "192.168.1.4".to_owned(),
+            port: 9,
+            component: 1,
+            ..Default::default()
+        },
+        tcp_type: TcpType::Active,
+    }
+    .new_candidate_host()?;
+    assert!(!a.add_remote_candidate(active)?);
+    assert!(a.remote_candidates.is_empty());
+    a.close()?;
+    Ok(())
+}
+
+// A connection accepted on a passive candidate arrives on that candidate's exact address. An
+// active candidate on the same IP, listed first, used to claim it by its IP-only match.
+#[test]
+fn test_find_local_candidate_prefers_exact_tcp_address() -> Result<()> {
+    let mut a = Agent::new(
+        Instant::now(),
+        Arc::new(AgentConfig::default()),
+        test_crypto_provider(),
+    )?;
+    for (port, tcp_type) in [(9, TcpType::Active), (5000, TcpType::Passive)] {
+        let c = CandidateHostConfig {
+            base_config: CandidateConfig {
+                network: "tcp".to_owned(),
+                address: "192.168.1.3".to_owned(),
+                port,
+                component: 1,
+                ..Default::default()
+            },
+            tcp_type,
+        }
+        .new_candidate_host()?;
+        a.add_local_candidate(c)?;
+    }
+    assert_eq!(
+        a.find_local_candidate(
+            SocketAddr::from_str("192.168.1.3:5000")?,
+            TransportProtocol::TCP
+        ),
+        Some(1),
+        "the passive candidate's own address"
+    );
+    assert_eq!(
+        a.find_local_candidate(
+            SocketAddr::from_str("192.168.1.3:40000")?,
+            TransportProtocol::TCP
+        ),
+        Some(0),
+        "an outbound connection's ephemeral port is the active candidate's"
+    );
+    assert_eq!(
+        a.find_local_candidate(
+            SocketAddr::from_str("192.168.1.3:5000")?,
+            TransportProtocol::UDP
+        ),
+        None
+    );
+    a.close()?;
+    Ok(())
+}
+
+fn host(network: &str, address: &str, port: u16, tcp_type: TcpType) -> Result<Candidate> {
+    CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: network.to_owned(),
+            address: address.to_owned(),
+            port,
+            component: 1,
+            ..Default::default()
+        },
+        tcp_type,
+    }
+    .new_candidate_host()
+}
+
+fn mdns_agent(mode: crate::mdns::MulticastDnsMode, local_ip: Option<IpAddr>) -> Result<Agent> {
+    Agent::new(
+        Instant::now(),
+        Arc::new(AgentConfig {
+            multicast_dns_mode: mode,
+            multicast_dns_local_ip: local_ip,
+            ..Default::default()
+        }),
+        test_crypto_provider(),
+    )
+}
+
+/// Moves every mDNS packet `from` (at `from_ip`) wrote to `to`'s mDNS socket; returns how many.
+fn carry_mdns(from: &mut Agent, from_ip: &str, to: &mut Agent, now: Instant) -> Result<usize> {
+    let mut n = 0;
+    while let Some(packet) = from.poll_write() {
+        if packet.transport.peer_addr.port() != mdns::MDNS_PORT {
+            continue;
+        }
+        to.handle_read(TaggedBytesMut {
+            now,
+            transport: TransportContext {
+                local_addr: "0.0.0.0:5353".parse().unwrap(),
+                peer_addr: format!("{from_ip}:5353").parse().unwrap(),
+                transport_protocol: TransportProtocol::UDP,
+                ecn: None,
+            },
+            message: packet.message,
+        })?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+// Browsers publish every host candidate under an mDNS name, one per address. `QueryAndGather`
+// without a fixed IP used to hide nothing (its one name pointed at 127.0.0.1), so every local
+// address went out in the SDP.
+#[test]
+fn test_query_and_gather_hides_every_local_address() -> Result<()> {
+    let mut a = mdns_agent(crate::mdns::MulticastDnsMode::QueryAndGather, None)?;
+    a.add_local_candidate(host("udp", "192.168.1.3", 5000, TcpType::Unspecified)?)?;
+    a.add_local_candidate(host("tcp", "192.168.1.3", 5001, TcpType::Passive)?)?;
+    a.add_local_candidate(host("udp", "192.168.7.3", 5000, TcpType::Unspecified)?)?;
+    a.add_local_candidate(host("udp", "2001:db8::3", 5000, TcpType::Unspecified)?)?;
+
+    let names: Vec<String> = a
+        .local_candidates
+        .iter()
+        .map(|c| c.address().to_owned())
+        .collect();
+    for name in &names {
+        assert!(
+            name.ends_with(".local") && name.len() == 36 + ".local".len(),
+            "{name} is a <uuid>.local name"
+        );
+    }
+    assert_eq!(
+        names[0], names[1],
+        "one name per address, UDP and TCP alike"
+    );
+    assert_ne!(names[0], names[2]);
+    assert_ne!(names[0], names[3]);
+    assert_ne!(names[2], names[3]);
+    // The candidates still know where they are bound.
+    assert_eq!(
+        a.local_candidates[3].addr(),
+        "[2001:db8::3]:5000".parse::<SocketAddr>()?
+    );
+    a.close()?;
+    Ok(())
+}
+
+// The original fixed-IP form hides that one IPv4 address, now on TCP candidates too (they used
+// to keep the literal address the UDP candidate's name hid).
+#[test]
+fn test_query_and_gather_with_fixed_ip_hides_its_tcp_candidates_too() -> Result<()> {
+    let ip: IpAddr = "192.168.1.3".parse()?;
+    let mut a = mdns_agent(crate::mdns::MulticastDnsMode::QueryAndGather, Some(ip))?;
+    a.add_local_candidate(host("udp", "192.168.1.3", 5000, TcpType::Unspecified)?)?;
+    a.add_local_candidate(host("tcp", "192.168.1.3", 5001, TcpType::Passive)?)?;
+    a.add_local_candidate(host("udp", "192.168.9.9", 5000, TcpType::Unspecified)?)?;
+    assert_eq!(a.local_candidates[0].address(), a.mdns_local_name);
+    assert_eq!(a.local_candidates[1].address(), a.mdns_local_name);
+    assert_eq!(a.local_candidates[2].address(), "192.168.9.9");
+    a.close()?;
+    Ok(())
+}
+
+// End to end, sans-I/O: B resolves the names A publishes, IPv4 and IPv6, and gets A's real
+// addresses as remote candidates.
+#[test]
+fn test_published_mdns_host_candidates_resolve_at_the_peer() -> Result<()> {
+    let now = Instant::now();
+    let mut a = mdns_agent(crate::mdns::MulticastDnsMode::QueryAndGather, None)?;
+    let mut b = mdns_agent(crate::mdns::MulticastDnsMode::QueryOnly, None)?;
+    a.add_local_candidate(host("udp", "192.168.1.3", 5000, TcpType::Unspecified)?)?;
+    a.add_local_candidate(host("udp", "2001:db8::3", 5002, TcpType::Unspecified)?)?;
+    for c in a.local_candidates.clone() {
+        let line = c.marshal();
+        assert!(!line.contains("192.168.1.3") && !line.contains("2001:db8::3"));
+        assert!(!b.add_remote_candidate(unmarshal_candidate(&line)?)?);
+    }
+    assert_eq!(b.mdns_queries.len(), 2);
+
+    b.handle_timeout(now)?;
+    assert_eq!(carry_mdns(&mut b, "192.168.1.4", &mut a, now)?, 2);
+    assert_eq!(carry_mdns(&mut a, "192.168.1.3", &mut b, now)?, 2);
+    b.handle_timeout(now)?;
+
+    let mut resolved: Vec<SocketAddr> = b.remote_candidates.iter().map(|c| c.addr()).collect();
+    resolved.sort();
+    assert_eq!(
+        resolved,
+        vec![
+            "192.168.1.3:5000".parse::<SocketAddr>()?,
+            "[2001:db8::3]:5002".parse::<SocketAddr>()?
+        ]
+    );
+    assert!(b.mdns_queries.is_empty());
+    a.close()?;
+    b.close()?;
     Ok(())
 }

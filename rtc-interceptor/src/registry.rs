@@ -180,6 +180,16 @@ pub enum Slot {
     /// the constraints of each, and those can pull in opposite directions:
     /// [`Slot::TwccReceiver`] is the worked example.
     Custom(usize),
+    /// `KeyFrameRequestInterceptor` — marks inbound PLI and FIR for delivery to the application,
+    /// which is the encoder that has to answer them.
+    ///
+    /// **Inbound only, and it only marks.**
+    ///
+    /// **Why here — application-most.** It neither holds, drops nor generates a packet, so it
+    /// constrains nothing; past every other interceptor, each of them has seen the request before
+    /// it leaves the chain. (Fork addition; see FORK.md. Declared after
+    /// [`Slot::Custom`] so that variant keeps its discriminant.)
+    KeyFrameRequests = 14_000,
 }
 
 impl Slot {
@@ -201,6 +211,7 @@ impl Slot {
             Self::SenderReport => 11_000,
             Self::IntervalPli => 12_000,
             Self::JitterBuffer => 13_000,
+            Self::KeyFrameRequests => 14_000,
             Self::Custom(position) => position,
         }
     }
@@ -656,6 +667,7 @@ mod tests {
             Slot::SenderReport,
             Slot::IntervalPli,
             Slot::JitterBuffer,
+            Slot::KeyFrameRequests,
         ];
 
         for pair in named.windows(2) {
