@@ -86,6 +86,18 @@ impl<'a>
 
             if message.is_empty() {
                 error!("drop invalid packet due to zero length");
+            } else if msg.transport.local_addr.port() == mdns::MDNS_PORT
+                && msg.transport.peer_addr.port() == mdns::MDNS_PORT
+            {
+                // mDNS from the host's mDNS socket goes to the ICE agent, which resolves remote
+                // `.local` candidates and answers for its own. RFC 7983's first-byte ranges
+                // don't apply to DNS: a message ID of 20-63 or 128-191 would otherwise send it
+                // to DTLS or SRTP.
+                self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
+                    now: msg.now,
+                    transport: msg.transport,
+                    message: RTCMessageInternal::Stun(STUNMessage::Raw(message)),
+                });
             } else if match_dtls(&message) {
                 self.ctx.read_outs.push_back(TaggedRTCMessageInternal {
                     now: msg.now,
@@ -160,5 +172,57 @@ impl<'a>
 
     fn close(&mut self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+    use sansio::Protocol;
+    use shared::{TransportContext, TransportProtocol};
+
+    fn read(local: &str, peer: &str, first_byte: u8) -> RTCMessageInternal {
+        let mut ctx = DemuxerHandlerContext::default();
+        let mut stats = RTCStatsAccumulator::new();
+        let mut handler = DemuxerHandler::new(&mut ctx, &mut stats);
+        let mut message = BytesMut::from(&[0u8; 12][..]);
+        message[0] = first_byte;
+        handler
+            .handle_read(TaggedRTCMessageInternal {
+                now: Instant::now(),
+                transport: TransportContext {
+                    local_addr: local.parse().unwrap(),
+                    peer_addr: peer.parse().unwrap(),
+                    ecn: None,
+                    transport_protocol: TransportProtocol::UDP,
+                },
+                message: RTCMessageInternal::Raw(message),
+            })
+            .unwrap();
+        handler.poll_read().unwrap().message
+    }
+
+    /// An mDNS message whose ID falls in the DTLS or SRTP first-byte range still reaches ICE
+    /// when it comes from the mDNS socket; elsewhere RFC 7983 applies as before.
+    #[test]
+    fn mdns_from_the_mdns_socket_goes_to_ice_whatever_its_first_byte() {
+        for first_byte in [0u8, 22, 63, 128, 191, 255] {
+            assert!(
+                matches!(
+                    read("0.0.0.0:5353", "192.168.1.9:5353", first_byte),
+                    RTCMessageInternal::Stun(_)
+                ),
+                "first byte {first_byte}"
+            );
+        }
+        assert!(matches!(
+            read("192.168.1.2:50000", "192.168.1.9:5353", 22),
+            RTCMessageInternal::Dtls(_)
+        ));
+        assert!(matches!(
+            read("192.168.1.2:50000", "192.168.1.9:40000", 128),
+            RTCMessageInternal::Rtp(_)
+        ));
     }
 }
