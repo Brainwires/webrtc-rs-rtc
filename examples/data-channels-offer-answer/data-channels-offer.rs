@@ -190,6 +190,10 @@ async fn main() -> Result<()> {
 
     let local_candidate_init = RTCIceCandidate::from(&candidate).to_json()?;
     peer_connection.add_local_candidate(local_candidate_init.clone())?;
+    // This side's gathering is done: its end-of-candidates goes with the description (a=end-of-candidates). W3C webrtc-pc 5.6.4: the peer's transport is
+    // "failed" only once it has the end of the candidates, "disconnected" until then.
+    peer_connection
+        .add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
 
     // Create channel for HTTP server to send commands to event loop
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(100);
@@ -213,7 +217,8 @@ async fn main() -> Result<()> {
 
     // Now send offer to answer server
     println!("Sending offer to answer server at http://{answer_addr}/sdp");
-    let payload = serde_json::to_string(&offer)?;
+    // The local description: the offer with the candidate and a=end-of-candidates.
+    let payload = serde_json::to_string(&peer_connection.local_description().unwrap_or(offer))?;
     let req = Request::builder()
         .method(Method::POST)
         .uri(format!("http://{answer_addr}/sdp"))
@@ -316,7 +321,8 @@ async fn main() -> Result<()> {
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     Command::AddIceCandidate(candidate) => {
-                        if let Err(e) = peer_connection.add_local_candidate(candidate) {
+                        // The peer's candidate (it was given as a local one).
+                        if let Err(e) = peer_connection.add_remote_candidate(candidate) {
                             eprintln!("Failed to add ICE candidate: {}", e);
                         }
                     }

@@ -13,9 +13,16 @@
 //!
 //! What is asserted is what a viewer sees (the longest time between rendered pictures, the
 //! oldest picture shown: capture to render), what the sender does with the engine's signals
-//! (its encoded rate against the target, no picture encoded in a pause, a key frame when it
-//! ends, no frame discarded by the pacer, the key-frame requests served), and the integrity of
-//! the pictures (the VP8 decoder decodes every picture released, close to its source).
+//! (its encoded rate against the target, no picture encoded in a pause, the pacer's flush at a
+//! capacity collapse answered by a key frame, the key-frame requests served), and the
+//! integrity of the pictures (the VP8 decoder decodes every picture released, close to its
+//! source).
+//!
+//! The engine's default pacer gives its backlog up when the path's capacity collapses
+//! (`PacerBacklog::Flush`, CHANGELOG `conf/flush-1r-backlog-flush-at-collapse`): the source is
+//! not paused, the queue is discarded (`OnPacerDiscard`) and a key frame asked for. The pause
+//! (a target of 0 while the pacer drains what it holds) is what `PacerBacklog::Keep` gives, and
+//! the pause test asks for it, as the engine's `tests/capacity_cap_video_rtc2rtc.rs` does.
 //! `MEASURE` lines print every figure (`--nocapture`).
 
 use std::collections::{HashMap, VecDeque};
@@ -26,7 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use bytes::BytesMut;
 use rtci::crypto::{CryptoError, RTCCrypto, RTCCryptoProvider, RTCRandom, default_provider};
-use rtci::interceptor::Registry;
+use rtci::interceptor::{PacerBacklog, Registry};
 use rtci::media_stream::MediaStreamTrack;
 use rtci::peer_connection::configuration::RTCConfigurationBuilder;
 use rtci::peer_connection::configuration::interceptor_registry::{
@@ -181,6 +188,7 @@ impl Link {
 fn build_pc(
     seed: u64,
     send: bool,
+    backlog: Option<PacerBacklog>,
 ) -> Result<(
     RTCPeerConnection,
     DefaultInterceptorHandles,
@@ -215,6 +223,9 @@ fn build_pc(
     let mut options = DefaultInterceptorOptions::default();
     options.rtcp_random = Some(provider.clone());
     options.wall_clock = Some(SystemInstant::at(start, ANCHOR));
+    if let Some(backlog) = backlog {
+        options.pacer_backlog = backlog;
+    }
     let (registry, handles) =
         register_default_interceptors_with_options(Registry::new(), &mut media_engine, &options)?;
     handles.congestion_control.set_min_bitrate(Some(MIN_BPS));
@@ -308,7 +319,8 @@ struct Call {
     /// Pictures the pipeline encoded while the target it last read was 0.
     sent_in_pause: u32,
     decisions: Vec<(Duration, KeyFrameDecision)>,
-    pacer_discards: u32,
+    /// When each `OnPacerDiscard` of the sender came.
+    pacer_discards: Vec<Duration>,
     queue_drops: u64,
     /// Receiving side.
     receiver_id: Option<RTCRtpReceiverId>,
@@ -327,8 +339,18 @@ fn is_rtp(data: &[u8]) -> bool {
 
 impl Call {
     fn new(link: Link, seed: u64, config: SendConfig) -> Result<Self> {
-        let (spc, shandles, track) = build_pc(seed, true)?;
-        let (rpc, _, _) = build_pc(seed ^ 0xabcd, false)?;
+        Self::with_backlog(link, seed, config, None)
+    }
+
+    /// The call with the pacer's backlog rule set on both peers (`None`: the engine's default).
+    fn with_backlog(
+        link: Link,
+        seed: u64,
+        config: SendConfig,
+        backlog: Option<PacerBacklog>,
+    ) -> Result<Self> {
+        let (spc, shandles, track) = build_pc(seed, true, backlog)?;
+        let (rpc, _, _) = build_pc(seed ^ 0xabcd, false, backlog)?;
         let now = Instant::now();
         let mut call = Self {
             now,
@@ -356,7 +378,7 @@ impl Call {
             frames: Vec::new(),
             sent_in_pause: 0,
             decisions: Vec::new(),
-            pacer_discards: 0,
+            pacer_discards: Vec::new(),
             queue_drops: 0,
             receiver_id: None,
             receiver: None,
@@ -517,7 +539,7 @@ impl Call {
                     }
                     self.connected[0] = *state == RTCPeerConnectionState::Connected;
                 }
-                RTCPeerConnectionEvent::OnPacerDiscard { .. } => self.pacer_discards += 1,
+                RTCPeerConnectionEvent::OnPacerDiscard { .. } => self.pacer_discards.push(at),
                 _ => {}
             }
             if let Some(video) = &mut self.video
@@ -759,8 +781,13 @@ struct CapOutcome {
     receive: ReceiveStats,
 }
 
-fn cap_run(seed: u64, config: SendConfig, name: &str) -> Result<(Call, CapOutcome)> {
-    let mut call = Call::new(Link::open(), seed, config)?;
+fn cap_run(
+    seed: u64,
+    config: SendConfig,
+    backlog: Option<PacerBacklog>,
+    name: &str,
+) -> Result<(Call, CapOutcome)> {
+    let mut call = Call::with_backlog(Link::open(), seed, config, backlog)?;
     call.run_for(Duration::from_secs(20))?;
     let capped_at = call.elapsed();
     let before = call.target_at(capped_at);
@@ -820,7 +847,7 @@ fn cap_run(seed: u64, config: SendConfig, name: &str) -> Result<(Call, CapOutcom
     println!(
         "MEASURE {name} seed {seed}: target before cap {} k, median under {} k, +20 s {} k (estimate {} k); \
          freeze {:.2} s at {:.1} s; oldest picture from the cap {:.2} s; pauses {:?} key on resume {:?} \
-         resumed after {:?}; sent in pause {}; pacer discards {}; queue drops {}; key frames {} \
+         resumed after {:?}; sent in pause {}; pacer discards {:?}; queue drops {}; key frames {} \
          (requests served {} coalesced {} suppressed {}); resolution changes {}, bandwidth-limited {:.1} s; \
          frames encoded {} dropped paused {} framerate {} encoder {}; decoded {} decode errors {} PSNR mean {mean:.1} worst {worst:.1}; \
          receive freezes {} longest {:.0} ms retransmitted {}",
@@ -838,7 +865,10 @@ fn cap_run(seed: u64, config: SendConfig, name: &str) -> Result<(Call, CapOutcom
         o.resumed_with_key,
         o.resumed_after,
         call.sent_in_pause,
-        call.pacer_discards,
+        call.pacer_discards
+            .iter()
+            .map(Duration::as_secs_f64)
+            .collect::<Vec<_>>(),
         call.queue_drops,
         o.send.key_frames_encoded,
         o.send.key_frame_requests_served,
@@ -928,7 +958,7 @@ fn on_an_open_link_the_encoder_follows_the_target() -> Result<()> {
         );
     }
     assert_eq!(call.decode_errors, 0);
-    assert_eq!(call.pacer_discards, 0);
+    assert!(call.pacer_discards.is_empty(), "{:?}", call.pacer_discards);
     assert!(worst > 25.0, "worst picture {worst:.1} dB");
     assert!(
         receive.frames_decoded > 850,
@@ -945,14 +975,42 @@ fn on_an_open_link_the_encoder_follows_the_target() -> Result<()> {
 
 /// The capacity test's cap, comes and goes (20 s open, 20 s at 300 kbit/s, 20 s open), with
 /// the engine's default chain: the video keeps playing, the capped link is used, the target
-/// recovers, nothing is discarded by the pacer.
+/// recovers. When the cap arrives the default pacer gives its backlog up (`PacerBacklog::Flush`,
+/// CHANGELOG `conf/flush-1r-backlog-flush-at-collapse`: "the queue and its retransmissions are
+/// discarded ... and the application is asked for a key frame ... the source is not paused"),
+/// and the pipeline answers with a key frame, so the picture shown stays current.
 #[test]
 fn video_keeps_playing_through_a_capacity_cap_that_comes_and_goes() -> Result<()> {
-    let (call, o) = cap_run(2, SendConfig::default(), "cap")?;
+    let (call, o) = cap_run(2, SendConfig::default(), None, "cap")?;
     assert_eq!(call.decode_errors, 0, "every picture released decodes");
-    assert_eq!(
-        call.pacer_discards, 0,
-        "a sender following the target loses nothing at the pacer"
+    // What the engine's own test of the default chain asserts of a flush
+    // (`a_capacity_collapse_asks_the_application_for_a_key_frame_of_its_video_stream` in
+    // tests/capacity_cap_video_rtc2rtc.rs): nothing is flushed while the path holds, the first
+    // flush comes within a second of the drop, and the next picture written is a key frame.
+    let first = *call
+        .pacer_discards
+        .first()
+        .ok_or_else(|| anyhow!("the default pacer flushed nothing at the collapse"))?;
+    assert!(
+        call.pacer_discards.iter().all(|at| *at >= o.capped_at),
+        "nothing is flushed while the path holds: {:?}",
+        call.pacer_discards
+    );
+    assert!(
+        first <= o.capped_at + Duration::from_secs(1),
+        "the flush came {:?} after the capacity fell",
+        first - o.capped_at
+    );
+    assert!(
+        call.frames
+            .iter()
+            .any(|f| f.2 && f.0 >= first && f.0 <= first + Duration::from_millis(150)),
+        "no key frame sent within 150 ms of the flush at {first:?}"
+    );
+    assert!(
+        o.pauses.is_empty(),
+        "at a flush the source is not paused: {:?}",
+        o.pauses
     );
     assert!(
         o.freeze.0 <= Duration::from_secs(2),
@@ -960,21 +1018,18 @@ fn video_keeps_playing_through_a_capacity_cap_that_comes_and_goes() -> Result<()
         o.freeze.0,
         o.freeze.1
     );
-    // The oldest picture is the engine's pacer backlog: the source was at 2.5 Mbit/s when the
-    // cap came, and what the pacer held is sent at the capped estimate while the target reads
-    // 0 (a pause of 10 to 11.5 s here). Measured 10.17 to 11.67 s on six seeds (hosted runs
-    // 45344063951, 45344738955); the capacity test's own source measured 5.59 to 9.84 s on
-    // the same chain. The guard is 13 s, a tenth above the worst measured. Freeze measured
-    // 1.19 to 1.71 s (guard 2 s, the capacity test's), +20 s 1186 to 1385 kbit/s (guard
-    // 800 kbit/s, the capacity test's).
-    assert!(
-        o.lag <= Duration::from_secs(13),
-        "a picture {:?} old",
-        o.lag
-    );
+    // With the backlog flushed the oldest picture is the half second it takes the estimate to
+    // fall plus the repair, not the pacer's backlog: 0.92 s on this seed (hosted runs
+    // 46137495578 at v0.2.1, 0.94 s in 46137469211 at the train's round 18), against 10.17 to
+    // 11.67 s on six seeds when the pacer kept its backlog (runs 45344063951, 45344738955,
+    // before the flush). The guard is the capacity instrument's picture requirement (a picture
+    // older than 2 s, tests/capacity_instrument.rs). Freeze measured 1.66 s (guard 2 s, the
+    // capacity test's), +20 s 1198 to 1285 kbit/s (guard 800 kbit/s, the capacity test's).
+    assert!(o.lag <= Duration::from_secs(2), "a picture {:?} old", o.lag);
     // The median target over the last twelve seconds of the cap: 191 to 260 kbit/s on six
-    // seeds (202 on this one; hosted run 45344738955). Guard 180 kbit/s, about a twentieth
-    // under the lowest (the capacity test's own guard, 200 kbit/s, is for its model source).
+    // seeds with the backlog kept (202 on this one; hosted run 45344738955), 277 kbit/s on
+    // this one with it flushed (run 46137495578). Guard 180 kbit/s, about a twentieth under
+    // the lowest (the capacity test's own guard, 200 kbit/s, is for its model source).
     assert!(o.under >= 180_000.0, "{} bit/s under the cap", o.under);
     // Degraded under the cap or not, the source's format is back when the target is.
     assert_eq!(o.send.frame_size, Some((WIDTH, HEIGHT)));
@@ -997,15 +1052,19 @@ fn video_keeps_playing_through_a_capacity_cap_that_comes_and_goes() -> Result<()
     Ok(())
 }
 
-/// The pacer's pause in the same call (a target of 0 when the pacer holds a second of media):
-/// no picture is encoded while the target reads 0, no key frame is made because a pause ended
-/// (the default), every picture decodes, and the receiver renders within a second of each
-/// pause's end. In this call the receiver asks for a key frame during every long pause, so one
-/// is due at the resume whatever `key_frame_on_resume` says: the resume rule itself is held by
-/// the unit tests in `send_test.rs` (a forced key frame by default fails two of them).
+/// The pacer's pause in the same call (a target of 0 when the pacer holds a second of media),
+/// with the backlog kept (`PacerBacklog::Keep` on both peers: the default flushes it instead and
+/// does not pause, CHANGELOG `conf/flush-1r-backlog-flush-at-collapse`; the engine's
+/// `with_the_backlog_kept_a_capacity_collapse_asks_the_application_for_nothing` holds that
+/// `Keep` pauses): no picture is encoded while the target reads 0, no key frame is made
+/// because a pause ended (the default), the pacer discards nothing, every picture decodes, and
+/// the receiver renders within a second of each pause's end. In this call the receiver asks for
+/// a key frame during every long pause, so one is due at the resume whatever
+/// `key_frame_on_resume` says: the resume rule itself is held by the unit tests in
+/// `send_test.rs` (a forced key frame by default fails two of them).
 #[test]
 fn a_pacer_pause_stops_the_encoder_and_the_video_resumes_within_a_second() -> Result<()> {
-    let (call, o) = cap_run(3, SendConfig::default(), "pause")?;
+    let (call, o) = cap_run(3, SendConfig::default(), Some(PacerBacklog::Keep), "pause")?;
     assert!(!o.pauses.is_empty(), "the pacer paused the sender");
     assert_eq!(call.sent_in_pause, 0, "nothing encoded in a pause");
     assert!(o.send.frames_dropped_paused > 0);
@@ -1020,7 +1079,7 @@ fn a_pacer_pause_stops_the_encoder_and_the_video_resumes_within_a_second() -> Re
             "rendered {after:?} after a pause"
         );
     }
-    assert_eq!(call.pacer_discards, 0);
+    assert!(call.pacer_discards.is_empty(), "{:?}", call.pacer_discards);
     assert_eq!(call.decode_errors, 0);
     Ok(())
 }
@@ -1073,12 +1132,18 @@ fn loss_is_repaired_by_nack_and_every_picture_decodes() -> Result<()> {
     Ok(())
 }
 
-/// The same call with the `Chrome` configuration (one key-frame request served per 300 ms,
-/// `maintain-framerate`), for comparison: prints, asserts the basics only.
+/// The same call (the backlog kept, so the pacer pauses) with the `Chrome` configuration (one
+/// key-frame request served per 300 ms, `maintain-framerate`), for comparison: prints, asserts
+/// the basics only.
 #[test]
 #[ignore = "measurement: run with --ignored --nocapture"]
 fn measure_the_pause_with_the_chrome_configuration() -> Result<()> {
-    let (call, o) = cap_run(3, SendConfig::chrome(), "pause chrome")?;
+    let (call, o) = cap_run(
+        3,
+        SendConfig::chrome(),
+        Some(PacerBacklog::Keep),
+        "pause chrome",
+    )?;
     assert_eq!(call.sent_in_pause, 0);
     assert_eq!(call.decode_errors, 0);
     println!("MEASURE pause chrome: freeze {:?}", o.freeze.0);
@@ -1133,7 +1198,7 @@ fn measure_the_capacity_cap_over_seeds() -> Result<()> {
         .split(',')
         .filter_map(|s| s.trim().parse::<u64>().ok())
     {
-        cap_run(seed, SendConfig::default(), "seeds")?;
+        cap_run(seed, SendConfig::default(), None, "seeds")?;
     }
     Ok(())
 }

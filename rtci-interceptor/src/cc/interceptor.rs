@@ -11,6 +11,7 @@ use super::tmmbr_request::{TmmbrControl, TmmbrRequester};
 use crate::Interceptor;
 use crate::circuit_breaker::CircuitBreakerHandle;
 use crate::never_sent::NeverSent;
+use crate::rtcp_session::RegularTiming;
 use crate::rtpfb::acknowledgement::PacketReport;
 use crate::rtpfb::convert::FeedbackTimeline;
 use crate::rtpfb::history::History;
@@ -328,6 +329,9 @@ impl<E: BandwidthEstimator> CongestionControlBuilder<E> {
 struct Shared {
     target: f64,
     stats: EstimatorStats,
+    /// Feedback batches handed to the estimator: per-packet congestion control feedback
+    /// (transport-wide or RFC 8888), and before any of it the loss of receiver reports.
+    feedback: u64,
     session_max: Option<f64>,
     min: Option<f64>,
     remb: Option<f64>,
@@ -365,13 +369,40 @@ pub struct CongestionControlHandle {
 
 impl CongestionControlHandle {
     /// The current target, in bits per second.
+    ///
+    /// Before any feedback ([`has_feedback`](Self::has_feedback) `false`) this is the
+    /// estimator's start (300 kbit/s for the default [`Gcc`](crate::Gcc)), within the floor
+    /// and ceiling and any limit already given (`b=AS` / `b=TIAS`, REMB, TMMBR): never zero,
+    /// never a measurement.
     pub fn target_bitrate(&self) -> f64 {
         lock(&self.shared).target
     }
 
     /// What the estimator says about itself.
+    ///
+    /// For [`Gcc`](crate::Gcc), before any feedback: `delay_based_bitrate` and
+    /// `loss_based_bitrate` are already `Some` (both halves start at the start value), so they
+    /// do not tell whether feedback arrived; `packet_loss` is `None` until a feedback batch or a
+    /// receiver report's loss was folded in, and `round_trip_time` until feedback or a receiver
+    /// report implied a round-trip time. Use [`has_feedback`](Self::has_feedback).
     pub fn stats(&self) -> EstimatorStats {
         lock(&self.shared).stats
+    }
+
+    /// Whether the target comes from the path yet: `true` once the estimator was given
+    /// feedback ([`feedback_reports`](Self::feedback_reports) above zero), `false` while
+    /// [`target_bitrate`](Self::target_bitrate) is still the start value it was built with.
+    pub fn has_feedback(&self) -> bool {
+        lock(&self.shared).feedback > 0
+    }
+
+    /// How many feedback batches the estimator has been given: each RTCP packet carrying
+    /// per-packet congestion control feedback (transport-wide congestion control or RFC 8888)
+    /// that reported packets this controller sent, and, while no such feedback has arrived,
+    /// each receiver report block whose fraction lost was used instead (draft-ietf-rmcat-gcc-02
+    /// section 7). Counts from the controller's start; a path change does not reset it.
+    pub fn feedback_reports(&self) -> u64 {
+        lock(&self.shared).feedback
     }
 
     /// The bit rate the remote description allows this endpoint to send (`b=AS`, `b=TIAS`), in
@@ -669,10 +700,17 @@ impl<E: BandwidthEstimator> CongestionControlInterceptor<E> {
                 })
                 .collect(),
         };
+        let mut message = AttributedPacket::new(Packet::Rtcp(vec![Box::new(request)]));
+        if self.tmmbr_requests.repeats_only() {
+            // RFC 5104 section 4.2.1.3: "Any repetition of a request message SHOULD use
+            // regular RTCP mode for its transmission timing": the RTCP session holds it for
+            // its next Regular compound packet.
+            message = message.with(Attribute::Custom(Arc::new(RegularTiming)));
+        }
         self.write_queue.push_back(TaggedPacket {
             now,
             transport: shared::TransportContext::default(),
-            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(request)])),
+            message,
         });
     }
 
@@ -873,6 +911,7 @@ impl<E: BandwidthEstimator> CongestionControlInterceptor<E> {
                         fraction_lost = interval.fraction_lost();
                     }
                     self.estimator.on_receiver_report(now, fraction_lost);
+                    lock(&self.shared).feedback += 1;
                 }
             }
         }
@@ -1233,6 +1272,9 @@ impl<E: BandwidthEstimator> Protocol<TaggedPacket, TaggedPacket, ()>
             self.per_packet_feedback = true;
             let reports = self.history.take_reports();
             self.estimator.on_reports(msg.now, &reports);
+            if !reports.is_empty() {
+                lock(&self.shared).feedback += 1;
+            }
             self.collect_probe_reports(msg.now, &reports);
         }
         self.apply_bounds(msg.now);

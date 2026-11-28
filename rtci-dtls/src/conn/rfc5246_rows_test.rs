@@ -433,10 +433,11 @@ fn a_message_larger_than_the_mtu_is_sent_whole() -> Result<()> {
     Ok(())
 }
 
+/// A ClientHello's cipher suites and its extensions (type, data).
+type SuitesAndExtensions = (Vec<u16>, Vec<(u16, Vec<u8>)>);
+
 /// The cipher suites and the extensions of the first ClientHello `client` writes.
-fn client_hello_suites_and_extensions(
-    client: ConfigBuilder,
-) -> Result<(Vec<u16>, Vec<(u16, Vec<u8>)>)> {
+fn client_hello_suites_and_extensions(client: ConfigBuilder) -> Result<SuitesAndExtensions> {
     let mut pair = Pair::new(client, server_builder())?;
     let hello = take(&mut pair.client);
     let datagram = &hello[0];

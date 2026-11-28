@@ -10,13 +10,13 @@ mod common;
 
 use common::{Peer, Result, negotiate, run_until};
 use rtci::ice::mdns::MulticastDnsMode;
-use rtci::mdns::MDNS_PORT;
+use rtci::mdns::{MDNS_MULTICAST_IPV4, MDNS_PORT, MdnsRateLimit};
 use rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtci::peer_connection::transport::RTCIceCandidateType;
 use rtci_stream_driver::peer::PeerDriverConfig;
 use rtci_stream_driver::runtime::mock::LinkConfig;
 use rtci_stream_driver::runtime::{MockRuntime, Runtime};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -238,5 +238,142 @@ fn drivers_on_a_lan_of_public_addresses_resolve_each_other() -> Result<()> {
         b.driver.pc().connection_state(),
         b.selected_remote_type()
     );
+    Ok(())
+}
+
+/// draft-ietf-mmusic-mdns-ice-candidates section 7.1: one rate limit over all mDNS queries and
+/// responses. Two connections whose drivers share a small budget (1 at once, then 1 a second)
+/// send together no more than it allows over the whole exchange (probes, announcements,
+/// queries and answers of both), and still connect: what the budget refused waited, and
+/// leaves later at the budget's rate. (On the mock network and clock: it was a test of
+/// `tests/mdns.rs` on the host's mDNS group, where it failed whenever the host did not
+/// deliver multicast to itself, which says nothing of the budget.)
+#[test]
+fn two_drivers_send_their_mdns_within_one_shared_budget_on_virtual_time() -> Result<()> {
+    const BURST: u32 = 1;
+    const PER_SECOND: u32 = 1;
+    let runtime = MockRuntime::new();
+    let shared: Arc<dyn Runtime> = Arc::new(runtime.clone());
+    let limit = MdnsRateLimit::new(BURST, PER_SECOND);
+    let config = |ip: IpAddr| PeerDriverConfig {
+        mdns_rate_limit: Some(limit.clone()),
+        ..PeerDriverConfig::on(vec![ip])
+    };
+    let mut a = Peer::with_config(shared.clone(), publishing(), config(A))?;
+    let mut b = Peer::with_config(shared, publishing(), config(B))?;
+    let start = runtime.now();
+    let up = runtime.run(async {
+        negotiate(&mut a, &mut b)?;
+        let up = run_until(&mut a, &mut b, STEP, 10_000, |a, b| {
+            a.connected() && b.connected()
+        })
+        .await?;
+        // The exchange goes on for a while, and what the budget held leaves at its rate.
+        run_until(&mut a, &mut b, STEP, 10_000, |a, _| {
+            a.now().duration_since(start) >= Duration::from_secs(4)
+        })
+        .await?;
+        Ok::<bool, Box<dyn std::error::Error>>(up)
+    })?;
+    let elapsed = runtime.now().duration_since(start);
+    let sent = a.driver.mdns_datagrams_sent() + b.driver.mdns_datagrams_sent();
+    let allowed = u64::from(BURST) + (elapsed.as_secs_f64() * f64::from(PER_SECOND)).ceil() as u64;
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "the exchange ran {elapsed:?} of virtual time"
+    );
+    assert!(
+        sent <= allowed,
+        "{sent} mDNS datagrams in {elapsed:?}: the shared budget allows {allowed}"
+    );
+    assert!(
+        sent > u64::from(BURST),
+        "the held mDNS left after the burst: {sent}"
+    );
+    assert!(
+        up,
+        "connected, the held mDNS sent as the budget allowed: a {:?} / b {:?}",
+        a.driver.pc().connection_state(),
+        b.driver.pc().connection_state()
+    );
+    Ok(())
+}
+
+/// What two publishing drivers whose only address is 127.0.0.1 did on the mock network.
+struct OnLoopback {
+    /// Datagrams sent to the IPv4 mDNS group from 127.0.0.1.
+    group_from_loopback: usize,
+    /// Whether the IPv4 mDNS socket of each was bound and usable.
+    available: (bool, bool),
+    /// Both connected over the peer's resolved name.
+    up: bool,
+}
+
+const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+/// Two drivers on 127.0.0.1 configured by `config` (one each), run to a connection over each
+/// other's resolved `.local` name (at most 2000 rounds).
+fn drivers_on_loopback(config: impl Fn() -> PeerDriverConfig) -> Result<OnLoopback> {
+    let runtime = MockRuntime::new();
+    let shared: Arc<dyn Runtime> = Arc::new(runtime.clone());
+    let mut a = Peer::with_config(shared.clone(), publishing(), config())?;
+    let mut b = Peer::with_config(shared, publishing(), config())?;
+    let up = resolve_and_connect(&runtime, &mut a, &mut b)?;
+    let group_from_loopback = runtime
+        .net()
+        .log()
+        .iter()
+        .filter(|d| d.to == SocketAddr::from((MDNS_MULTICAST_IPV4, MDNS_PORT)))
+        .filter(|d| d.from.ip() == LOOPBACK)
+        .count();
+    Ok(OnLoopback {
+        group_from_loopback,
+        available: (
+            a.driver.mdns_available(false),
+            b.driver.mdns_available(false),
+        ),
+        up,
+    })
+}
+
+/// With `PeerDriverConfig::mdns_on_loopback_on_windows` (and on every system other than
+/// Windows whatever it says), drivers on loopback announce and answer their names on the IPv4
+/// group from 127.0.0.1, resolve each other's and connect: the baseline of the next test, which
+/// varies only the setting.
+#[test]
+fn drivers_asked_for_mdns_on_loopback_send_it_there_and_connect() -> Result<()> {
+    let run = drivers_on_loopback(|| PeerDriverConfig {
+        mdns_on_loopback_on_windows: true,
+        ..PeerDriverConfig::on(vec![LOOPBACK])
+    })?;
+    assert!(
+        run.group_from_loopback > 0,
+        "mDNS went to the group from 127.0.0.1"
+    );
+    assert_eq!(run.available, (true, true), "both IPv4 mDNS sockets bound");
+    assert!(run.up, "connected over the resolved loopback names");
+    Ok(())
+}
+
+/// The 0.3.0 default on Windows: a driver sends no mDNS to the IPv4 group from a loopback
+/// address and binds no IPv4 mDNS socket for loopback-only addresses, since on Windows that
+/// traffic leaves the group's destination-cache route on loopback for the whole host
+/// (`peer` module documentation). On other systems the default changes nothing: the same
+/// exchange as the test above.
+#[test]
+fn by_default_drivers_on_loopback_send_no_mdns_there_on_windows_only() -> Result<()> {
+    // `PeerDriverConfig::on`'s default, not set here: what is tested is the default itself.
+    let run = drivers_on_loopback(|| PeerDriverConfig::on(vec![LOOPBACK]))?;
+    if cfg!(windows) {
+        assert_eq!(
+            run.group_from_loopback, 0,
+            "no mDNS to the group from 127.0.0.1"
+        );
+        assert_eq!(run.available, (false, false), "no IPv4 mDNS socket");
+    } else {
+        assert!(run.group_from_loopback > 0, "unchanged off Windows");
+        assert_eq!(run.available, (true, true));
+        assert!(run.up);
+    }
     Ok(())
 }

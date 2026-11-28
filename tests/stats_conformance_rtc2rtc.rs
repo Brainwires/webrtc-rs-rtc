@@ -1708,8 +1708,10 @@ fn a_transport_reports_the_session_it_negotiated() -> Result<()> {
     Ok(())
 }
 
-/// webrtc-stats 4.3 and 7.1: a transport that fails has no selected pair any more, which
-/// `selectedCandidatePairChanges` counts; and the report stays available after `close()`.
+/// webrtc-stats 4.3 and 7.1: a transport whose consent expired has no selected pair any
+/// more, which `selectedCandidatePairChanges` counts, while it is "disconnected" waiting for
+/// the end of the candidates (W3C webrtc-pc 5.6.4) and once it is "failed"; and the report
+/// stays available after `close()`.
 #[test]
 fn losing_the_selected_pair_is_a_change_and_stats_outlive_close() -> Result<()> {
     let (mut world, sender) = World::connected(VIDEO)?;
@@ -1722,10 +1724,36 @@ fn losing_the_selected_pair_is_a_change_and_stats_outlive_close() -> Result<()> 
         1
     );
 
-    // Nothing gets through any more: consent expires and ICE fails.
+    // Nothing gets through any more: consent expires. No end of the candidates has been
+    // signalled: "disconnected", and the pair is gone.
     world.blackhole = true;
     world.fail_on_failed = false;
     world.run_for(Duration::from_secs(60))?;
+    assert!(
+        !world.peers[0]
+            .states
+            .contains(&RTCPeerConnectionState::Failed),
+        "{:?}",
+        world.peers[0].states
+    );
+    let now = world.now;
+    let lost = world.peers[0].stats(now);
+    let transport = one(&lost, "transport");
+    assert_eq!(transport["iceState"], "disconnected");
+    assert!(!has(transport, "selectedCandidatePairId"), "{transport}");
+    assert_eq!(u(transport, "selectedCandidatePairChanges"), 2);
+
+    // The application ends its gathering and relays the peer's end-of-candidates: ICE fails.
+    world.peers[0]
+        .pc
+        .add_local_candidate(RTCIceCandidateInit::default())?;
+    world.peers[0]
+        .pc
+        .add_remote_candidate(RTCIceCandidateInit {
+            sdp_mline_index: Some(0),
+            ..Default::default()
+        })?;
+    world.run_for(Duration::from_secs(1))?;
     assert!(
         world.peers[0]
             .states

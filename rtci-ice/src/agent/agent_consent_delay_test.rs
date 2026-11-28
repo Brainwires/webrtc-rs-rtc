@@ -18,6 +18,8 @@ use sansio::Protocol;
 
 use super::agent_rfc8445_test::*;
 use super::*;
+use crate::attributes::control::AttrControlling;
+use crate::attributes::priority::PriorityAttr;
 use crate::candidate::candidate_host::CandidateHostConfig;
 
 const MS: Duration = Duration::from_millis(1);
@@ -36,6 +38,10 @@ struct Trace {
     ignored: Vec<(Instant, TransactionId)>,
     /// The most consent transactions the agent held open at once.
     most_open_consent_transactions: usize,
+    /// When the agent's media path went away (consent expired, RFC 7675 Section 5.1), if it
+    /// did. The agent is `Failed` then or, within the PAC timer, when the timer expires (W3C
+    /// webrtc-pc 5.6.4).
+    lost: Option<Instant>,
 }
 
 impl Trace {
@@ -88,7 +94,11 @@ impl SlowPeer {
                 let (response, peer) = entry.remove();
                 Self::arrive(a, now, &response, peer, &mut trace);
             }
+            let had_path = a.media_path().is_some();
             a.handle_timeout(now).unwrap();
+            if had_path && a.media_path().is_none() {
+                trace.lost.get_or_insert(now);
+            }
             while let Some(t) = a.poll_write() {
                 let mut m = Message {
                     raw: t.message.to_vec(),
@@ -162,6 +172,14 @@ fn connected(config: AgentConfig) -> (Agent, SlowPeer, Instant) {
     peer.run(&mut a, start, start + S, |_, _, _| Some(20 * MS));
     assert_eq!(a.state(), ConnectionState::Connected);
     (a, peer, start + S)
+}
+
+/// Tells `a` that no candidate is to come on either side, so that consent that expires fails
+/// it (W3C webrtc-pc 5.6.4: "failed" needs the end of the candidates; without it the agent is
+/// disconnected).
+fn no_more_candidates(a: &mut Agent) {
+    a.set_local_gathering_complete();
+    a.set_remote_end_of_candidates();
 }
 
 fn fixed(wait: Duration) -> AgentConfig {
@@ -330,15 +348,13 @@ fn test_a_consent_request_waits_sixteen_times_the_rto_for_its_response() {
 #[test]
 fn test_a_response_after_its_wait_renews_nothing_unless_the_wait_is_fixed() {
     let (mut a, mut peer, now) = connected(config(true));
+    no_more_candidates(&mut a);
     let last = selected_consent(&a);
     let trace = peer.run(&mut a, now, now + 120 * S, |_, _, _| Some(9 * S));
     assert_eq!(trace.renewed, vec![], "an answer 9 s after its request");
     assert!(trace.ignored.len() >= 3);
-    assert!(
-        is_at(trace.at(ConnectionState::Failed), last + 30 * S),
-        "{:?}",
-        trace.states
-    );
+    assert!(is_at(trace.lost, last + 30 * S), "{:?}", trace.states);
+    assert!(trace.saw(ConnectionState::Failed), "{:?}", trace.states);
     assert!(a.pending_binding_requests.is_empty());
 
     let (mut a, mut peer, now) = connected(fixed(60 * S));
@@ -406,7 +422,8 @@ fn test_no_consent_transaction_is_kept_past_the_consent_expiry() {
 }
 
 /// A peer that stops answering: the agent is `Disconnected` when a consent request has gone
-/// 5 s without any response and `Failed` 30 s after the last response, and then holds no
+/// 5 s without any response, loses consent (its media path) 30 s after the last response and
+/// is `Failed` then or as the PAC timer expires (W3C webrtc-pc 5.6.4), and then holds no
 /// transaction (RFC 7675 Section 5.1: "All outstanding STUN consent transactions for a
 /// candidate pair MUST be discarded when consent expires"). Until then the open consent
 /// transactions are few: the requests are 4 to 6 s apart and each waits 8 s (the initial
@@ -420,6 +437,7 @@ fn test_unanswered_consent_transactions_are_bounded_and_end_with_the_consent() {
         (fixed(60 * S), None, 4..=8),
     ] {
         let (mut a, mut peer, mut now) = connected(cfg);
+        no_more_candidates(&mut a);
         if let Some(round_trip) = warm_up {
             peer.run(&mut a, now, now + 60 * S, |_, _, _| Some(round_trip));
             now += 60 * S;
@@ -429,10 +447,11 @@ fn test_unanswered_consent_transactions_are_bounded_and_end_with_the_consent() {
         // (The answers still on their way when the peer stopped arrive first.)
         let last = trace.renewed.last().map_or(before, |(at, _)| *at);
         assert!(
-            is_at(trace.at(ConnectionState::Failed), last + 30 * S),
+            is_at(trace.lost, last + 30 * S),
             "{:?} after the last response",
-            trace.at(ConnectionState::Failed).map(|at| at - last)
+            trace.lost.map(|at| at - last)
         );
+        assert!(trace.saw(ConnectionState::Failed), "{:?}", trace.states);
         if warm_up.is_none() {
             let first_unanswered = trace.requests[0].0;
             assert!(
@@ -558,8 +577,8 @@ fn test_only_a_matching_authenticated_response_renews_consent() {
 /// The selected pair's consent is its own. A check on another pair that is answered late
 /// (its transaction was cancelled at the nomination and waits out its time, RFC 8445 Section
 /// 7.3.1.4) makes that pair valid and says nothing about the selected one, whose peer
-/// address has stopped answering: the agent fails 30 s after the selected pair's last
-/// response.
+/// address has stopped answering: consent is lost (no media path) 30 s after the selected
+/// pair's last response, and the agent fails (then, or as the PAC timer expires).
 #[test]
 fn test_a_late_response_on_another_pair_does_not_renew_the_selected_pairs_consent() {
     let start = Instant::now();
@@ -585,6 +604,7 @@ fn test_a_late_response_on_another_pair_does_not_renew_the_selected_pairs_consen
     }
     a.start_connectivity_checks(start, true, REMOTE_UFRAG.to_owned(), REMOTE_PWD.to_owned())
         .unwrap();
+    no_more_candidates(&mut a);
     let mut peer = SlowPeer::default();
     let trace = peer.run(&mut a, start, start + 120 * S, |at, _, to| {
         if to == addr(REMOTE_B) {
@@ -614,9 +634,259 @@ fn test_a_late_response_on_another_pair_does_not_renew_the_selected_pairs_consen
     assert_eq!(other.len(), 1, "the other pair's late response was taken");
     assert!(other[0] > selected_last);
     assert!(
-        is_at(trace.at(ConnectionState::Failed), selected_last + 30 * S),
+        is_at(trace.lost, selected_last + 30 * S),
         "{:?}",
         trace.states
+    );
+    assert!(trace.saw(ConnectionState::Failed), "{:?}", trace.states);
+}
+
+/// Consent is per 5-tuple (RFC 7675 Section 1: "Consent to send applies to a single
+/// 5-tuple"; Section 5.1: without a valid response "from the remote peer's transport
+/// address in 30 seconds, the endpoint MUST cease transmission on that 5-tuple"). Two local
+/// candidates with bases of their own, one remote candidate: (L1, R) is selected while the
+/// check on (L2, R) is still open. From then on nothing sent from L1 is answered, and the
+/// open (L2, R) check is answered 10 s later, from the same remote address. That response
+/// is taken (it validates (L2, R)) but says nothing of the 5-tuple (L1, R): consent is lost
+/// 30 s after the last response on (L1, R), and the agent fails.
+#[test]
+fn test_a_late_response_on_another_pair_to_the_same_remote_does_not_renew_consent() {
+    const LOCAL_2: &str = "192.168.0.5:1001";
+    let start = Instant::now();
+    let mut a = Agent::new(start, Arc::new(config(true)), provider()).unwrap();
+    a.add_local_candidate(host_with_priority(addr(LOCAL), 500))
+        .unwrap();
+    a.add_local_candidate(host_with_priority(addr(LOCAL_2), 400))
+        .unwrap();
+    a.add_remote_candidate(host(addr(REMOTE_A))).unwrap();
+    a.start_connectivity_checks(start, true, REMOTE_UFRAG.to_owned(), REMOTE_PWD.to_owned())
+        .unwrap();
+    no_more_candidates(&mut a);
+
+    let to_agent = |a: &mut Agent, now: Instant, m: &Message, local: &str| {
+        a.handle_read(TaggedBytesMut {
+            now,
+            transport: TransportContext {
+                local_addr: addr(local),
+                peer_addr: addr(REMOTE_A),
+                ecn: None,
+                transport_protocol: TransportProtocol::UDP,
+            },
+            message: BytesMut::from(&m.raw[..]),
+        })
+    };
+
+    // Responses on their way: arrival, the response, the local address it arrives at.
+    let mut in_flight: Vec<(Instant, Message, &str)> = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let mut open_on_l2: Option<TransactionId> = None;
+    let mut selected_at: Option<Instant> = None;
+    let mut last_on_l1: Option<Instant> = None;
+    let mut l2_answered_at: Option<Instant> = None;
+    let mut l2_taken = false;
+    let mut selected_local: Option<SocketAddr> = None;
+    let mut failed_at: Option<Instant> = None;
+    // When the media path went away (consent expired): `Failed` then, or as the PAC timer
+    // expires when that is later (W3C webrtc-pc 5.6.4).
+    let mut lost_at: Option<Instant> = None;
+    let mut now = start;
+    let until = start + 120 * S;
+    while now <= until && failed_at.is_none() {
+        in_flight.sort_by_key(|(at, _, _)| *at);
+        while in_flight.first().is_some_and(|(at, _, _)| *at <= now) {
+            let (_, response, local) = in_flight.remove(0);
+            let _ = to_agent(&mut a, now, &response, local);
+            if local == LOCAL {
+                last_on_l1 = Some(now);
+            } else {
+                l2_answered_at = Some(now);
+                // The response was matched and taken: consent from the remote candidate,
+                // on the other 5-tuple.
+                let remote = a.find_remote_candidate(addr(REMOTE_A)).unwrap();
+                l2_taken = a.remote_candidates[remote].last_consent() == Some(now);
+            }
+        }
+        let had_path = a.media_path().is_some();
+        a.handle_timeout(now).unwrap();
+        if had_path && a.media_path().is_none() {
+            lost_at.get_or_insert(now);
+        }
+        while let Some(t) = a.poll_write() {
+            let mut m = Message {
+                raw: t.message.to_vec(),
+                ..Message::default()
+            };
+            m.decode().unwrap();
+            if m.typ != BINDING_REQUEST || !seen.insert(m.transaction_id) {
+                continue;
+            }
+            let response = peer_response(BINDING_SUCCESS, m.transaction_id, addr(LOCAL), None);
+            if t.transport.local_addr == addr(LOCAL_2) {
+                // The first check on (L2, R) is answered 10 s after the selection; nothing
+                // else sent from L2 is.
+                if open_on_l2.is_none() {
+                    open_on_l2 = Some(m.transaction_id);
+                }
+            } else if selected_at.is_none() {
+                // Until the selection (L1, R) answers after 100 ms, so that the check on
+                // (L2, R) is sent and open when (L1, R) is nominated.
+                in_flight.push((now + 100 * MS, response, LOCAL));
+            }
+        }
+        while let Some(e) = a.poll_event() {
+            match e.event {
+                Event::ConnectionStateChange(ConnectionState::Connected)
+                    if selected_at.is_none() =>
+                {
+                    selected_at = Some(e.now);
+                    selected_local = a.get_selected_candidate_pair().map(|(l, _)| l.addr());
+                }
+                Event::ConnectionStateChange(ConnectionState::Failed) => failed_at = Some(e.now),
+                _ => {}
+            }
+        }
+        if let (Some(selected), Some(id), None) = (selected_at, open_on_l2, l2_answered_at)
+            && !in_flight.iter().any(|(_, m, _)| m.transaction_id == id)
+        {
+            // The L2 check, answered from the remote's address 10 s after the selection.
+            let response = peer_response(BINDING_SUCCESS, id, addr(LOCAL_2), None);
+            in_flight.push((selected + 10 * S, response, LOCAL_2));
+        }
+        let arrival = in_flight.iter().map(|(at, _, _)| *at).min();
+        let next = match (a.poll_timeout(), arrival) {
+            (Some(timer), Some(arrival)) => Some(timer.min(arrival)),
+            (timer, arrival) => timer.or(arrival),
+        };
+        match next {
+            Some(next) => now = next.max(now + Duration::from_micros(1)),
+            None => break,
+        }
+    }
+
+    let selected_at = selected_at.expect("(L1, R) was selected");
+    assert_eq!(
+        selected_local,
+        Some(addr(LOCAL)),
+        "the selected pair is (L1, R)"
+    );
+    let last_on_l1 = last_on_l1.unwrap();
+    assert!(last_on_l1 + S >= selected_at && last_on_l1 <= selected_at + S);
+    let l2_answered_at = l2_answered_at.expect("the open check on (L2, R) was answered");
+    assert!(l2_answered_at > last_on_l1 + 5 * S);
+    assert!(l2_taken, "the late response on (L2, R) was matched");
+    assert!(failed_at.is_some(), "the agent fails");
+    assert!(
+        is_at(lost_at, last_on_l1 + 30 * S),
+        "consent lost at {:?}, last response on (L1, R) at {:?}, on (L2, R) at {:?}",
+        lost_at.map(|t| t - start),
+        last_on_l1 - start,
+        l2_answered_at - start,
+    );
+}
+
+/// The pair ICE selects is not the pair that was checked, and the only consent response is
+/// on the checked one. A controlled agent: 10 s after the start the peer nominates (L, R)
+/// with a request carrying USE-CANDIDATE; the agent's triggered check on (L, R) is answered
+/// with an XOR-MAPPED-ADDRESS that is not a local candidate, so the valid pair has a
+/// peer-reflexive local candidate on L's base (RFC 8445 Section 7.2.5.3.1) and the
+/// nomination is accepted on that valid pair (Section 7.2.5.3.4). The response was to a
+/// request sent on the checked pair; it is the selected pair's consent because the two are
+/// one 5-tuple (RFC 7675 Section 1). Nothing after it is answered: the agent fails 30 s
+/// after that response, not 30 s after the start (which is what reading the selected pair's
+/// own responses alone gives).
+#[test]
+fn test_the_response_that_validated_another_pair_is_the_selected_pairs_consent() {
+    const MAPPED: &str = "203.0.113.7:4000";
+    let start = Instant::now();
+    let mut a = started_agent(start, config(false), &[REMOTE_A]);
+    no_more_candidates(&mut a);
+
+    let nominate_at = start + 10 * S;
+    let mut nominated = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut answered_at: Option<Instant> = None;
+    let mut answers = 0;
+    let mut selected: Option<(CandidateType, SocketAddr)> = None;
+    let mut checked_consent_only = false;
+    let mut failed_at: Option<Instant> = None;
+    let mut now = start;
+    while now <= start + 120 * S && failed_at.is_none() {
+        if !nominated && now >= nominate_at {
+            nominated = true;
+            let request = peer_request(
+                &a,
+                vec![
+                    Box::new(AttrControlling(1)),
+                    Box::new(PriorityAttr(1000)),
+                    Box::new(crate::attributes::use_candidate::UseCandidateAttr::new()),
+                ],
+            );
+            deliver(&mut a, now, &request, REMOTE_A).unwrap();
+        }
+        a.handle_timeout(now).unwrap();
+        while let Some(t) = a.poll_write() {
+            let mut m = Message {
+                raw: t.message.to_vec(),
+                ..Message::default()
+            };
+            m.decode().unwrap();
+            if m.typ != BINDING_REQUEST || !seen.insert(m.transaction_id) {
+                continue;
+            }
+            // Only the check the nomination triggers is answered, at once.
+            if nominated && selected.is_none() && answered_at.is_none() {
+                let response = peer_response(BINDING_SUCCESS, m.transaction_id, addr(MAPPED), None);
+                deliver(&mut a, now, &response, REMOTE_A).unwrap();
+                answered_at = Some(now);
+                answers += 1;
+            }
+        }
+        while let Some(e) = a.poll_event() {
+            match e.event {
+                Event::ConnectionStateChange(ConnectionState::Connected) if selected.is_none() => {
+                    let pair = a.selected_pair.expect("a selected pair");
+                    selected = a
+                        .get_selected_candidate_pair()
+                        .map(|(l, _)| (l.candidate_type(), l.addr()));
+                    // The consent is on the checked pair, not on the selected one.
+                    checked_consent_only = a.candidate_pairs[pair].last_consent.is_none()
+                        && a.candidate_pairs
+                            .iter()
+                            .any(|p| p.last_consent == answered_at);
+                }
+                Event::ConnectionStateChange(ConnectionState::Failed) => failed_at = Some(e.now),
+                _ => {}
+            }
+        }
+        let next = a.poll_timeout();
+        let next = if nominated {
+            next
+        } else {
+            Some(next.map_or(nominate_at, |n| n.min(nominate_at)))
+        };
+        match next {
+            Some(next) => now = next.max(now + Duration::from_micros(1)),
+            None => break,
+        }
+    }
+
+    let answered_at = answered_at.expect("the triggered check was answered");
+    assert_eq!(answers, 1);
+    assert!(answered_at >= nominate_at);
+    assert_eq!(
+        selected,
+        Some((CandidateType::PeerReflexive, addr(MAPPED))),
+        "the selected pair is the valid pair, not the checked one"
+    );
+    assert!(
+        checked_consent_only,
+        "the only response is recorded on the checked pair"
+    );
+    assert!(
+        is_at(failed_at, answered_at + 30 * S),
+        "failed at {:?}, the one response at {:?}",
+        failed_at.map(|t| t - start),
+        answered_at - start,
     );
 }
 

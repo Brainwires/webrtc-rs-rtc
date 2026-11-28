@@ -7,6 +7,7 @@ pub struct AssociationStats {
     n_ack_timeouts: u64,
     n_fast_retrans: u64,
     n_retransmissions: u64,
+    n_partially_reliable_retransmissions: u64,
     n_abandoned_messages: u64,
     n_forward_tsns: u64,
     n_fast_retrans_abandoned: u64,
@@ -76,6 +77,23 @@ impl AssociationStats {
         self.n_retransmissions
     }
 
+    /// Counts one DATA chunk of a partially reliable message (RFC 3758: a lifetime or a
+    /// retransmission limit, RFC 7496) sent again.
+    pub fn inc_partially_reliable_retransmissions(&mut self) {
+        self.n_partially_reliable_retransmissions += 1;
+    }
+
+    /// Of [`Self::get_num_retransmissions`], the DATA chunks of partially reliable messages
+    /// (RFC 3758, RFC 7496: sent with a lifetime or a retransmission limit) sent again; the rest
+    /// are reliable messages (on a WebRTC association, the DCEP messages, RFC 8832 section 5,
+    /// beside the reliable channels). With a limit of zero retransmissions (RFC 8831 section
+    /// 6.6, `maxRetransmits` 0) and the peer's support for partial reliability, a message's
+    /// chunks are never counted here. Without that support (RFC 3758 3.3) partially reliable
+    /// messages are retransmitted as reliable ones, and counted here.
+    pub fn get_num_partially_reliable_retransmissions(&mut self) -> u64 {
+        self.n_partially_reliable_retransmissions
+    }
+
     /// Counts one message abandoned (RFC 3758 3.5 A2): sent in part or whole and never to be
     /// sent again, or dropped before it was sent.
     pub fn inc_abandoned_messages(&mut self) {
@@ -143,6 +161,7 @@ impl AssociationStats {
         self.n_ack_timeouts = 0;
         self.n_fast_retrans = 0;
         self.n_retransmissions = 0;
+        self.n_partially_reliable_retransmissions = 0;
         self.n_abandoned_messages = 0;
         self.n_forward_tsns = 0;
         self.n_fast_retrans_abandoned = 0;

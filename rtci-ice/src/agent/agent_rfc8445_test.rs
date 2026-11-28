@@ -2125,6 +2125,9 @@ fn test_no_data_path_without_a_pair() {
         },
         &[REMOTE_A],
     );
+    // No candidate is to come: consent that expires fails the agent (W3C webrtc-pc 5.6.4).
+    a.set_local_gathering_complete();
+    a.set_remote_end_of_candidates();
     run_answering(&mut a, now, now + Duration::from_secs(1), |_, _| true);
     assert!(a.media_path().is_some(), "connected: a path");
     run_answering(&mut a, now, now + Duration::from_secs(60), |_, _| false);

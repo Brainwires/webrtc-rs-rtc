@@ -11,7 +11,13 @@ and decides, per benchmark:
   base), which is what the runner's noise did to this benchmark in this job;
 * ``slower`` when EVERY round's ratio exceeds ``1 + threshold`` and the median difference exceeds
   ``floor_ns`` (an integer-nanosecond bench of a few ns moves by a whole step on noise alone);
-  ``faster`` symmetrically; ``same`` otherwise; ``new`` when only the head has it and ``gone``
+* ``slower`` too when the two trees are SEPARATED over at least ``separation_rounds`` rounds of
+  each: the head's fastest round is slower than the base's slowest by more than ``separation``
+  (relative) and ``separation_floor_ns`` (the integer resolution of criterion's bencher lines).
+  This one does not depend on how fast the runner is: the noise band is the base's own spread in
+  the same job. With two rounds a separation is only a suspect (``--suspects`` lists them, and
+  `scripts/bench-compare.sh` runs those benches for more rounds before the verdict);
+* ``faster`` symmetrically; ``same`` otherwise; ``new`` when only the head has it and ``gone``
   when only the base does.
 
 A ``slower`` benchmark fails the job unless `benches/accepted-regressions.toml` has an entry for
@@ -46,6 +52,13 @@ ROOT = Path(__file__).resolve().parent.parent
 # single rounds ranged 0.85 to 1.40, but the lowest round of a bench never exceeded 1.053.
 DEFAULT_THRESHOLD = 0.20
 DEFAULT_FLOOR_NS = 25.0
+# The separation rule (docs/performance.md, row bench-2): set from train 36's 24 pull-request bench
+# runs (two rounds each): at 5 % and 3 ns it marks `Interceptor/Pacer/write+poll` in 17 of the 18
+# runs after the regression of round 7 and in none of the 6 before; on two rounds it also marks a
+# few other benches in 8 of the 24 runs, hence the extra rounds before it decides.
+DEFAULT_SEPARATION = 0.05
+DEFAULT_SEPARATION_FLOOR_NS = 3.0
+DEFAULT_SEPARATION_ROUNDS = 4
 
 
 def ratio_of(head: float, base: float) -> float:
@@ -143,6 +156,10 @@ class Result:
     high: float | None = None
     accepted_by: Allowed | None = None
     rounds: list[float] = field(default_factory=list)
+    # The trees are separated (see the module docstring), however many rounds there were.
+    separated: str | None = None  # "slower" | "faster" | None
+    # Which rule decided a slower / faster verdict: "threshold" or "separation".
+    by: str | None = None
 
     @property
     def fails(self) -> bool:
@@ -160,6 +177,9 @@ def compare(
     threshold: float = DEFAULT_THRESHOLD,
     floor_ns: float = DEFAULT_FLOOR_NS,
     allowlist: list[Allowed] | None = None,
+    separation: float = DEFAULT_SEPARATION,
+    separation_floor_ns: float = DEFAULT_SEPARATION_FLOOR_NS,
+    separation_rounds: int = DEFAULT_SEPARATION_ROUNDS,
 ) -> list[Result]:
     """One result per benchmark seen in either tree, slowest change first."""
     if not base_rounds or not head_rounds:
@@ -187,13 +207,24 @@ def compare(
         ] or [ratio]
         low, high = min(paired), max(paired)
         difference = head_ns - base_ns
+        separated = None
+        if min(head) > max(base) * (1.0 + separation) and min(head) - max(base) > separation_floor_ns:
+            separated = "slower"
+        elif max(head) * (1.0 + separation) < min(base) and min(base) - max(head) > separation_floor_ns:
+            separated = "faster"
+        enough = len(base) >= separation_rounds and len(head) >= separation_rounds
+        by = None
         if low > 1.0 + threshold and difference > floor_ns:
-            verdict = "slower"
+            verdict, by = "slower", "threshold"
         elif high < 1.0 / (1.0 + threshold) and -difference > floor_ns:
-            verdict = "faster"
+            verdict, by = "faster", "threshold"
+        elif enough and separated:
+            verdict, by = separated, "separation"
         else:
             verdict = "same"
-        result = Result(name, verdict, base_ns, head_ns, ratio, low, high, rounds=paired)
+        result = Result(
+            name, verdict, base_ns, head_ns, ratio, low, high, rounds=paired, separated=separated, by=by
+        )
         if verdict == "slower":
             for entry in allowlist:
                 if entry.matches(name):
@@ -217,28 +248,54 @@ def format_ns(value: float | None) -> str:
     return f"{value:.0f} ns"
 
 
-def report(results: list[Result], allowlist: list[Allowed], threshold: float, floor_ns: float) -> tuple[str, list[str]]:
+def suspects(results: list[Result]) -> list[str]:
+    """Benchmarks whose trees are separated toward slower but that are not slower yet (too few
+    rounds): the ones to measure again."""
+    return [r.name for r in results if r.separated == "slower" and r.verdict != "slower"]
+
+
+def report(
+    results: list[Result],
+    allowlist: list[Allowed],
+    threshold: float,
+    floor_ns: float,
+    separation: float = DEFAULT_SEPARATION,
+    separation_floor_ns: float = DEFAULT_SEPARATION_FLOOR_NS,
+    separation_rounds: int = DEFAULT_SEPARATION_ROUNDS,
+) -> tuple[str, list[str]]:
     """A markdown summary and the failure messages."""
     failures = []
     lines = [
         "## Benchmarks compared with the base (same runner, alternating rounds)",
         "",
         f"Slower or faster = every round beyond {threshold * 100:.0f} % and the median differs by "
-        f"more than {floor_ns:.0f} ns. Ratio = head median / base median; spread = lowest and "
-        "highest per-round ratio.",
+        f"more than {floor_ns:.0f} ns; or, over at least {separation_rounds} rounds of each, the "
+        f"head's fastest round beyond the base's slowest by more than {separation * 100:.0f} % and "
+        f"{separation_floor_ns:.0f} ns (separated). Ratio = head median / base median; spread = "
+        "lowest and highest per-round ratio.",
         "",
         "| benchmark | base | head | ratio | spread | verdict |",
         "|---|---|---|---|---|---|",
     ]
     for r in results:
-        if r.verdict in ("same",) and r.ratio is not None and abs(r.ratio - 1.0) < threshold / 2:
+        if (
+            r.verdict in ("same",)
+            and r.separated is None
+            and r.ratio is not None
+            and abs(r.ratio - 1.0) < threshold / 2
+        ):
             continue
         verdict = r.verdict
+        if r.by == "separation":
+            verdict += " (separated)"
+        elif r.verdict == "same" and r.separated:
+            verdict += f" (separated {r.separated}, too few rounds)"
         if r.verdict == "slower":
+            how = " (separated)" if r.by == "separation" else ""
             if r.accepted_by:
-                verdict = f"slower, accepted ({r.accepted_by.ledger})"
+                verdict = f"slower{how}, accepted ({r.accepted_by.ledger})"
             else:
-                verdict = "**SLOWER**"
+                verdict = f"**SLOWER**{how}"
         spread = f"{r.low:.3f} to {r.high:.3f}" if r.low is not None else ""
         ratio = f"{r.ratio:.3f}" if r.ratio is not None else ""
         lines.append(f"| `{r.name}` | {format_ns(r.base_ns)} | {format_ns(r.head_ns)} | {ratio} | {spread} | {verdict} |")
@@ -250,9 +307,10 @@ def report(results: list[Result], allowlist: list[Allowed], threshold: float, fl
         if r.fails:
             entry = next((e for e in allowlist if e.matches(r.name)), None)
             beyond = f" (its allowlist entry accepts up to {entry.max_ratio:.2f}x)" if entry else ""
+            how = ", every round of the head beyond every round of the base" if r.by == "separation" else ""
             failures.append(
                 f"{r.name}: slower by {(r.ratio - 1.0) * 100:.1f} % (ratio {r.ratio:.3f}, rounds "
-                f"{r.low:.3f} to {r.high:.3f}){beyond}; if accepted, add a ledger row "
+                f"{r.low:.3f} to {r.high:.3f}{how}){beyond}; if accepted, add a ledger row "
                 "(docs/performance.md) and an allowlist entry "
                 "(benches/accepted-regressions.toml) naming it"
             )
@@ -291,6 +349,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ledger", type=Path, default=ROOT / "docs" / "performance.md")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument("--floor-ns", type=float, default=DEFAULT_FLOOR_NS)
+    parser.add_argument("--separation", type=float, default=DEFAULT_SEPARATION)
+    parser.add_argument("--separation-floor-ns", type=float, default=DEFAULT_SEPARATION_FLOOR_NS)
+    parser.add_argument("--separation-rounds", type=int, default=DEFAULT_SEPARATION_ROUNDS)
+    parser.add_argument(
+        "--suspects",
+        action="store_true",
+        help="print only the benchmarks to measure again (separated, too few rounds), one per line",
+    )
     parser.add_argument("--summary", type=Path, help="append the markdown summary here")
     args = parser.parse_args(argv)
 
@@ -312,8 +378,13 @@ def main(argv: list[str] | None = None) -> int:
                   f"which is not a row of {args.ledger.name}", file=sys.stderr)
         return 2
 
-    results = compare(base_rounds, head_rounds, args.threshold, args.floor_ns, allowlist)
-    summary, failures = report(results, allowlist, args.threshold, args.floor_ns)
+    separation = (args.separation, args.separation_floor_ns, args.separation_rounds)
+    results = compare(base_rounds, head_rounds, args.threshold, args.floor_ns, allowlist, *separation)
+    if args.suspects:
+        for name in suspects(results):
+            print(name)
+        return 0
+    summary, failures = report(results, allowlist, args.threshold, args.floor_ns, *separation)
     print("\n".join(machine_lines(results)))
     print(summary)
     if args.summary:

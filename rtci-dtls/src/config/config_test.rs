@@ -89,6 +89,7 @@ fn test_config_rejects_incomplete_provider() {
 fn test_config_accepts_ring_provider() -> Result<()> {
     let handshake = ConfigBuilder::default()
         .with_crypto_provider(Arc::new(crypto::providers::RingProvider::new()))
+        .with_server_name("example.org".to_owned())
         .build(true, None)?;
 
     assert_eq!(handshake.provider().name(), "ring");
@@ -100,6 +101,7 @@ fn test_config_accepts_ring_provider() -> Result<()> {
 fn test_config_accepts_aws_lc_rs_provider() -> Result<()> {
     let handshake = ConfigBuilder::default()
         .with_crypto_provider(Arc::new(crypto::providers::AwsLcRsProvider::new()))
+        .with_server_name("example.org".to_owned())
         .build(true, None)?;
 
     assert_eq!(handshake.provider().name(), "aws-lc-rs");
@@ -118,6 +120,7 @@ fn test_config_accepts_aws_lc_rs_provider() -> Result<()> {
 fn test_config_build_permits_retransmissions() -> Result<()> {
     let handshake = ConfigBuilder::default()
         .with_crypto_provider(crypto::default_provider().map_err(crypto_error)?)
+        .with_server_name("example.org".to_owned())
         .build(true, None)?;
 
     assert!(

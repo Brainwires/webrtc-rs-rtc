@@ -2605,9 +2605,10 @@ impl Error {
 
     /// The name of the W3C error a JavaScript API over this engine raises for this error, as
     /// webrtc-pc names them, where the engine knows it: `"InvalidAccessError"`,
-    /// `"InvalidStateError"`, `"InvalidModificationError"`, `"NotFoundError"`, `"OperationError"` (an `RTCError`,
-    /// see [`rtc_error_detail`](Self::rtc_error_detail)), `"RangeError"`, `"TypeError"`,
-    /// `"OverconstrainedError"`. `None` for the others.
+    /// `"InvalidStateError"`, `"InvalidModificationError"`, `"NotFoundError"`,
+    /// `"OperationError"` (for a description that does not parse an `RTCError`, see
+    /// [`rtc_error_detail`](Self::rtc_error_detail)), `"SyntaxError"`, `"RangeError"`,
+    /// `"TypeError"`, `"OverconstrainedError"`. `None` for the others.
     ///
     /// W3C webrtc-pc section 4.4.1.5 ("set the session description"): a description that does
     /// not parse (RFC 9429 sections 5.8.1 and 5.8.2) rejects with an `RTCError` whose
@@ -2616,9 +2617,44 @@ impl Error {
     /// (credentials, fingerprints, mids, rtcp-mux, the answer against its offer, ...) rejects
     /// with an `InvalidAccessError`; one invalid for the signaling state with an
     /// `InvalidStateError`.
+    ///
+    /// The other operations, as webrtc-pc names their failures: the constructor's expired
+    /// certificate (4.4.1.1, [`Error::ErrCertificateExpired`]) and a TURN url without a
+    /// username or credential ("validate an ICE server URL", [`Error::ErrNoTurnCredentials`])
+    /// are `InvalidAccessError`s; the members "set the configuration" (4.4.1.5) does not let
+    /// change (`ErrModifyingCertificates`, `ErrModifyingBundlePolicy`,
+    /// `ErrModifyingRTCPMuxPolicy`, `ErrModifyingICECandidatePoolSize`), like a local offer
+    /// or answer that is not the last one created (`ErrSDPDoesNotMatchOffer`,
+    /// `ErrSDPDoesNotMatchAnswer`, 4.4.2 `setLocalDescription`), an
+    /// `InvalidModificationError`; an ICE server without a url and a url that "validate an ICE
+    /// server URL" refuses (`ErrNoIceServerUrls`, `ErrSchemeType`, `ErrInvalidUrl`,
+    /// `ErrStunQuery`, `ErrInvalidQuery`, `ErrProtoType`) a `SyntaxError`; `addIceCandidate`
+    /// (4.4.2) without a remote description, like `createAnswer` without one, an
+    /// `InvalidStateError` ([`Error::ErrNoRemoteDescription`]), and a candidate whose `sdpMid`
+    /// or `sdpMLineIndex` names no media description or whose `usernameFragment` is not its
+    /// section's an `OperationError` (`ErrIceCandidateMediaSectionNotFound`,
+    /// `ErrIceCandidateUsernameFragmentMismatch`; a `DOMException`, not an `RTCError`).
     pub fn dom_exception_name(&self) -> Option<&'static str> {
         match self {
             Error::SdpSyntaxError { .. } | Error::SdpInvalidSyntax(_) => Some("OperationError"),
+            Error::ErrIceCandidateMediaSectionNotFound
+            | Error::ErrIceCandidateUsernameFragmentMismatch => Some("OperationError"),
+            Error::ErrNoIceServerUrls
+            | Error::ErrSchemeType
+            | Error::ErrInvalidUrl
+            | Error::ErrStunQuery
+            | Error::ErrInvalidQuery
+            | Error::ErrProtoType => Some("SyntaxError"),
+            Error::ErrSDPDoesNotMatchOffer
+            | Error::ErrSDPDoesNotMatchAnswer
+            | Error::ErrModifyingCertificates
+            | Error::ErrModifyingBundlePolicy
+            | Error::ErrModifyingRTCPMuxPolicy
+            | Error::ErrModifyingICECandidatePoolSize => Some("InvalidModificationError"),
+            Error::ErrCertificateExpired | Error::ErrNoTurnCredentials => {
+                Some("InvalidAccessError")
+            }
+            Error::ErrNoRemoteDescription => Some("InvalidStateError"),
             Error::InvalidAccessError
             | Error::SdpInvalidValue(_)
             | Error::ErrPeerConnRemoteDescriptionWithoutMidValue

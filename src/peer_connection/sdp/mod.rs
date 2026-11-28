@@ -169,6 +169,7 @@ mod rejected_mline_tests {
             initial_offer: false,
             bundle_attributes_in_tagged_section_only: false,
             bundle_only_browser_form: false,
+            answer_offered_formats_only: false,
             sctp_max_message_size: 0,
             sctp_port: 5000,
             sctp_over_tcp: false,
@@ -176,6 +177,7 @@ mod rejected_mline_tests {
             write_ssrc_attributes_for_simulcast: false,
             ice_pacing: None,
             ice_options_in_media_sections: false,
+            ice_options: vec!["trickle", "ice2"],
             ls_groups: vec![],
             selected_destination: None,
             remote_candidates: vec![],
@@ -326,6 +328,7 @@ use crate::peer_connection::configuration::RTCBundlePolicy;
 use crate::peer_connection::configuration::media_engine::{
     MediaEngine, RTCPacketTime, is_rtcp_conflicting_payload_type, local_extension_ids,
 };
+use crate::peer_connection::configuration::setting_engine::AnswerIceOptions;
 use crate::peer_connection::state::ice_gathering_state::RTCIceGatheringState;
 use crate::peer_connection::transport::dtls::fingerprint::{
     RTCDtlsFingerprint, parse_fingerprint_attribute,
@@ -348,6 +351,7 @@ use crate::rtp_transceiver::{
     },
 };
 use ice::candidate::{Candidate, unmarshal_candidate};
+use sdp::attribute::RidIdGrammar;
 use sdp::description::common::{Address, ConnectionInformation};
 use sdp::description::media::*;
 use sdp::description::session::*;
@@ -602,6 +606,25 @@ pub(crate) fn remote_ice_pacing(desc: &SessionDescription) -> Option<std::time::
 
 /// The ICE options a description states (`a=ice-options`, RFC 8839 section 5.6), at session
 /// level and in its media sections, each once, in order.
+/// The options of an answer's `a=ice-options` line under `setting`, given the offer's
+/// options (`remote_ice_options`): `trickle` first, then `ice2` (RFC 9429 section 5.3.1 for
+/// [`AnswerIceOptions::AsOffered`]).
+pub(crate) fn answer_ice_options(
+    setting: AnswerIceOptions,
+    offered: &[String],
+) -> Vec<&'static str> {
+    let offered = |option: &str| offered.iter().any(|o| o == option);
+    let (trickle, ice2) = match setting {
+        AnswerIceOptions::AsOffered => (offered("trickle"), offered("ice2")),
+        AnswerIceOptions::TrickleAlways => (true, offered("ice2")),
+        AnswerIceOptions::Always => (true, true),
+    };
+    [(trickle, "trickle"), (ice2, "ice2")]
+        .into_iter()
+        .filter_map(|(on, option)| on.then_some(option))
+        .collect()
+}
+
 pub(crate) fn remote_ice_options(desc: &SessionDescription) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     let values = desc
@@ -780,7 +803,12 @@ pub(crate) fn track_details_for_rid<'a>(
 }
 
 /// extract all TrackDetails from an SDP.
-pub(crate) fn track_details_from_sdp(s: &SessionDescription) -> Vec<TrackDetails> {
+///
+/// Rid-ids are read with `rid_ids` (`SettingEngine::rid_id_grammar`).
+pub(crate) fn track_details_from_sdp(
+    s: &SessionDescription,
+    rid_ids: RidIdGrammar,
+) -> Vec<TrackDetails> {
     let mut incoming_tracks = vec![];
 
     for media in &s.media_descriptions {
@@ -947,7 +975,7 @@ pub(crate) fn track_details_from_sdp(s: &SessionDescription) -> Vec<TrackDetails
         if has_media_msid || (!track_id.is_empty() && !stream_id.is_empty()) {
             // The streams the remote side sends: its `send` rids. A `recv` rid is one of this
             // endpoint's own streams, which the remote side takes.
-            let rids: Vec<SimulcastRid> = get_rids(media)
+            let rids: Vec<SimulcastRid> = get_rids(media, rid_ids)
                 .into_iter()
                 .filter(|rid| rid.direction == SimulcastDirection::Send)
                 .collect();
@@ -1083,7 +1111,7 @@ fn track_details_from_sdp_pairs_repair_flows_by_lookup() {
     }
     let desc = SessionDescription::default().with_media(media);
 
-    let tracks = track_details_from_sdp(&desc);
+    let tracks = track_details_from_sdp(&desc, RidIdGrammar::Corrected);
 
     assert_eq!(tracks.len(), PRIMARIES as usize);
     for (i, track) in tracks.iter().enumerate() {
@@ -1114,7 +1142,10 @@ fn groups_of_three_ids_name_one_source_and_its_flows() {
             format!("{ssrc} msid:stream track"),
         );
     }
-    let tracks = track_details_from_sdp(&SessionDescription::default().with_media(media));
+    let tracks = track_details_from_sdp(
+        &SessionDescription::default().with_media(media),
+        RidIdGrammar::Corrected,
+    );
     assert_eq!(tracks.len(), 1, "{tracks:?}");
     assert_eq!(tracks[0].ssrc, Some(4));
     assert_eq!(tracks[0].rtx_ssrc, Some(14));
@@ -1147,7 +1178,7 @@ fn get_rids_orders_and_pauses_by_lookup() {
         format!("send {}", list.join(";")),
     );
 
-    let rids = get_rids(&simulcast);
+    let rids = get_rids(&simulcast, RidIdGrammar::Corrected);
 
     assert_eq!(rids.len(), RIDS);
     for (position, rid) in rids.iter().enumerate() {
@@ -1164,7 +1195,7 @@ fn get_rids_orders_and_pauses_by_lookup() {
         SDP_ATTRIBUTE_SIMULCAST.to_owned(),
         format!("send {}", list.join(";")),
     );
-    let rids = get_rids(&repeated);
+    let rids = get_rids(&repeated, RidIdGrammar::Corrected);
     assert_eq!(rids.len(), RIDS);
     assert!(
         rids.iter()
@@ -1448,6 +1479,9 @@ pub(crate) struct AddTransceiverSdpParams {
     /// The payload type each format an answer may add (RFC 9429 section 5.3.1) takes, by
     /// (SFrame numbering, kind, the format's own payload type): see `answer_payload_types`.
     answer_payload_types: HashMap<(bool, RtpCodecKind, u8), u8>,
+    /// `SettingEngineBuilder::with_answer_offered_formats_only`: an answer lists only formats
+    /// the offer has.
+    answer_offered_formats_only: bool,
 }
 
 impl RTCPeerConnection {
@@ -1529,6 +1563,16 @@ impl RTCPeerConnection {
             transceiver.get_offer_codecs(media_engine)
         } else {
             transceiver.get_codecs(media_engine)
+        };
+        // `SettingEngineBuilder::with_answer_offered_formats_only`: the answer lists the
+        // offered formats only (RFC 9429 section 5.3.1 "MAY include formats that are locally
+        // supported but not present in the offer"; libwebrtc's form), also when codec
+        // preferences name a format the offer lacks.
+        let codecs = match &media_section.offered_codecs {
+            Some(offered) if !is_offer && params.answer_offered_formats_only => {
+                offered_formats_only(codecs, offered)
+            }
+            _ => codecs,
         };
         // Which repair flows the section has a format for: a sender's RTX / FlexFEC SSRCs are
         // described only then (codec preferences may leave either out). The FEC flow is the
@@ -1635,7 +1679,9 @@ impl RTCPeerConnection {
         // section 6). The numbers come from `answer_payload_types`, the same for every section
         // of the answer: a payload type the offer uses for another format is never taken,
         // which in a BUNDLE group would give it two configurations (RFC 9143 section 9.1.1).
+        // `SettingEngineBuilder::with_answer_offered_formats_only` leaves them out.
         if !is_offer
+            && !params.answer_offered_formats_only
             && !transceiver.has_application_codec_preferences()
             && let Some(offered) = &media_section.offered_codecs
             && !codecs.is_empty()
@@ -2081,14 +2127,25 @@ impl RTCPeerConnection {
         if direction.has_send()
             && let Some(sender) = transceiver.sender()
         {
-            let encodings = sender.send_encodings();
+            // An offer also lists the streams remote answers rejected, should the sender keep
+            // them for it (`with_rejected_rids_kept_in_offers`, RFC 9429 section 5.2.2: the
+            // a=rid and a=simulcast lines "MUST stay the same").
+            let encodings: Vec<(_, bool)> = if is_offer {
+                sender.offered_encodings()
+            } else {
+                sender
+                    .send_encodings()
+                    .iter()
+                    .map(|encoding| (encoding, false))
+                    .collect()
+            };
             let is_simulcast = encodings.len() > 1
                 && encodings
                     .iter()
-                    .all(|encoding| !encoding.rtp_coding_parameters.rid.is_empty());
+                    .all(|(encoding, _)| !encoding.rtp_coding_parameters.rid.is_empty());
             if is_simulcast {
                 let mut lines = 0;
-                for encoding in encodings {
+                for (encoding, rejected) in encodings {
                     let coding = &encoding.rtp_coding_parameters;
                     let (rid, listed) = if is_offer {
                         (
@@ -2122,7 +2179,10 @@ impl RTCPeerConnection {
                     media = media.with_value_attribute(SDP_ATTRIBUTE_RID.to_owned(), line);
                     lines += 1;
                     if listed {
+                        // A rejected stream is not sent: paused, in RFC 8853 section 5.3.4's
+                        // "current pause state".
                         let paused = !encoding.active
+                            || rejected
                             || (!is_offer && rid.paused && !ignore_rid_pause_for_recv);
                         send_sc_list.push(sc_id(&coding.rid, paused));
                     }
@@ -2726,6 +2786,9 @@ pub(crate) struct PopulateSdpParams {
     /// says its group's ICE credentials, and when it has a bundle-only section its fingerprints
     /// are at session level too.
     pub(crate) bundle_only_browser_form: bool,
+    /// `SettingEngineBuilder::with_answer_offered_formats_only`: an answer lists only formats
+    /// the offer has.
+    pub(crate) answer_offered_formats_only: bool,
     pub(crate) sctp_max_message_size: usize,
     /// The data section's `a=sctp-port`.
     pub(crate) sctp_port: u16,
@@ -2747,6 +2810,9 @@ pub(crate) struct PopulateSdpParams {
     /// `SettingEngineBuilder::with_ice_options_in_media_sections`: `a=ice-options` after each
     /// section's `a=ice-pwd` instead of at session level.
     pub(crate) ice_options_in_media_sections: bool,
+    /// The options of the `a=ice-options` line, in order (empty: no line): `trickle ice2` in an
+    /// offer; in an answer as `SettingEngineBuilder::with_answer_ice_options` says.
+    pub(crate) ice_options: Vec<&'static str>,
     /// In an offer, the `a=group:LS` groups of the most recent answer; in an answer, the
     /// offer's (RFC 9429 sections 5.2.2, 5.3.1).
     pub(crate) ls_groups: Vec<Vec<String>>,
@@ -2965,6 +3031,7 @@ impl RTCPeerConnection {
                     rtcp_mux_only_renegotiated: params.rtcp_mux_only_renegotiated,
                     ecn: params.ecn,
                     answer_payload_types: answer_payload_types.clone(),
+                    answer_offered_formats_only: params.answer_offered_formats_only,
                 };
                 let (d1, should_add_id) = RTCPeerConnection::add_transceiver_sdp(
                     d,
@@ -3132,32 +3199,43 @@ impl RTCPeerConnection {
 
         // RFC 8445 section 10: "an agent compliant to this specification MUST inform the
         // peer about the compliance using the 'ice2' option" (RFC 8839 section 5.6:
-        // `a=ice-options`), lite agents included.
-        let ice_options = if params.is_ice_lite {
+        // `a=ice-options`), lite agents included. `trickle` too: this side accepts trickled
+        // candidates (`add_remote_candidate` at any time after the remote description) and
+        // trickles its own (JSEP RFC 9429 §5.2.1 / §5.3.1), and RFC 8840 §4: "Trickle ICE
+        // Agents MUST indicate support for Trickle ICE by including the ice-option "trickle"
+        // within all SDP Offers and Answers". A lite agent is one as well: it takes trickled
+        // candidates and trickles its own (its TCP candidates come after the description),
+        // and RFC 8838 Appendix B has an ICE-lite agent capable of Trickle ICE "indicate
+        // support for Trickle ICE". Without it the full peer takes the lite agent's
+        // description for all its candidates (W3C webrtc-pc 5.6.4, `canTrickleIceCandidates`
+        // false) and may report "failed" before the trickled ones arrive.
+        if params.is_ice_lite {
             // RFC 8839 §5.3
             d = d.with_property_attribute(ATTR_KEY_ICELITE.to_owned());
-            "ice2"
-        } else {
-            // JSEP RFC 8829 §5.2.1 / §5.3.1: this side accepts trickled candidates
-            // (`add_remote_candidate` at any time after the remote description), so it says so
-            // (RFC 8840 §4.1.1). A lite agent has no checks to trickle into.
-            "trickle ice2"
-        };
+        }
+        // Offers say `trickle ice2`, lite agents' too. An answer says what
+        // `SettingEngineBuilder::with_answer_ice_options` gives: by default RFC 9429 section
+        // 5.3.1's form, each of the two only "if such an option was present in the offer",
+        // against RFC 8840 section 4.1.3 and RFC 8445 section 10 (`answer_ice_options`;
+        // spec-issues row 28). No line for no option (RFC 8839 section 5.6: one or more tags).
+        let ice_options = params.ice_options.join(" ");
         // RFC 8839 section 5.6: "session-level or media-level".
-        if params.ice_options_in_media_sections {
+        if ice_options.is_empty() {
+            // Nothing to say: no line.
+        } else if params.ice_options_in_media_sections {
             for media in &mut d.media_descriptions {
                 if let Some(at) = media.attributes.iter().position(|a| a.key == "ice-pwd") {
                     media.attributes.insert(
                         at + 1,
                         sdp::description::common::Attribute::new(
                             ATTR_KEY_ICE_OPTIONS.to_owned(),
-                            Some(ice_options.to_owned()),
+                            Some(ice_options.clone()),
                         ),
                     );
                 }
             }
         } else {
-            d = d.with_value_attribute(ATTR_KEY_ICE_OPTIONS.to_owned(), ice_options.to_owned());
+            d = d.with_value_attribute(ATTR_KEY_ICE_OPTIONS.to_owned(), ice_options);
         }
         // RFC 8445 section 14.2: an agent that wants a Ta other than the default "MUST
         // indicate the proposed value to its peer"; RFC 8839 section 5.5: `a=ice-pacing`, in
@@ -4127,7 +4205,14 @@ pub(crate) fn discard_stray_bundle_only(desc: &mut SessionDescription, answers: 
 /// (`SettingEngineBuilder::with_strict_sdp_attribute_grammar`: webrtc-rs 0.17.x ends an
 /// `a=rtcp-fb` without parameters with a space, against RFC 4585 section 4.2's
 /// `rtcp-fb-param`; Pion did before v4.1.5).
-pub(crate) fn check_attribute_lines(desc: &SessionDescription, strict: bool) -> Result<()> {
+///
+/// `a=simulcast` is checked with `rid_ids` (`SettingEngine::rid_id_grammar`), the rid-id
+/// grammar `section_rids` reads it with.
+pub(crate) fn check_attribute_lines(
+    desc: &SessionDescription,
+    strict: bool,
+    rid_ids: RidIdGrammar,
+) -> Result<()> {
     // RFC 8866 section 6.7: "At most one occurrence of "a=recvonly", "a=sendrecv",
     // "a=sendonly", or "a=inactive" MAY appear at session level, and at most one MAY appear
     // in each media description": a level with two is ambiguous, and refused.
@@ -4160,6 +4245,12 @@ pub(crate) fn check_attribute_lines(desc: &SessionDescription, strict: bool) -> 
                     ATTR_KEY_SSRC.to_owned(),
                     Some(format!("{id} msid-ignored")),
                 ))?;
+            }
+            _ if a.key == SDP_ATTRIBUTE_SIMULCAST => {
+                sdp::attribute::Simulcast::parse_with(
+                    a.value.as_deref().unwrap_or_default(),
+                    rid_ids,
+                )?;
             }
             _ => sdp::attribute::check_attribute(a)?,
         }
@@ -4226,6 +4317,34 @@ pub(crate) fn described_ssrcs(desc: &SessionDescription) -> HashSet<SSRC> {
         }
     }
     ssrcs
+}
+
+/// The CNAME each SSRC of a description is declared with (`a=ssrc:<ssrc> cname:<cname>`, RFC
+/// 5576 section 6.1), in any section: "This MUST be the CNAME value that the media sender will
+/// place in its RTCP SDES packets". An SSRC declared twice keeps its first one (section 6.1:
+/// the attribute "MUST NOT occur more than once for the same ssrc-id within a given media
+/// stream"). At most [`MAX_REMOTE_CNAMES`](crate::peer_connection::handler::interceptor::MAX_REMOTE_CNAMES).
+pub(crate) fn declared_cnames(desc: &SessionDescription) -> HashMap<SSRC, String> {
+    use crate::peer_connection::handler::interceptor::MAX_REMOTE_CNAMES;
+    let mut cnames = HashMap::new();
+    for media in &desc.media_descriptions {
+        for a in &media.attributes {
+            if a.key != ATTR_KEY_SSRC {
+                continue;
+            }
+            let Some((id, attribute)) = a.value.as_deref().and_then(|v| v.split_once(' ')) else {
+                continue;
+            };
+            let (Ok(ssrc), Some(cname)) = (id.parse::<SSRC>(), attribute.strip_prefix("cname:"))
+            else {
+                continue;
+            };
+            if cnames.len() < MAX_REMOTE_CNAMES {
+                cnames.entry(ssrc).or_insert_with(|| cname.to_owned());
+            }
+        }
+    }
+    cnames
 }
 
 /// The decoding dependencies of a description (RFC 5583): for each media section in an
@@ -5189,8 +5308,10 @@ fn parse_rtcp_feedback(value: &str) -> Option<RTCPFeedback> {
 /// section 5.3.1), by (SFrame numbering, kind, the format's own payload type), worked out once
 /// for the whole answer so that every section numbers a format alike. A format keeps its own
 /// number unless the offer uses that number for another format anywhere (in a BUNDLE group one
-/// payload type has one configuration, RFC 9143 section 9.1.1); then it takes the next
-/// dynamic payload type no offered, registered or SFrame format uses and no format before it
+/// payload type has one configuration, RFC 9143 section 9.1.1), or an earlier description of
+/// the session gave it another format (RFC 3264 section 8.3.2: the mapping "MUST NOT change
+/// for the duration of a session"); then it takes the next dynamic payload type no offered,
+/// registered or SFrame format uses, no earlier description used and no format before it
 /// took. A format with nothing left is not added.
 fn answer_payload_types(
     media_engine: &MediaEngine,
@@ -5226,15 +5347,31 @@ fn answer_payload_types(
     let mut taken: HashSet<u8> = offered.keys().copied().collect();
     taken.extend(candidates.iter().map(|(_, _, codec)| codec.payload_type));
     taken.extend(media_engine.sframe_payload_types.iter().copied());
+    taken.extend(media_engine.payload_type_history.keys().copied());
     let mut free = (96..=127u8).filter(|pt| !taken.contains(pt));
     let mut numbers = HashMap::new();
     for (sframe, kind, codec) in candidates {
         let conflicting = offered.get(&codec.payload_type).is_some_and(|offered| {
             codec_parameters_fuzzy_search(offered, std::slice::from_ref(&codec)).1
                 != CodecMatch::Exact
-        });
+        }) || media_engine
+            .payload_type_means_another_format(codec.payload_type, &codec);
         let number = if conflicting {
-            free.next()
+            // A number an earlier description already gave this very format, when the offer
+            // does not use it for another one; else a new one.
+            media_engine
+                .payload_type_history
+                .iter()
+                .filter(|(pt, earlier)| {
+                    !offered.contains_key(pt)
+                        && crate::peer_connection::configuration::media_engine::is_same_codec(
+                            earlier,
+                            &codec.rtp_codec,
+                        )
+                })
+                .map(|(pt, _)| *pt)
+                .min()
+                .or_else(|| free.next())
         } else {
             Some(codec.payload_type)
         };
@@ -5243,6 +5380,67 @@ fn answer_payload_types(
         }
     }
     numbers
+}
+
+/// The formats of `codecs` (an answer's, in its order) that `offered` has
+/// (`SettingEngineBuilder::with_answer_offered_formats_only`), matched as a remote description
+/// is (`RTCRtpTransceiverInternal::match_remote_codecs`): an exact match, or a match by name
+/// for a format whose parameters are not its configuration. A repair format stays only with
+/// what it repairs: an RTX format when the offer has RTX and its `apt` names a kept format, a
+/// RED format when the formats its fmtp line names are kept (or it names none), a FEC format
+/// when a media format is kept.
+fn offered_formats_only(
+    codecs: Vec<RTCRtpCodecParameters>,
+    offered: &[RTCRtpCodecParameters],
+) -> Vec<RTCRtpCodecParameters> {
+    use crate::peer_connection::configuration::media_engine::{
+        has_symmetric_configuration, red_block_payload_types,
+    };
+    use crate::rtp_transceiver::rtp_sender::rtp_codec::parse_rtx_apt;
+    let is_offered = |codec: &RTCRtpCodecParameters| match codec_parameters_search(
+        &codec.rtp_codec,
+        Some(codec.payload_type),
+        offered,
+    ) {
+        (_, CodecMatch::Exact) => true,
+        (found, CodecMatch::Partial) => {
+            !has_symmetric_configuration(&codec.rtp_codec)
+                || found.rtp_codec.sdp_fmtp_line.trim().is_empty()
+        }
+        (_, CodecMatch::None) => false,
+    };
+    let offer_has_rtx = offered
+        .iter()
+        .any(|codec| repair_family(&codec.rtp_codec) == "rtx");
+    let mut kept: Vec<RTCRtpCodecParameters> = codecs
+        .into_iter()
+        .filter(|codec| repair_family(&codec.rtp_codec) == "rtx" || is_offered(codec))
+        .collect();
+    let media: HashSet<PayloadType> = kept
+        .iter()
+        .filter(|codec| repair_family(&codec.rtp_codec).is_empty())
+        .map(|codec| codec.payload_type)
+        .collect();
+    kept.retain(|codec| match repair_family(&codec.rtp_codec) {
+        "" => true,
+        "red" => red_block_payload_types(&codec.rtp_codec.sdp_fmtp_line)
+            .is_none_or(|blocks| blocks.iter().all(|block| media.contains(block))),
+        "ulpfec" | "flexfec" => !media.is_empty(),
+        _ => true,
+    });
+    // RTX: its `apt` names a kept primary (a media format, or a kept RED format).
+    let primaries: HashSet<PayloadType> = kept
+        .iter()
+        .filter(|codec| repair_family(&codec.rtp_codec) != "rtx")
+        .map(|codec| codec.payload_type)
+        .collect();
+    kept.retain(|codec| {
+        repair_family(&codec.rtp_codec) != "rtx"
+            || (offer_has_rtx
+                && parse_rtx_apt(&codec.rtp_codec.sdp_fmtp_line)
+                    .is_some_and(|apt| primaries.contains(&apt)))
+    });
+    kept
 }
 
 pub(crate) fn codecs_from_media_description(
@@ -5615,7 +5813,7 @@ fn get_rids_uses_each_layers_first_alternative_once() {
         SDP_ATTRIBUTE_SIMULCAST.to_owned(),
         "recv foo,bar;1,2".to_owned(),
     );
-    let ids: Vec<(String, bool)> = get_rids(&simulcast)
+    let ids: Vec<(String, bool)> = get_rids(&simulcast, RidIdGrammar::Corrected)
         .into_iter()
         .map(|r| (r.id, r.simulcast))
         .collect();
@@ -5627,7 +5825,11 @@ fn get_rids_uses_each_layers_first_alternative_once() {
         SDP_ATTRIBUTE_SIMULCAST.to_owned(),
         "recv foo,bar;1,2;foo".to_owned(),
     );
-    assert!(get_rids(&repeated).iter().all(|r| !r.simulcast));
+    assert!(
+        get_rids(&repeated, RidIdGrammar::Corrected)
+            .iter()
+            .all(|r| !r.simulcast)
+    );
 }
 
 /// The extensions an offer adds back for a transceiver with an explicit list of header

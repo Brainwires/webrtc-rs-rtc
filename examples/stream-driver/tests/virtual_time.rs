@@ -55,15 +55,25 @@ fn two_drivers_connect_and_exchange_a_data_channel_message_on_virtual_time() -> 
 
 /// RFC 7675 section 5.1: "Consent expires after 30 seconds". The path between the two peers
 /// goes dark after they connected; each driver reports its ICE connection (and its peer
-/// connection) disconnected, then failed, at most 30 seconds after the last consent response
-/// it had, and the whole wait takes no wall time worth the name.
+/// connection) disconnected, then failed: at most 30 seconds after the last consent response
+/// it had, or as the PAC timer expires when that is later (W3C webrtc-pc 5.6.4; the drivers'
+/// applications relay the end of the candidates), and the whole wait takes no wall time worth
+/// the name.
 #[test]
 fn consent_expiry_after_30_seconds_elapses_on_virtual_time_and_the_driver_reports_the_failure()
 -> Result<()> {
     let runtime = MockRuntime::new();
     let (mut a, mut b) = peers(&runtime)?;
+    // The application relays the end of the candidates: lost consent is "failed" then (W3C
+    // webrtc-pc 5.6.4), "disconnected" without it.
+    a.relay_end_of_candidates = true;
+    b.relay_end_of_candidates = true;
+    let begun = runtime.now();
     runtime.run(connect_and_exchange(&mut a, &mut b, STEP, 10_000))?;
     let dark = runtime.now();
+    // "failed" also waits for the PAC timer, 39.5 s after the checks began (W3C webrtc-pc
+    // 5.6.4, RFC 8863): consent that expires before that fails the connection then.
+    let pac = (begun + Duration::from_millis(39_500)).saturating_duration_since(dark);
     runtime.net().set_links(
         A,
         B,
@@ -100,8 +110,9 @@ fn consent_expiry_after_30_seconds_elapses_on_virtual_time_and_the_driver_report
         // The last consent response came at most one consent interval (5 s, drawn up to
         // 1.2 times) before the path went dark: consent expires 24 to 30 s after that.
         assert!(
-            failed >= Duration::from_secs(20) && failed <= Duration::from_secs(31),
-            "{who}: failed {failed:?} after the path went dark"
+            failed >= Duration::from_secs(20)
+                && failed <= Duration::from_secs(31).max(pac + Duration::from_millis(250)),
+            "{who}: failed {failed:?} after the path went dark (PAC timer {pac:?})"
         );
         assert!(
             peer.states

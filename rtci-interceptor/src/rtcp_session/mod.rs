@@ -33,9 +33,10 @@ use rtcp::source_description::{
 use rtcp::transport_feedbacks::cc_feedback_report::CcFeedbackReport;
 use rtcp::transport_feedbacks::ecn_feedback::EcnFeedback;
 use rtcp::transport_feedbacks::rapid_resynchronization_request::RapidResynchronizationRequest;
+use rtcp::transport_feedbacks::tmmb::TemporaryMaximumBitrateRequest;
 use rtcp::transport_feedbacks::transport_layer_cc::TransportLayerCc;
 use rtcp::transport_feedbacks::transport_layer_nack::{
-    TransportLayerNack, nack_pairs_from_sequence_numbers,
+    NackPair, TransportLayerNack, nack_pairs_from_sequence_numbers,
 };
 use sansio::Protocol;
 use scheduler::{
@@ -238,6 +239,13 @@ pub struct RepeatInRegularReports {
     /// In how many Regular compound packets after the first one they ride again.
     pub count: u8,
 }
+
+/// Attached as an [`Attribute::Custom`] to RTCP packets written into the chain that are to
+/// leave in the RTCP session's next **Regular** compound packet, not in an Early one: RFC 5104
+/// section 4.2.1.3, "Any repetition of a request message SHOULD use regular RTCP mode for its
+/// transmission timing" (the TMMBR requester marks its repetitions so).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegularTiming;
 
 /// Packets the RTCP session repeats in its Regular compound packets.
 struct Repeat {
@@ -703,6 +711,7 @@ impl RtcpSessionBuilder {
             outside_budget: false,
             pending: Vec::new(),
             repeats: Vec::new(),
+            held_for_regular: Vec::new(),
             early_at: None,
             sender_report_requested: None,
             clock_rate_switch: None,
@@ -993,6 +1002,8 @@ pub struct RtcpSessionInterceptor {
     /// Packets each of the next Regular compound packets carries again
     /// ([`RepeatInRegularReports`]).
     repeats: Vec<Repeat>,
+    /// Packets written with [`RegularTiming`], for the next Regular compound packet.
+    held_for_regular: Vec<Box<dyn rtcp::Packet>>,
     /// RFC 4585 3.5.2: when the scheduled Early packet goes.
     early_at: Option<Instant>,
     /// RFC 6051 section 3.2: the local SSRC an RTCP-SR-REQ asked for an SR of, until an
@@ -1026,6 +1037,32 @@ pub struct RtcpSessionInterceptor {
 
 fn boxed<P: rtcp::Packet + 'static>(packet: P) -> Box<dyn rtcp::Packet> {
     Box::new(packet)
+}
+
+/// Splits `nack` (RFC 3550 6.1, RFC 4585 6.2.1): a first NACK of the pairs that fit in `budget`
+/// octets (it may ask for none) and NACKs of the rest, each of at most `room` octets. `None`
+/// when `room` holds no pair.
+fn split_nack(
+    nack: &TransportLayerNack,
+    budget: usize,
+    room: usize,
+) -> Option<(TransportLayerNack, Vec<TransportLayerNack>)> {
+    /// The common header, the packet sender's and the media source's SSRC.
+    const HEADER: usize = 12;
+    /// One PID and BLP.
+    const PAIR: usize = 4;
+    let per_packet = room.saturating_sub(HEADER) / PAIR;
+    if per_packet == 0 {
+        return None;
+    }
+    let with = |nacks: &[NackPair]| TransportLayerNack {
+        sender_ssrc: nack.sender_ssrc,
+        media_ssrc: nack.media_ssrc,
+        nacks: nacks.to_vec(),
+    };
+    let in_first = (budget.saturating_sub(HEADER) / PAIR).min(nack.nacks.len());
+    let (first, rest) = nack.nacks.split_at(in_first);
+    Some((with(first), rest.chunks(per_packet).map(with).collect()))
 }
 
 /// The size of `packets` on the wire, lower layers included.
@@ -2018,6 +2055,13 @@ impl RtcpSessionInterceptor {
             _ => packet,
         };
 
+        if let Some(request) = packet
+            .as_any()
+            .downcast_ref::<TemporaryMaximumBitrateRequest>()
+        {
+            self.supersede_held_requests(request);
+        }
+
         // RFC 4585 3.5.2: feedback for one compound packet is merged into as few messages
         // as possible.
         let any = packet.as_any();
@@ -2065,6 +2109,69 @@ impl RtcpSessionInterceptor {
             self.pending.remove(0);
         }
         self.pending.push(packet);
+    }
+
+    /// Holds a packet written with [`RegularTiming`] for the next Regular compound packet.
+    fn hold_for_regular(&mut self, packet: Box<dyn rtcp::Packet>) {
+        let any = packet.as_any();
+        if any.is::<SenderReport>() || any.is::<ReceiverReport>() || any.is::<SourceDescription>() {
+            return;
+        }
+        if let Some(request) = any.downcast_ref::<TemporaryMaximumBitrateRequest>() {
+            self.supersede_held_requests(request);
+        }
+        if self.held_for_regular.len() >= MAX_PENDING {
+            self.held_for_regular.remove(0);
+        }
+        self.held_for_regular.push(packet);
+    }
+
+    /// A newer TMMBR replaces the entries a held repetition has for the same media senders
+    /// (RFC 5104 section 4.2.1.2: the entry is sent with its current values).
+    fn supersede_held_requests(&mut self, newer: &TemporaryMaximumBitrateRequest) {
+        let asked: HashSet<u32> = newer.entries.iter().map(|entry| entry.ssrc).collect();
+        self.held_for_regular.retain_mut(|held| {
+            let Some(request) = held
+                .as_any()
+                .downcast_ref::<TemporaryMaximumBitrateRequest>()
+            else {
+                return true;
+            };
+            if !request
+                .entries
+                .iter()
+                .any(|entry| asked.contains(&entry.ssrc))
+            {
+                return true;
+            }
+            let mut request = request.clone();
+            request.entries.retain(|entry| !asked.contains(&entry.ssrc));
+            if request.entries.is_empty() {
+                return false;
+            }
+            *held = boxed(request);
+            true
+        });
+    }
+
+    /// Moves the packets held for a Regular compound packet into `packets`, as far as
+    /// `budget` goes; the others wait for the next one.
+    fn take_held_for_regular(
+        &mut self,
+        packets: &mut Vec<Box<dyn rtcp::Packet>>,
+        budget: &mut usize,
+    ) {
+        let mut kept = vec![];
+        for packet in std::mem::take(&mut self.held_for_regular) {
+            let size = packet.marshal_size();
+            if size <= *budget {
+                *budget -= size;
+                packets.push(packet);
+            } else {
+                kept.push(packet);
+            }
+        }
+        self.held_for_regular = kept;
     }
 
     /// RFC 4585 3.5.2, step 4a: feedback that could not leave in an Early packet is stored
@@ -2486,22 +2593,46 @@ impl RtcpSessionInterceptor {
     }
 
     /// Moves what is waiting into `packets`, as far as `budget` octets go. What does not fit
-    /// waits for the next packet; a packet too large for any compound packet goes anyway.
-    fn take_pending(&mut self, packets: &mut Vec<Box<dyn rtcp::Packet>>, budget: &mut usize) {
+    /// waits for the next packet. A NACK too large for any compound packet is split (RFC 3550
+    /// 6.1): its first pairs go in `packets` as far as `budget` goes, and the NACKs of the rest
+    /// are returned, to leave at once in compound packets of their own. Any other packet too
+    /// large for a compound packet goes as it is (it cannot be split).
+    fn take_pending(
+        &mut self,
+        packets: &mut Vec<Box<dyn rtcp::Packet>>,
+        budget: &mut usize,
+        overhead: usize,
+    ) -> Vec<TransportLayerNack> {
         /// A report without blocks and an SDES with one CNAME: what a minimal compound
         /// packet spends before its feedback.
         const MINIMAL_OVERHEAD: usize = 64;
         let mut kept = vec![];
+        let mut rest = vec![];
         for packet in std::mem::take(&mut self.pending) {
             let size = packet.marshal_size();
-            if size <= *budget || size + MINIMAL_OVERHEAD > self.mtu {
-                *budget = budget.saturating_sub(size);
+            if size <= *budget {
+                *budget -= size;
                 packets.push(packet);
+            } else if size + MINIMAL_OVERHEAD > self.mtu {
+                if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>()
+                    && let Some((first, more)) =
+                        split_nack(nack, *budget, self.mtu.saturating_sub(overhead))
+                {
+                    *budget = budget.saturating_sub(first.marshal_size());
+                    if !first.nacks.is_empty() {
+                        packets.push(boxed(first));
+                    }
+                    rest.extend(more);
+                } else {
+                    *budget = budget.saturating_sub(size);
+                    packets.push(packet);
+                }
             } else {
                 kept.push(packet);
             }
         }
         self.pending = kept;
+        rest
     }
 
     /// Builds and sends a compound packet led by the local SSRC `first`.
@@ -2679,8 +2810,12 @@ impl RtcpSessionInterceptor {
 
         if shape == Shape::Full {
             self.take_repeats(&mut packets, &mut budget);
+            self.take_held_for_regular(&mut packets, &mut budget);
         }
-        self.take_pending(&mut packets, &mut budget);
+        // A follow-up compound packet: the leader's report without blocks, its CNAME, then
+        // the rest of a split NACK.
+        let follow_up_overhead = 28 + 4 + chunk;
+        let rest = self.take_pending(&mut packets, &mut budget, follow_up_overhead);
         // The originals of the repetitions not yet armed left with this packet (everything
         // pending is taken): the Regular packets after it carry the copies.
         for repeat in &mut self.repeats {
@@ -2689,6 +2824,16 @@ impl RtcpSessionInterceptor {
         self.early_at = None;
         self.compound_sent = true;
         self.send(now, packets);
+        // RFC 3550 6.1: what a NACK too large for one compound packet asks for more is
+        // "segmented into multiple shorter compound packets to be transmitted in separate
+        // packets", each beginning with a report.
+        for nack in rest {
+            let report = self.report(first, now, vec![]);
+            let sdes = boxed(SourceDescription {
+                chunks: vec![self.sdes_chunk(self.locals[first].ssrc)],
+            });
+            self.send(now, vec![report, sdes, boxed(nack)]);
+        }
         included
     }
 
@@ -3197,6 +3342,7 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for RtcpSessionInterceptor {
         self.sync(now);
 
         let repeat = msg.message.custom::<RepeatInRegularReports>().copied();
+        let regular = msg.message.custom::<RegularTiming>().is_some();
         match msg.message.packet {
             Packet::Rtp(ref packet) => {
                 if let Some(index) = self.local_index(packet.header.ssrc) {
@@ -3235,7 +3381,11 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for RtcpSessionInterceptor {
                     }
                 }
                 for packet in packets {
-                    self.adopt(packet);
+                    if regular {
+                        self.hold_for_regular(packet);
+                    } else {
+                        self.adopt(packet);
+                    }
                 }
                 self.run_timers(now);
                 if congestion_feedback && self.immediate_congestion_feedback {

@@ -159,6 +159,7 @@ use std::time::Instant;
 pub(crate) mod data_channel_event;
 pub(crate) mod ice_error_event;
 pub(crate) mod ice_event;
+pub(crate) mod key_frame_request_event;
 pub(crate) mod track_event;
 pub(crate) mod transport_event;
 
@@ -166,6 +167,7 @@ pub use crate::peer_connection::states_events::ICE_SERVER_UNREACHABLE;
 pub use data_channel_event::RTCDataChannelEvent;
 pub use ice_error_event::RTCPeerConnectionIceErrorEvent;
 pub use ice_event::RTCPeerConnectionIceEvent;
+pub use key_frame_request_event::{RTCKeyFrameRequestEvent, RTCKeyFrameRequestOrigin};
 pub use track_event::{
     RTCRemoteStreamsChange, RTCRemoteTrackEventInit, RTCTrackEvent, RTCTrackEventInit,
 };
@@ -546,6 +548,25 @@ pub enum RTCPeerConnectionEvent {
     /// Not a W3C event: a fork addition.
     OnSsrcCollision(crate::rtp_transceiver::SSRC),
 
+    /// The remote source with this SSRC named another CNAME in its RTCP SDES than the remote
+    /// description declares for it (`a=ssrc:<ssrc> cname:`), once per SSRC and declared
+    /// CNAME; [`RTCPeerConnection::remote_rtcp_cname`](crate::peer_connection::RTCPeerConnection::remote_rtcp_cname)
+    /// gives the one it named.
+    ///
+    /// RFC 5576 section 6.1: the receiver "SHOULD assume there has been an SSRC collision and
+    /// that the description of the source that was carried in the SDP description is not
+    /// applicable to the actual source being received". A collision between remote sources:
+    /// no local SSRC moves (that is [`Self::OnSsrcCollision`]) and no negotiation is asked
+    /// for. The media keeps flowing: a stream already established stays on its track; one
+    /// not established yet that is its receiver's only stream is received from then on as
+    /// one of an SSRC the description does not mention (by its section, MID or payload type,
+    /// without the repair flows the description paired with it), where its packets can be
+    /// placed that way; a later description that still declares the SSRC with that CNAME is
+    /// not applied to it again.
+    ///
+    /// Not a W3C event: a fork addition.
+    OnRemoteCnameMismatch(crate::rtp_transceiver::SSRC),
+
     /// RTP media of this SSRC arrived that no media section or track could take, and was
     /// discarded: the first such packet of each SSRC (at most 64 SSRCs per connection are
     /// reported).
@@ -604,12 +625,33 @@ pub enum RTCPeerConnectionEvent {
     /// the encoder (the application's) should generate a key frame for that layer. `rid` is
     /// the layer's RID, `None` when the sender's encoding has none (not simulcast). The PLI /
     /// FIR itself is delivered as well (`RTCMessage::RtcpPacket`).
+    ///
+    /// Raised for the engine's own requests too (the pacer's discard and flush, the NACK
+    /// responder's give-up: a PLI with sender SSRC 0), which this variant does not tell apart
+    /// from the remote peer's: [`Self::OnKeyFrameRequestOrigin`] follows each one and does.
+    /// (Its fields cannot grow here without breaking a `match` that names them all, so the
+    /// origin is a second event; see the CHANGELOG for the form planned for 0.3.0.)
     OnKeyFrameRequest {
         /// The sender whose stream the request names.
         sender: crate::rtp_transceiver::RTCRtpSenderId,
         /// The RID of the requested layer.
         rid: Option<String>,
     },
+
+    /// The same key-frame request as the [`Self::OnKeyFrameRequest`] just before it, with
+    /// where it came from ([`RTCKeyFrameRequestOrigin`]): a Picture Loss Indication or Full
+    /// Intra Request the remote peer sent, or a request the engine made itself
+    /// ([`RTCKeyFrameRequestOrigin::Local`]: the pacer discarded a frame or gave its queue up,
+    /// or the NACK responder gave the stream's repair up). Raised once for every
+    /// `OnKeyFrameRequest`, right after it.
+    ///
+    /// An application that answers the two differently (a remote request with a key frame at
+    /// once, the engine's own by a policy of its own, `OnPacerDiscard` beside it) reads this
+    /// one and ignores `OnKeyFrameRequest`.
+    ///
+    /// Not a W3C event (webrtc-encoded-transform 6.4 `keyframerequest` has no origin): a fork
+    /// addition.
+    OnKeyFrameRequestOrigin(RTCKeyFrameRequestEvent),
 
     /// The engine's pacer discarded media of this sender for want of room in the congestion
     /// controller's target (the default chain's `PacerQueueOverflow::Drop`): whole frames of
@@ -798,6 +840,20 @@ pub enum RTCPeerConnectionEvent {
         local_address: std::net::SocketAddr,
         /// The relayed address, when an allocation had been made.
         relayed_address: Option<std::net::SocketAddr>,
+    },
+    /// A new ICE generation needed an allocation on a server from the only UDP base the
+    /// transport has, which the allocation the previous generation uses holds (an allocation is
+    /// its 5-tuple's, RFC 8656 section 2.2): that one was released first, so the relayed path
+    /// is broken until the new generation selects a pair (break before make). An application
+    /// that adds a host candidate on a second local address while the restart is staged
+    /// (before `set_local_description` of the restart offer, or of the answer to one) gets the
+    /// new allocation from there instead, and data keeps flowing. Not a W3C event: a fork
+    /// addition.
+    OnTurnAllocationReplacedInPlace {
+        /// The server's URL (`turn:host:port?transport=udp`).
+        url: String,
+        /// The local address both allocations use.
+        local_address: std::net::SocketAddr,
     },
     /// A request of one of the engine's TURN links was finally refused by the server (after
     /// the retries the TURN client makes: 401 or 438 once more, RFC 8489 section 9.2.5), or,

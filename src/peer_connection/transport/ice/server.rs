@@ -22,8 +22,12 @@ pub struct RTCIceServer {
 }
 
 impl RTCIceServer {
+    /// The URL as W3C "validate an ICE server URL" takes it. A `stuns:` URL whose host is an
+    /// IP address is taken: the algorithm has no condition that refuses it, and RFC 8489
+    /// section 8.1's "A 'stuns' URI containing an IP address MUST be rejected" binds the STUN
+    /// client that would use it, so gathering rejects it (`EngineSrflx`).
     pub(crate) fn parse_url(&self, url_str: &str) -> Result<ice::url::Url> {
-        ice::url::Url::parse_url(url_str)
+        ice::url::Url::parse_url_lenient(url_str)
     }
 
     /// W3C "set a configuration", for one server: `urls` is not empty, and each url passes
@@ -35,10 +39,11 @@ impl RTCIceServer {
     /// `stun`, `stuns`, `turn` and `turns` ([`Error::ErrSchemeType`]), no opaque path, or one
     /// with `/` or `@`, or a fragment ([`Error::ErrInvalidUrl`]), a query on a STUN url
     /// ([`Error::ErrStunQuery`]) or one other than `transport=udp` / `transport=tcp` on a TURN
-    /// url ([`Error::ErrInvalidQuery`]), and a host and port that do not parse. The
+    /// url ([`Error::ErrInvalidQuery`]), and a host and port that do not parse
+    /// ([`Error::ErrInvalidUrl`]). The
     /// `InvalidAccessError` cases: a TURN url without a username or credential
     /// ([`Error::ErrNoTurnCredentials`]), or with a username of 509 bytes or more (RFC 8489
-    /// section 14.3) or a credential that is not an RFC 8265 OpaqueString
+    /// section 14.3), or a username or credential that is not an RFC 8265 OpaqueString
     /// ([`Error::InvalidAccessError`]).
     pub(crate) fn validate(&self) -> Result<()> {
         if self.urls.is_empty() {
@@ -47,7 +52,12 @@ impl RTCIceServer {
         for url in &self.urls {
             self.validate_url(url)?;
         }
-        self.urls()?;
+        // "hostAndPortURL is failure": a host or a port the URL parser refuses is a
+        // SyntaxError like the textual checks above.
+        self.urls().map_err(|err| match err {
+            Error::Url(_) => Error::ErrInvalidUrl,
+            err => err,
+        })?;
         Ok(())
     }
 
@@ -83,9 +93,13 @@ impl RTCIceServer {
             if self.username.is_empty() || self.credential.is_empty() {
                 return Err(Error::ErrNoTurnCredentials);
             }
-            // RFC 8489 section 14.3: "fewer than 509 bytes". RFC 8265 section 4.1: an
-            // OpaqueString has at least one character and no control character.
-            if self.username.len() >= 509 || self.credential.chars().any(char::is_control) {
+            // RFC 8489 section 14.3: the username "MUST contain a UTF-8-encoded sequence of
+            // fewer than 509 bytes and MUST have been processed using the OpaqueString
+            // profile"; RFC 8265 section 4.1: a password conforms to the OpaqueString profile
+            // (4.2: no control, default-ignorable or unassigned code point, not empty).
+            let username = ::stun::opaque::opaque_string(&self.username)
+                .map_err(|_| Error::InvalidAccessError)?;
+            if username.len() >= 509 || ::stun::opaque::opaque_string(&self.credential).is_err() {
                 return Err(Error::InvalidAccessError);
             }
         }

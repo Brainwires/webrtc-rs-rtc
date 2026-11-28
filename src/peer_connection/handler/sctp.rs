@@ -2971,6 +2971,74 @@ mod tests {
         );
     }
 
+    /// W3C webrtc-pc 6.1.2: the transport is "closed" when "the SCTP association ... is
+    /// closed, either because an SCTP SHUTDOWN or ABORT chunk was received". Here the peer
+    /// shuts the association down gracefully: its SHUTDOWN reaches this side's handler, which
+    /// completes the shutdown, and the transport reads "closed".
+    #[test]
+    fn a_received_shutdown_closes_the_sctp_transport() {
+        use crate::peer_connection::transport::RTCSctpTransportState;
+        let e = establish();
+        let now = Instant::now();
+        let mut server_ep = e.server_ep;
+        let mut server_conn = e.server_conn;
+        let server_ch = e.server_ch;
+        let mut ctx = client_ctx(now, e.client_ep, e.client_ch, e.client_conn);
+        // As `SctpTransport::start` leaves it.
+        ctx.sctp_transport.is_started = true;
+        assert_eq!(ctx.sctp_transport.state(), RTCSctpTransportState::Connected);
+
+        server_conn.shutdown().expect("shutdown");
+        let mut to_client = drain_transmits(&mut server_conn, now);
+        assert!(!to_client.is_empty(), "the peer sends its SHUTDOWN");
+        let mut rounds = 0;
+        while !to_client.is_empty() {
+            rounds += 1;
+            assert!(rounds < 10, "the shutdown does not end");
+            let mut to_server = vec![];
+            {
+                let mut handler = SctpHandler::new(&mut ctx, 0);
+                for d in to_client.drain(..) {
+                    handler
+                        .handle_read(TaggedRTCMessageInternal {
+                            now,
+                            transport: TransportContext {
+                                local_addr: client_addr(),
+                                peer_addr: server_addr(),
+                                transport_protocol: TransportProtocol::UDP,
+                                ecn: None,
+                            },
+                            message: RTCMessageInternal::Dtls(DTLSMessage::Raw(BytesMut::from(
+                                &d[..],
+                            ))),
+                        })
+                        .expect("handle_read");
+                }
+                handler.handle_timeout(now).expect("handle_timeout");
+                while let Some(out) = handler.poll_write() {
+                    if let RTCMessageInternal::Dtls(DTLSMessage::Raw(raw)) = out.message {
+                        to_server.push(raw.freeze());
+                    }
+                }
+            }
+            for d in to_server {
+                if let Some((ch, DatagramEvent::AssociationEvent(ev))) =
+                    server_ep.handle(now, client_addr(), None, d)
+                {
+                    assert_eq!(ch, server_ch);
+                    server_conn.handle_event(ev);
+                }
+            }
+            while server_conn.poll().is_some() {}
+            to_client = drain_transmits(&mut server_conn, now);
+        }
+        assert_eq!(
+            ctx.sctp_transport.state(),
+            RTCSctpTransportState::Closed,
+            "a received SHUTDOWN closes the transport"
+        );
+    }
+
     // The teardown-safety flush must touch ONLY the draining association. With two
     // live associations, draining A must flush A's final SHUTDOWN and remove A while
     // leaving B — and B's queued DATA — untouched (B keeps coalescing and is flushed

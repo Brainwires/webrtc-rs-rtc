@@ -1,5 +1,6 @@
 //! The formats an answer adds beyond the offer's are received, between two `rtci` peer
-//! connections in virtual time.
+//! connections in virtual time. The answerer lists them with
+//! `SettingEngineBuilder::with_answer_offered_formats_only(false)` (the default before 0.3.0).
 //!
 //! RFC 9429 section 5.3.1 (no codec preferences): "Any currently available media formats that
 //! are not present in the current remote description MUST be added after all existing
@@ -53,8 +54,15 @@ impl Peer {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+        // The answer lists the formats the offer lacks (the setting; the default answers with
+        // the offered formats only since 0.3.0).
         let pc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
+            .with_setting_engine(
+                rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder::new()
+                    .with_answer_offered_formats_only(false)
+                    .build(),
+            )
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
             .build(Instant::now())?;

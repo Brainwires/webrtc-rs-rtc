@@ -35,6 +35,9 @@ pub struct Peer {
     pub states: Vec<(RTCPeerConnectionState, Instant)>,
     /// Every ICE connection state it went through, with the runtime's time.
     pub ice_states: Vec<(RTCIceConnectionState, Instant)>,
+    /// Whether the end-of-candidates candidate is carried to the other peer too (an
+    /// application that relays it; W3C webrtc-pc 5.6.4: "failed" needs it). Off by default.
+    pub relay_end_of_candidates: bool,
 }
 
 impl Peer {
@@ -69,6 +72,7 @@ impl Peer {
             received: vec![],
             states: vec![],
             ice_states: vec![],
+            relay_end_of_candidates: false,
         })
     }
 
@@ -82,7 +86,9 @@ impl Peer {
         while let Some(event) = self.driver.poll_event() {
             match event {
                 RTCPeerConnectionEvent::OnIceCandidateEvent(event) => {
-                    if let Some(candidate) = event.candidate.filter(|c| !c.end_of_candidates)
+                    if let Some(candidate) = event
+                        .candidate
+                        .filter(|c| self.relay_end_of_candidates || !c.end_of_candidates)
                         && let Ok(init) = candidate.to_json()
                     {
                         self.outgoing.push(init);

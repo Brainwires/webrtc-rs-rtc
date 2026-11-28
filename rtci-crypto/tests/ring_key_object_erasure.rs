@@ -1,5 +1,5 @@
 //! The ring provider's key objects are erased when they are dropped (RFC 7714 section 13.1,
-//! RFC 3711 section 9.3, RFC 8446 section 7.1): its AES-GCM and ChaCha20-Poly1305 AEAD keys
+//! RFC 8446 section 7.1): its AES-GCM and ChaCha20-Poly1305 AEAD keys
 //! (`ring::aead::LessSafeKey`), its record-number (QUIC header-protection) keys
 //! (`ring::aead::quic::HeaderProtectionKey`) and its HMAC-SHA-2 keys (`ring::hmac::Key`).
 //!

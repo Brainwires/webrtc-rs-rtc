@@ -136,6 +136,13 @@ pub(crate) struct EngineStreams {
     /// one whose listener accepted it, or (a listening port shared by several transports)
     /// the one its first Binding request names.
     connection_transport: HashMap<StreamId, TransportId>,
+    /// Two lite agents (RFC 6544 section 6.1): the pairs (transport, local, remote) whose
+    /// connection this side opened when it selected them, once each.
+    lite_connects: HashSet<(TransportId, SocketAddr, SocketAddr)>,
+    /// Two lite agents, this side controlled: transports whose updated candidate exchange
+    /// was applied, and whose connections opened in parallel with it are still to be matched
+    /// against its pair (RFC 6544 section 6.1).
+    pub(crate) lite_updates: HashSet<TransportId>,
     /// The transports whose end of gathering was signalled while their listeners or TURN
     /// allocations were still being made.
     end_of_gathering_deferred: HashSet<TransportId>,
@@ -165,6 +172,8 @@ impl EngineStreams {
             active_connections: HashSet::new(),
             answered: HashSet::new(),
             connection_transport: HashMap::new(),
+            lite_connects: HashSet::new(),
+            lite_updates: HashSet::new(),
             end_of_gathering_deferred: HashSet::new(),
             unroutable: 0,
         }
@@ -258,6 +267,30 @@ impl EngineStreams {
         }
         connecting
     }
+
+    /// Opens a connection from the active candidate on `ip` (an ephemeral port of that
+    /// interface, RFC 6544 section 7.1) to `remote`, for the agent of `on`.
+    fn connect_active(
+        &mut self,
+        on: TransportId,
+        ip: IpAddr,
+        remote: SocketAddr,
+    ) -> Option<StreamId> {
+        let id = self
+            .table
+            .connect(
+                SocketAddr::new(ip, 0),
+                remote,
+                Framing::Rfc4571,
+                ICE_TCP,
+                false,
+                None,
+            )
+            .ok()?;
+        self.active_connections.insert(id);
+        self.connection_transport.insert(id, on);
+        Some(id)
+    }
 }
 
 /// RFC 7983's first-byte ranges for what may travel on an ICE-TCP connection: STUN, DTLS,
@@ -290,6 +323,8 @@ impl RTCPeerConnection {
             self.turn_tcp_permissions(now);
             self.pump_turn(now);
         }
+        self.open_lite_tcp_connections();
+        self.settle_lite_tcp_updates();
         self.route_stream_writes();
         self.close_unused_tcp_connections();
         self.close_settled_srflx_connections();
@@ -431,6 +466,12 @@ impl RTCPeerConnection {
                     }
                 },
             };
+            // Two lite agents: the peer's active candidate opened this connection for the
+            // selected pair; the agent knows that peer by the candidate's address (port 9),
+            // not by the connection's ephemeral port (RFC 6544 section 6.1).
+            let transport = self
+                .lite_pair_peer(on, id)
+                .map_or(transport, |peer| tcp_context(local, peer));
             if !demultiplexable(first) {
                 debug!("{id}: a frame that is neither STUN, DTLS nor RTP: framing lost, reset");
                 self.streams.table.reset(id);
@@ -455,7 +496,13 @@ impl RTCPeerConnection {
             );
             // RFC 6544 section 7.1: on a connection this agent opened, a first answer that is
             // not STUN closes it (the agent has failed the pairs of that remote candidate).
-            if first_answer && first > 3 {
+            // Two lite agents send no connectivity check (RFC 8445 section 6.1.1): the first
+            // thing the peer sends on the connection is DTLS, and that is no failed check.
+            let lite_lite = {
+                let agent = &self.ice_transport_of(on).agent;
+                agent.is_lite() && agent.is_remote_lite()
+            };
+            if first_answer && first > 3 && !lite_lite {
                 debug!("{id}: the first answer is not STUN, the connection is closed");
                 self.streams.table.reset(id);
                 break;
@@ -593,8 +640,46 @@ impl RTCPeerConnection {
     /// refused (RFC 8838 section 13); given at once otherwise.
     pub(crate) fn finish_local_gathering_after_streams(&mut self) {
         if !self.defer_end_of_gathering() {
+            self.release_unserved_tcp_listeners();
             self.finish_local_gathering();
         }
+    }
+
+    /// The end of candidates of the active transport came before the application first
+    /// served the stream interface (no `poll_stream_command` or `handle_stream_*` yet): the
+    /// engine cannot know a driver will bind its listeners, so the end of gathering does not
+    /// wait for them, and a TCP candidate made once one is bound would follow the
+    /// end-of-candidates indication, which RFC 8838 section 13 forbids ("an agent MUST NOT
+    /// convey any more candidates after it has conveyed an end-of-candidates indication").
+    /// Those listeners would listen for connections no candidate announces: they are
+    /// released (a driver that polls later sees each `Listen` followed by its
+    /// `StopListening`) and the application is told, at warn level, what to do instead. An
+    /// ICE restart gathers them afresh.
+    fn release_unserved_tcp_listeners(&mut self) {
+        if self.streams.driver_seen {
+            return;
+        }
+        let on = self.pipeline_context.transports.active_id();
+        let unserved: Vec<ListenerId> = self
+            .streams
+            .gathers
+            .iter()
+            .filter(|g| g.transport == on)
+            .flat_map(|g| g.listeners.iter().map(|l| l.id))
+            .collect();
+        if unserved.is_empty() {
+            return;
+        }
+        log::warn!(
+            "end of candidates before the stream interface was first served: the engine's TCP \
+             candidates are not gathered ({} listener(s) released); poll `poll_stream_command` \
+             before adding the end of candidates to have them (RFC 8838 section 13)",
+            unserved.len()
+        );
+        for listener in unserved {
+            self.streams.table.stop_listening(listener);
+        }
+        self.streams.gathers.retain(|g| g.transport != on);
     }
 
     /// Whether the end of gathering of the active transport waits for the engine's listeners
@@ -950,24 +1035,16 @@ impl RTCPeerConnection {
         let remote = msg.transport.peer_addr;
         let named_only = msg.message.first().is_none_or(|first| *first > 3)
             && self.pipeline_context.transports.ids().len() > 1;
-        let id = match self.streams.connection_for(local, remote, on, named_only) {
+        let id = match self
+            .streams
+            .connection_for(local, remote, on, named_only)
+            .or_else(|| self.lite_pair_connection(on, local, remote))
+        {
             Some(id) => Some(id),
             None if local.port() == ACTIVE_PORT && self.streams.active.contains(&local.ip()) => {
                 // RFC 6544 section 7.1: an active candidate opens its connection from that
                 // interface, on an ephemeral port, when its check is sent.
-                let id = self.streams.table.connect(
-                    SocketAddr::new(local.ip(), 0),
-                    remote,
-                    Framing::Rfc4571,
-                    ICE_TCP,
-                    false,
-                    None,
-                );
-                if let Ok(id) = id {
-                    self.streams.active_connections.insert(id);
-                    self.streams.connection_transport.insert(id, on);
-                }
-                id.ok()
+                self.streams.connect_active(on, local.ip(), remote)
             }
             None if self
                 .streams
@@ -1031,6 +1108,9 @@ impl RTCPeerConnection {
             // failed.
             if agent.get_selected_candidate_pair().is_none()
                 || agent.state() == ice::state::ConnectionState::Failed
+                // Two lite agents: the pair is the controlling agent's, still to come; a
+                // connection it opened in parallel waits for it (RFC 6544 section 6.1).
+                || agent.awaits_lite_update()
             {
                 continue;
             }
@@ -1045,6 +1125,7 @@ impl RTCPeerConnection {
                 match self
                     .streams
                     .connection_for(path.local_addr, path.peer_addr, *t, false)
+                    .or_else(|| self.lite_pair_connection(*t, path.local_addr, path.peer_addr))
                 {
                     Some(id) => keep.push(id),
                     None => continue,
@@ -1081,6 +1162,160 @@ impl RTCPeerConnection {
         for id in unused {
             debug!("{id} carries no selected pair: closed");
             self.streams.table.close(id);
+        }
+    }
+
+    /// Two lite agents, the selected pair of `on` from this agent's passive TCP candidate to
+    /// the peer's active one: the connection the peer opened for it (RFC 6544 section 6.1),
+    /// and the addresses the agent knows the pair by (the peer by its active candidate's,
+    /// port 9). It is a connection accepted on the pair's local candidate from the active
+    /// candidate's IP address, from any port ("from any of the IP addresses the offerer
+    /// listed"); no connectivity check names it, since two lite agents send none.
+    fn lite_pair(&self, on: TransportId) -> Option<(StreamId, SocketAddr, SocketAddr)> {
+        let agent = &self.ice_transport_of(on).agent;
+        if !(agent.is_lite() && agent.is_remote_lite()) {
+            return None;
+        }
+        let (local, remote) = agent.get_selected_candidate_pair()?;
+        if local.tcp_type() != TcpType::Passive || remote.tcp_type() != TcpType::Active {
+            return None;
+        }
+        let (local, peer) = (local.base_addr(), remote.addr());
+        let mut found = None;
+        for c in self.streams.table.connections() {
+            if c.tag != ICE_TCP
+                || c.state == StreamState::Closing
+                || !matches!(c.origin, StreamOrigin::Accepted(_))
+                || c.local != local
+                || c.remote.ip() != peer.ip()
+                || self
+                    .streams
+                    .connection_transport
+                    .get(&c.id)
+                    .is_some_and(|t| *t != on)
+            {
+                continue;
+            }
+            if c.state == StreamState::Open {
+                return Some((c.id, local, peer));
+            }
+            found.get_or_insert((c.id, local, peer));
+        }
+        found
+    }
+
+    /// [`Self::lite_pair`]'s connection, when the agent of `on` sends from `local` to `peer`.
+    fn lite_pair_connection(
+        &self,
+        on: TransportId,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> Option<StreamId> {
+        self.lite_pair(on)
+            .filter(|(_, l, p)| *l == local && *p == peer)
+            .map(|(id, _, _)| id)
+    }
+
+    /// [`Self::lite_pair`]'s peer address, when `id` is its connection.
+    fn lite_pair_peer(&self, on: TransportId, id: StreamId) -> Option<SocketAddr> {
+        self.lite_pair(on)
+            .filter(|(pair_id, _, _)| *pair_id == id)
+            .map(|(_, _, peer)| peer)
+    }
+
+    /// RFC 6544 section 6.1: "If both agents are using the lite mode and if the offerer uses
+    /// the a=setup:active attribute [RFC4145] in the new offer, the offerer MAY initiate the
+    /// TCP connection on the selected pair in parallel with the new offer". The TCP role is
+    /// the pair's (`a=setup` is DTLS's in WebRTC, RFC 8842): the side whose candidate of the
+    /// selected pair is active opens its connection, before anything is sent on it, once for
+    /// each pair. The controlling agent does at once, in parallel with its updated offer; the
+    /// controlled one once its pair is final (the update taken, or a single pair).
+    fn open_lite_tcp_connections(&mut self) {
+        for on in self.pipeline_context.transports.ids() {
+            let agent = &self.ice_transport_of(on).agent;
+            if !(agent.is_lite() && agent.is_remote_lite()) || agent.awaits_lite_update() {
+                continue;
+            }
+            let Some((local, remote)) = agent.get_selected_candidate_pair() else {
+                continue;
+            };
+            if local.tcp_type() != TcpType::Active || remote.tcp_type() != TcpType::Passive {
+                continue;
+            }
+            let (local, remote) = (local.base_addr(), remote.addr());
+            if !self.streams.manages(local)
+                || !self.streams.lite_connects.insert((on, local, remote))
+                || self
+                    .streams
+                    .connection_for(local, remote, on, false)
+                    .is_some()
+            {
+                continue;
+            }
+            debug!("lite-lite: connecting the selected pair {local} -> {remote}");
+            self.streams.connect_active(on, local.ip(), remote);
+        }
+    }
+
+    /// RFC 6544 section 6.1, the answerer of two lite agents, once the updated offer was
+    /// applied and its pair selected: "If the answerer receives the new offer matching the
+    /// candidate pair where a connection was already created in parallel with the new offer,
+    /// it MUST accept the offer and respond to it while keeping the already-created
+    /// connection. If the connection that was created in parallel with the new offer does
+    /// not match the candidate pair in the new offer, the connection MUST be closed, and ICE
+    /// restart SHOULD be performed." A connection that matches the pair stays and any other
+    /// the peer opened is closed; connections of which none matches are closed and ICE
+    /// restarts (`restart_ice`). Until a connection is accepted (the update came first) the
+    /// transport waits; a pair of another kind (UDP, or this side's candidate active) has no
+    /// parallel connection to match.
+    fn settle_lite_tcp_updates(&mut self) {
+        if self.streams.lite_updates.is_empty() {
+            return;
+        }
+        let pending: Vec<TransportId> = self.streams.lite_updates.iter().copied().collect();
+        for on in pending {
+            if !self.pipeline_context.transports.ids().contains(&on) {
+                self.streams.lite_updates.remove(&on);
+                continue;
+            }
+            let agent = &self.ice_transport_of(on).agent;
+            let Some((local, remote)) = agent.get_selected_candidate_pair() else {
+                continue;
+            };
+            if local.tcp_type() != TcpType::Passive || remote.tcp_type() != TcpType::Active {
+                self.streams.lite_updates.remove(&on);
+                continue;
+            }
+            let kept = self.lite_pair(on).map(|(id, _, _)| id);
+            let others: Vec<StreamId> = self
+                .streams
+                .table
+                .connections()
+                .filter(|c| {
+                    c.tag == ICE_TCP
+                        && c.state != StreamState::Closing
+                        && matches!(c.origin, StreamOrigin::Accepted(_))
+                        && Some(c.id) != kept
+                        && self
+                            .streams
+                            .connection_transport
+                            .get(&c.id)
+                            .is_none_or(|t| *t == on)
+                })
+                .map(|c| c.id)
+                .collect();
+            if kept.is_none() && others.is_empty() {
+                continue;
+            }
+            self.streams.lite_updates.remove(&on);
+            for id in &others {
+                debug!("lite-lite: {id} does not match the pair of the new offer: closed");
+                self.streams.table.close(*id);
+            }
+            if kept.is_none() {
+                debug!("lite-lite: no connection matches the pair of the new offer: ICE restart");
+                self.restart_ice();
+            }
         }
     }
 

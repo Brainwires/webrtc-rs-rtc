@@ -104,6 +104,13 @@ pub(crate) struct RTCRtpSenderInternal {
     /// A rid leaves it when the answer removes its encoding or the application gives it new
     /// restrictions (`set_parameters`).
     offered_rid_restrictions: Vec<(String, RTCRtpRidRestrictions)>,
+    /// `with_rejected_rids_kept_in_offers` (RFC 9429 section 5.2.2): the encodings of the
+    /// simulcast streams remote answers rejected, which later offers still list and a later
+    /// answer may accept again. Not sent, not in `get_parameters`.
+    rejected_encodings: Vec<RTCRtpEncodingParameters>,
+    /// The rids of the simulcast envelope in the order first offered, rejected ones included,
+    /// kept with `rejected_encodings`: the order later offers list them in.
+    envelope_rids: Vec<String>,
     /// The `RTCDTMFSender` of an audio sender: its slots and playout.
     pub(crate) dtmf: super::dtmf::DtmfState,
     /// Whether the last answer negotiated `a=extmap-allow-mixed` for the media section (RFC
@@ -135,6 +142,13 @@ pub(crate) struct RTCRtpSenderInternal {
     /// codec the current SSRC is sent with when the application switched to one other than
     /// the negotiated choice.
     clock_rates: std::collections::HashMap<SSRC, ClockRateStreams>,
+    /// The packets `write_rtp` accepted with a payload type it rewrote to the one negotiated
+    /// for their encoding's codec (`RTCRtpSender::rewritten_payload_type_rtp_packets`).
+    rewritten_payload_type_rtp_packets: u64,
+    /// Of those, the ones whose written payload type names, in the media engine, a format
+    /// other than the codec they were sent as
+    /// (`RTCRtpSender::rewritten_from_another_codec_rtp_packets`).
+    rewritten_from_another_codec_rtp_packets: u64,
 }
 
 /// What a sender keeps of one encoding's clock rates (RFC 7160 section 4.1: an SSRC per
@@ -508,6 +522,30 @@ impl RTCRtpSenderInternal {
         true
     }
 
+    /// Whether the sender holds encodings a remote offer proposed, which a rollback replaces
+    /// (`[[LastStableRidlessSendEncodings]]` is set).
+    pub(crate) fn has_proposed_send_encodings(&self) -> bool {
+        self.last_stable_ridless_send_encodings.is_some()
+    }
+
+    /// A track given to a sender that holds proposed encodings, which it keeps (W3C
+    /// `addTrack` and `replaceTrack` change only `[[SenderTrack]]`). When the sender had no
+    /// encodings before the offer (the engine's form of the W3C default encoding), what a
+    /// rollback restores is `restore`: the track's own encodings, or `None` (the W3C slot
+    /// stays null, so the proposed encodings stay).
+    pub(crate) fn keep_proposed_send_encodings_for_track(
+        &mut self,
+        restore: Option<Vec<RTCRtpEncodingParameters>>,
+    ) {
+        if self
+            .last_stable_ridless_send_encodings
+            .as_ref()
+            .is_some_and(|encodings| encodings.is_empty())
+        {
+            self.last_stable_ridless_send_encodings = restore;
+        }
+    }
+
     /// The negotiation completed: the proposed envelope is the sender's.
     pub(crate) fn forget_ridless_send_encodings(&mut self) {
         self.last_stable_ridless_send_encodings = None;
@@ -531,6 +569,9 @@ impl RTCRtpSenderInternal {
     /// Gives a sender that has none its encodings (SSRCs allocated by the caller).
     pub(crate) fn set_send_encodings(&mut self, send_encodings: Vec<RTCRtpEncodingParameters>) {
         self.send_encodings = send_encodings;
+        // A new envelope: the streams answers rejected from the old one are not offered.
+        self.rejected_encodings.clear();
+        self.envelope_rids.clear();
         self.last_returned_parameters = None;
         self.sync_tracks();
     }
@@ -540,6 +581,43 @@ impl RTCRtpSenderInternal {
     /// what was negotiated: one of the send codecs, or any before negotiation. A coding that
     /// names no codec, or one that was not negotiated, leaves the encoding's codec alone (the
     /// envelope `replaceTrack` stays in). The SSRCs and rids are the sender's and stay.
+    /// W3C `replaceTrack`: whether a track with `codings` "can be sent immediately by the
+    /// sender without violating the sender's already-negotiated envelope". The engine encodes
+    /// nothing, so what it can see of the envelope is the codec each coding says its source
+    /// produces: every coding that names one must name a codec of [[SendCodecs]] by mime type,
+    /// clock rate and channel count (webrtc-pc: "Sources that also encode ... might be unable
+    /// to produce the negotiated codec", "An audio track having a different number of
+    /// channels"). A coding without a codec, or a sender with nothing negotiated, is within it;
+    /// a coding's clock rate or channel count of 0 is not compared.
+    pub(crate) fn within_negotiated_envelope(&self, codings: &[RTCRtpEncodingParameters]) -> bool {
+        if self.send_codecs.is_empty() {
+            return true;
+        }
+        codings.iter().all(|coding| {
+            let codec = &coding.codec;
+            codec.mime_type.is_empty()
+                || self.send_codecs.iter().any(|negotiated| {
+                    let n = &negotiated.rtp_codec;
+                    // A negotiated audio codec without a channel count has one (RFC 8866
+                    // section 6.6: "the default value is one"); a coding that names none says
+                    // nothing about its channels.
+                    let negotiated_channels = match n.channels {
+                        0 if n
+                            .mime_type
+                            .get(..6)
+                            .is_some_and(|p| p.eq_ignore_ascii_case("audio/")) =>
+                        {
+                            1
+                        }
+                        channels => channels,
+                    };
+                    n.mime_type.eq_ignore_ascii_case(&codec.mime_type)
+                        && (codec.clock_rate == 0 || codec.clock_rate == n.clock_rate)
+                        && (codec.channels == 0 || codec.channels == negotiated_channels)
+                })
+        })
+    }
+
     pub(crate) fn adopt_coding_codecs(&mut self, codings: &[RTCRtpEncodingParameters]) {
         for (i, encoding) in self.send_encodings.iter_mut().enumerate() {
             let rid = &encoding.rtp_coding_parameters.rid;
@@ -618,6 +696,25 @@ impl RTCRtpSenderInternal {
     /// and are available for sending.
     pub(crate) fn get_send_codecs(&self) -> &[RTCRtpCodecParameters] {
         &self.send_codecs
+    }
+
+    /// Counts a packet `write_rtp` sent with a rewritten payload type; `another_codec` when
+    /// the written number named a format other than the codec it was sent as.
+    pub(crate) fn count_rewritten_payload_type(&mut self, another_codec: bool) {
+        self.rewritten_payload_type_rtp_packets += 1;
+        if another_codec {
+            self.rewritten_from_another_codec_rtp_packets += 1;
+        }
+    }
+
+    /// See `RTCRtpSender::rewritten_payload_type_rtp_packets`.
+    pub(crate) fn rewritten_payload_type_rtp_packets(&self) -> u64 {
+        self.rewritten_payload_type_rtp_packets
+    }
+
+    /// See `RTCRtpSender::rewritten_from_another_codec_rtp_packets`.
+    pub(crate) fn rewritten_from_another_codec_rtp_packets(&self) -> u64 {
+        self.rewritten_from_another_codec_rtp_packets
     }
 
     /// The RTP capabilities of the engine for sending `kind` (W3C webrtc 5.2
@@ -1025,8 +1122,36 @@ impl RTCRtpSenderInternal {
     /// with the restrictions the answer gave them (see
     /// `RTCPeerConnection::apply_negotiated_simulcast`). Without any of them, the first
     /// encoding stays. A sender with one encoding is left as it is.
-    pub(crate) fn apply_simulcast_answer(&mut self, accepted: &[(String, RTCRtpRidRestrictions)]) {
+    ///
+    /// `keep_rejected` (`with_rejected_rids_kept_in_offers`, a remote answer): the encodings
+    /// the answer leaves out are kept aside instead of dropped, for later offers to list
+    /// (RFC 9429 section 5.2.2), and those an earlier answer left out take part again: one
+    /// this answer accepts is the sender's again, in its place in the envelope.
+    pub(crate) fn apply_simulcast_answer(
+        &mut self,
+        accepted: &[(String, RTCRtpRidRestrictions)],
+        keep_rejected: bool,
+    ) {
+        if keep_rejected {
+            let order = if self.envelope_rids.is_empty() {
+                self.send_encodings
+                    .iter()
+                    .map(|encoding| encoding.rtp_coding_parameters.rid.clone())
+                    .collect()
+            } else {
+                std::mem::take(&mut self.envelope_rids)
+            };
+            self.send_encodings.append(&mut self.rejected_encodings);
+            self.send_encodings.sort_by_key(|encoding| {
+                order
+                    .iter()
+                    .position(|rid| *rid == encoding.rtp_coding_parameters.rid)
+                    .unwrap_or(usize::MAX)
+            });
+            self.envelope_rids = order;
+        }
         if self.send_encodings.len() < 2 {
+            self.envelope_rids.clear();
             return;
         }
         let restrictions_of = |rid: &str| {
@@ -1057,26 +1182,66 @@ impl RTCRtpSenderInternal {
                             .push((coding.rid.clone(), coding.rid_restrictions.clone()));
                     }
                     coding.rid_restrictions = restrictions.clone();
+                    // A stream an earlier answer rejected, accepted again.
+                    if let Some(ssrc) = coding.ssrc {
+                        self.removed_ssrcs.retain(|removed| *removed != ssrc);
+                    }
                     kept.push(encoding);
                 }
                 None if !keeps_any && index == 0 => kept.push(encoding),
                 None => {
-                    if let Some(ssrc) = coding.ssrc {
+                    if let Some(ssrc) = coding.ssrc
+                        && !self.removed_ssrcs.contains(&ssrc)
+                    {
                         self.removed_ssrcs.push(ssrc);
+                    }
+                    if keep_rejected {
+                        self.rejected_encodings.push(encoding);
                     }
                 }
             }
         }
         self.send_encodings = kept;
+        if self.rejected_encodings.is_empty() {
+            self.envelope_rids.clear();
+        }
+        // The restrictions offered for a kept-aside stream stay what later offers write.
         let kept_rids: Vec<String> = self
             .send_encodings
             .iter()
+            .chain(&self.rejected_encodings)
             .map(|encoding| encoding.rtp_coding_parameters.rid.clone())
             .collect();
         self.offered_rid_restrictions
             .retain(|(rid, _)| kept_rids.contains(rid));
         self.last_returned_parameters = None;
         self.sync_tracks();
+    }
+
+    /// The encodings an offer lists, in the envelope's order, each with whether a remote
+    /// answer rejected it (`with_rejected_rids_kept_in_offers`): the sender's own, and those
+    /// kept aside for later offers (RFC 9429 section 5.2.2). Without kept-aside ones, the
+    /// sender's encodings.
+    pub(crate) fn offered_encodings(&self) -> Vec<(&RTCRtpEncodingParameters, bool)> {
+        let mut offered: Vec<(&RTCRtpEncodingParameters, bool)> = self
+            .send_encodings
+            .iter()
+            .map(|encoding| (encoding, false))
+            .chain(
+                self.rejected_encodings
+                    .iter()
+                    .map(|encoding| (encoding, true)),
+            )
+            .collect();
+        if !self.rejected_encodings.is_empty() {
+            offered.sort_by_key(|(encoding, _)| {
+                self.envelope_rids
+                    .iter()
+                    .position(|rid| *rid == encoding.rtp_coding_parameters.rid)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        offered
     }
 
     /// The restrictions the offer gave `rid` before an answer tightened them, which a later
@@ -1643,7 +1808,8 @@ pub(crate) fn validate_scalability_modes(
 
 /// W3C webrtc 5.1 `addTransceiver`, the steps that take `sendEncodings`:
 ///
-/// - a rid that is not `1*(alpha-numeric / "-" / "_")` (RFC 8851 section 10) is a `TypeError`,
+/// - a rid that is not `1*255(alpha-numeric)` (RFC 8851 section 10 as corrected by erratum
+///   7132) is a `TypeError`,
 ///   as are a rid on some encodings only and a repeated rid;
 /// - for audio `scaleResolutionDownBy` and `maxFramerate` are removed;
 /// - a `scaleResolutionDownBy` below 1.0 and a negative `maxFramerate` are `RangeError`s;
@@ -1658,10 +1824,8 @@ pub(crate) fn validate_send_encodings(
     kind: RtpCodecKind,
     encodings: &mut Vec<RTCRtpEncodingParameters>,
 ) -> Result<()> {
-    let is_rid = |rid: &str| {
-        rid.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    };
+    // An empty rid is no rid (the encoding has none).
+    let is_rid = |rid: &str| rid.is_empty() || sdp::attribute::RidIdGrammar::Corrected.admits(rid);
     if let Some(encoding) = encodings
         .iter()
         .find(|encoding| !is_rid(&encoding.rtp_coding_parameters.rid))
@@ -1748,7 +1912,10 @@ pub(crate) fn rtp_capabilities(
         return None;
     }
     let mut codecs: Vec<RTCRtpCodec> = vec![];
-    for codec in media_engine.get_codecs_by_kind(kind) {
+    // W3C webrtc-pc 5.2 / 5.3 getCapabilities: "the list of implemented send codecs" ("receive
+    // codecs"), "the most optimistic view of the codecs the user agent supports": the
+    // registered formats, never the list a negotiation narrowed them to.
+    for codec in media_engine.registered_codecs_by_kind(kind).iter().cloned() {
         let mut codec = codec.rtp_codec;
         if is_repair_codec(&codec) && repair_family(&codec) == "rtx" {
             codec.sdp_fmtp_line = String::new();
@@ -1760,11 +1927,14 @@ pub(crate) fn rtp_capabilities(
     }
     Some(RTCRtpCapabilities {
         codecs,
+        // W3C webrtc-pc 5.2 / 5.3: "the list of implemented header extensions for sending"
+        // ("for receiving"), "the most optimistic view": the registered extensions of the kind
+        // that the direction allows, once per URI (a dictionary has the URI only), never the
+        // set a negotiation narrowed them to.
         header_extensions: media_engine
-            .get_rtp_parameters_by_kind(kind, direction)
-            .header_extensions
+            .registered_header_extension_uris(kind, direction)
             .into_iter()
-            .map(|h| RTCRtpHeaderExtensionCapability { uri: h.uri })
+            .map(|uri| RTCRtpHeaderExtensionCapability { uri })
             .collect(),
     })
 }

@@ -178,11 +178,31 @@ for (const codec of ["VP8", "VP9", "H264", "H265", "AV1"]) {
           return r && r.framesDecoded > 15 && r;
         }, 25000, "15 decoded frames").catch(async (e) => ({ error: String(e), last: await Interop.inbound(s.pc, "video") }));
         const report = await s.report();
+        // What Rust received on a payload type the browser's offer does not have: a format the
+        // answer added (RFC 9429 section 5.3.1) that the browser switched to (RFC 3264 section 7
+        // lets it), which Rust cannot reflect (its sender may only use the offer's formats, RFC
+        // 3264 section 6.1), or one the answer lacks too (a browser defect). WebKit did this in
+        // train-36 round 10d (test-env 46081695534): VP8 on 96 offered, VP9 on 98 sent, Rust
+        // reflected 7 VP8 packets and then only RTX probe padding, the cell timed out.
+        const offPt = Interop.receivedOutside(report, s.pc.localDescription.sdp);
+        const notInAnswer = Interop.receivedOutside(report, s.pc.remoteDescription.sdp);
+        const answerVideo = Interop.codecLines(s.pc.remoteDescription.sdp, "video");
+        const sending = (await Interop.codecView(s.pc)).sending;
         s.close();
-        return { rtp, report };
+        return { rtp, report, offPt, notInAnswer, answerVideo, sending };
       },
       [WS, codec],
     );
+    console.log(
+      `[${test.info().project.name}] reflect ${codec} payload types: answer ${JSON.stringify(r.answerVideo)}; ` +
+        `received ${JSON.stringify(r.report?.wireRtp?.received)}; sent ${JSON.stringify(r.report?.wireRtp?.sent)}; ` +
+        `the engine ignored ${r.report?.unnegotiatedPayloadTypeRtp} for an unnegotiated payload type; ` +
+        `PLIs forwarded ${r.report?.plisForwarded}; the browser sending ${JSON.stringify(r.sending)}`,
+    );
+    expect(
+      r.offPt,
+      `the browser sent media on a payload type its offer does not have (${r.notInAnswer.length ? "nor the answer, RFC 3264 section 7" : "a format the answer added, RFC 9429 section 5.3.1, which Rust cannot reflect"}): ${JSON.stringify({ offPt: r.offPt, answer: r.answerVideo, received: r.report?.wireRtp?.received, sent: r.report?.wireRtp?.sent, sending: r.sending })}`,
+    ).toEqual([]);
     expect(r.rtp.error, JSON.stringify(r)).toBeUndefined();
     expect(r.rtp.mimeType.toLowerCase()).toBe(`video/${codec}`.toLowerCase());
   });

@@ -104,6 +104,11 @@ pub(crate) const MAX_REMOTE_EPOCH: u16 = 1;
 /// caller wants, and it is what `ConfigBuilder::build` accidentally used between P7 and this
 /// constant being introduced.
 pub(crate) const DEFAULT_MAXIMUM_RETRANSMIT_NUMBER: usize = 7;
+/// How long a completed association answers a repeat of the peer's last flight with its own
+/// last flight again: "at least twice the default MSL defined for [TCP]" (RFC 6347 4.2.4),
+/// the TCP MSL being two minutes (RFC 793 3.3). The same as DTLS 1.3 keeps its handshake keys
+/// for (`dtls13::conn::HANDSHAKE_KEYS_LINGER`, RFC 9147 5.8.1).
+pub(crate) const FINAL_FLIGHT_ANSWER_PERIOD: Duration = Duration::from_secs(240);
 
 pub(crate) static INVALID_KEYING_LABELS: &[&str] = &[
     "client finished",
@@ -131,6 +136,13 @@ pub struct DTLSConn {
     pub(crate) state: State, // Internal state
 
     handshake_completed: bool,
+    /// When the handshake completed, the start of [`FINAL_FLIGHT_ANSWER_PERIOD`]: nanoseconds
+    /// after `handshake_started`, `u64::MAX` until then (`handshake_completed_at`). An integer
+    /// and not an `Option<Instant>`: a `None` of that type leaves eight bytes of the value
+    /// uninitialized, and moving the association copies whatever the stack held there into the
+    /// heap blocks it passes through, where `Zeroize` cannot reach them (the secret-erasure
+    /// test found an exported SRTP key that way, on Windows).
+    pub(crate) handshake_completed_after_ns: u64,
     connection_closed_by_user: bool,
     // closeLock              sync.Mutex
     closed: bool, //  *closer.Closer
@@ -302,6 +314,7 @@ impl DTLSConn {
             cache: HandshakeCache::new(),
             state,
             handshake_completed: false,
+            handshake_completed_after_ns: u64::MAX,
             connection_closed_by_user: false,
             closed: false,
             closed_by_peer: false,
@@ -1912,9 +1925,10 @@ impl DTLSConn {
             }
         }
 
-        // Once complete, neither plaintext handshake records nor a new transcript
-        // may spend the last-flight retry budget. Authenticate a repeat and match it
-        // against the Finished already received before signaling the endpoint.
+        // Once complete, neither plaintext handshake records nor a new transcript may draw
+        // the last flight again (RFC 6347 4.2.4, `FINAL_FLIGHT_ANSWER_PERIOD`). Authenticate
+        // a repeat and match it against the Finished already received before signaling the
+        // endpoint.
         if self.is_handshake_completed() && h.content_type == ContentType::Handshake {
             let repeats_finished = h.epoch != 0
                 && self.cache.matches_received_finished(

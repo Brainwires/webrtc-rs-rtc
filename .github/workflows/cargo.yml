@@ -15,6 +15,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The real-multicast mDNS tests probe the host first and skip where it does not deliver
+  # multicast to itself; on the systems named here they run or fail, never skip (Linux runners
+  # always deliver; `test_platforms` adds macOS and GitHub-hosted Windows).
+  RTCI_EXPECT_HOST_MULTICAST: linux
 
 jobs:
   build:
@@ -99,7 +103,7 @@ jobs:
       - id: pick
         uses: Brainwires/.github/actions/pick-runners@7475d2c4523faa74d428c3607a8fe195c1f782ac # pick-runners
         with:
-          jobs: test_macos=macos-arm64 test_windows=windows-x64
+          jobs: test_macos=macos-arm64 test_windows=windows-x64 video_codecs=linux-x64
           vars: ${{ toJSON(vars) }}
           runner-token: ${{ secrets.RUNNER_STATUS_TOKEN }}
 
@@ -136,7 +140,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
+      # GitHub's runners only. Ours sit behind one shared ~20 Mbit/s uplink and the cache buys
+      # them nothing. Windows: every job starts from a fresh account, so the key (it hashes
+      # CARGO_HOME, under that account) never matches ("No cache found"), and saving the
+      # ~460 MB cache uploaded at 0.2 MB/s: the post step ran 36 minutes and hit this job's
+      # limit after every test had passed (run 45956791846). macOS (denext-mac-arm): the
+      # workspace build takes 1m25s to 1m42s with or without a restored cache (runs 46016680112
+      # to 46081695449), a hit downloads 324 MB (~45 s) and each new key uploads 341 MB (2 to
+      # 3.5 min). A GitHub-hosted job restores (~17 s) and saves (~2.5 min) as before.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: runner.environment == 'github-hosted'
       # On GitHub's macOS image the multicast route leads to an interface that cannot carry it:
       # an mDNS send fails with "No route to host" and the mDNS interop tests time out. Both
       # peers of those tests are on this machine, so the route is moved to loopback. Our own
@@ -150,6 +163,23 @@ jobs:
           netstat -rn -f inet | grep -E '^224' || true
       - name: Test workspace
         run: cargo test --workspace --no-fail-fast --verbose
+        env:
+          # macOS (its multicast route over loopback on GitHub's image; our runners deliver)
+          # and GitHub-hosted Windows run the real-multicast mDNS tests today: there they must
+          # not skip. A self-hosted Windows VM whose network does not loop multicast skips them.
+          RTCI_EXPECT_HOST_MULTICAST: ${{ format('linux{0}{1}', runner.os == 'macOS' && ',macos' || '', (runner.os == 'Windows' && runner.environment == 'github-hosted') && ',windows' || '') }}
+      # `MulticastSocket::with_interface` must send by its interface on a Windows host whose
+      # route for the mDNS group was left on loopback. The script puts the host in that state,
+      # fails if it could not, and deletes the entry again from an EXIT trap; it needs an
+      # administrator shell. GitHub's runners only (elevated, thrown away after the job): never
+      # our own Windows machines, whose state would outlive the job.
+      - name: mDNS with the group's route on loopback (GitHub-hosted Windows)
+        if: runner.os == 'Windows' && runner.environment == 'github-hosted'
+        shell: bash
+        run: >-
+          bash scripts/windows-poisoned-mdns-route.sh
+          'RTCI_EXPECT_HOST_MULTICAST=linux,windows cargo test -p rtci --test mdns_query_and_gather_interop --no-fail-fast'
+          'cargo test -p rtci-stream-driver --test mdns --no-fail-fast'
       # The driver's mDNS on virtual time (`runtime-mock` is not a default feature): two
       # publishing drivers must connect, which catches a return of 0.1.0's socket matching on
       # every platform, not only where real multicast runs.
@@ -200,8 +230,8 @@ jobs:
         run: python3 scripts/check-fuzz-registry.py
       - name: Actions pinned, self-hosted runners kept from fork pull requests
         run: python3 scripts/check-workflow-pins.py
-      - name: Clause audit counts agree with the tables (COUNTS.md up to date)
-        run: python3 scripts/audit-count.py --check
+      - name: Clause audit counts agree with the tables (COUNTS.md and README's figures up to date)
+        run: python3 scripts/test_audit_count.py && python3 scripts/audit-count.py --check
       - name: Old crate names stay out (the rename to rtci, docs/rename.md)
         run: python3 scripts/rename-to-rtci.py --check
       - name: Every open MUST row of the audit has a class (OPEN-MUST.md up to date)
@@ -244,6 +274,74 @@ jobs:
           cargo test --package rtci --features chrome-defaults --lib behaviour_profile --verbose
           cargo test --package rtci --features chrome-defaults --test behaviour_profiles --verbose
 
+  # rtci-video's codec features, off by default (docs/video-pipeline.md 4.6, 4.9): no other job
+  # turns them on, and cargo skips a test target whose `required-features` are off without a
+  # word, so the send pipeline's call tests (`send_rtc2rtc`, feature `vp8`) went unrun from the
+  # crate's landing to v0.2.1 (scripts/check-test-inventory.py now fails on such a target).
+  # `vp8`, `av1` and `isolation` are pure Rust and need no system package. `libvpx`, `dav1d`
+  # and `openh264` load their library at run time (dlopen): building needs nothing, running
+  # needs the libraries, installed or downloaded here (docs/video-pipeline.md 4.9 proposed this
+  # job). On our Linux pool first (the runners job's pick), GitHub's ubuntu-latest when it is
+  # busy; a fork's pull request runs `video_codecs_fork`.
+  video_codecs:
+    name: rtci-video, every feature (codecs, isolation, system-library backends)
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.plan || '{}').video_codecs || 'ubuntu-latest' }}
+    # Self-hosted only for a push or a same-repository pull request; never for
+    # pull_request_target.
+    if: >-
+      github.event_name != 'pull_request_target' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      !cancelled()
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps: &video-codecs-steps
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      # GitHub's runners only, as in test_platforms (the cache buys our runners nothing).
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: runner.environment == 'github-hosted'
+      - name: libvpx and libdav1d for the run-time-loaded backends
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libvpx-dev libdav1d-dev
+      # Cisco's binary, fetched for the test and never kept (the "separately downloaded" case of
+      # docs/video-pipeline.md 4.1): Cisco serves it over plain HTTP, and the backend loads a
+      # file only if its SHA-256 is one Cisco published.
+      - name: Cisco's OpenH264 binary
+        run: |
+          curl -sSf --retry 3 -o "$RUNNER_TEMP/libopenh264.so.bz2" http://ciscobinary.openh264.org/libopenh264-2.6.0-linux64.8.so.bz2
+          bunzip2 -f "$RUNNER_TEMP/libopenh264.so.bz2"
+          echo "OPENH264_LIBRARY=$RUNNER_TEMP/libopenh264.so" >> "$GITHUB_ENV"
+      - name: Every feature's tests (the codecs, the child-process decoder, the send and receive calls)
+        run: cargo test --package rtci-video --all-features --no-fail-fast --verbose
+      - name: The interop peer's video scenario builds
+        run: cargo build --package rtci-video-interop --features pipeline --verbose
+      - name: Disk left after the build
+        if: always()
+        run: df -h
+
+  # A pull request from a fork: the same on GitHub's runner only.
+  video_codecs_fork:
+    name: rtci-video codec features (fork pull request)
+    # runners-first: a fork's pull request must never reach our pools (scripts/check-workflow-pins.py; as test_platforms_fork)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps: *video-codecs-steps
+
   # The same for `performance-defaults` (BehaviourProfile::Performance as the default).
   performance_defaults:
     timeout-minutes: 30
@@ -265,6 +363,74 @@ jobs:
         run: |
           cargo test --package rtci --features performance-defaults --lib behaviour_profile --verbose
           cargo test --package rtci --features performance-defaults --test behaviour_profiles --verbose
+
+  # RFC 7714 section 13.1, "All keys MUST be properly erased when no longer needed": the
+  # residue measurement (rtci-srtp/tests/key_residue.rs) in an UNOPTIMISED and an OPTIMISED
+  # build, with the workspace's rust-version (the oldest supported compiler) and with stable.
+  # In every build it asserts that building and tearing down leave no key form in a dead stack
+  # frame, and that the ring provider's packet path leaves none (in an unoptimised build
+  # because rtci-crypto overwrites the stack after each RustCrypto AES record operation there;
+  # docs/key-erasure.md). How deep an unoptimised build's frames go depends on the
+  # compiler (rustc 1.99.1 went past the 32 KiB that used to be overwritten), so the oldest
+  # one is measured too. x86-64 Linux, with the whole process searched, and AArch64 macOS.
+  # The DTLS measurement (rtci-dtls/tests/key_residue.rs) runs in the same builds: every step of
+  # DTLS 1.2 and 1.3 associations, the export and resumption included.
+  key_residue:
+    timeout-minutes: 45
+    name: SRTP and DTLS key residue (${{ matrix.os }}, ${{ matrix.toolchain }}, ${{ matrix.profile }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ 'ubuntu-latest' ]
+        toolchain: [ 'rust-version', 'stable' ]
+        profile: [ 'unoptimised', 'optimised' ]
+        include:
+          - { os: 'macos-latest', toolchain: 'stable', profile: 'unoptimised' }
+          - { os: 'macos-latest', toolchain: 'stable', profile: 'optimised' }
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      # With the rust-version toolchain, as in the `msrv` job: dependencies resolve to versions
+      # that support it. With stable, as in every other job.
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: ${{ matrix.toolchain == 'rust-version' && 'fallback' || 'allow' }}
+      RELEASE: ${{ matrix.profile == 'optimised' && '--release' || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The toolchain to measure with
+        id: toolchain
+        shell: bash
+        run: |
+          if [ "${{ matrix.toolchain }}" = rust-version ]; then
+            echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=stable" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ steps.toolchain.outputs.version }}-${{ matrix.profile }}
+      - name: No SRTP key is left in a dead stack frame
+        run: |
+          rustc --version
+          cargo test $RELEASE --package rtci-srtp --features crypto-aws-lc-rs --test key_residue --verbose -- --nocapture
+      - name: No DTLS key is left in a dead stack frame
+        # The AES-CCM record path (RustCrypto's AES in rtci-crypto) is asserted in an optimised
+        # build from rustc 1.99.1 on, where it was measured to leave no key; rustc 1.89 left
+        # one round key (docs/key-erasure.md), and the versions between are unmeasured: for a
+        # compiler older than 1.99.1 the test prints the AES-CCM forms instead (as
+        # scripts/key-residue-report.sh does).
+        shell: bash
+        run: |
+          version=$(rustc --version | sed -n 's/^rustc \([0-9][0-9.]*\).*/\1/p')
+          if [ "$(printf '%s\n' "$version" 1.99.1 | sort -V | head -1)" != 1.99.1 ]; then
+            echo "rustc $version is older than 1.99.1: AES-CCM record path printed, not asserted"
+            export RTCI_KEY_RESIDUE_CCM_KNOWN_LIMIT=1
+          fi
+          cargo test $RELEASE --package rtci-dtls --features crypto-aws-lc-rs --test key_residue --verbose -- --nocapture
+      - name: HMAC-SHA1 computed in the keyed object (RFC 2202, object reuse)
+        run: cargo test $RELEASE --package rtci-crypto --features crypto-aws-lc-rs --test hmac_sha1_vectors --verbose
 
   crypto_backend_baseline:
     timeout-minutes: 45
@@ -337,7 +503,7 @@ jobs:
         run: df -h
 
   rtci_crypto_custom_provider:
-    timeout-minutes: 20
+    timeout-minutes: 40
     name: rtci-crypto (no built-in, custom provider)
     runs-on: ubuntu-latest
     # No incremental cache and no debug info (panics still print file:line): the test build of
@@ -354,6 +520,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Test downstream-style provider
         run: cargo test --package rtci-crypto --no-default-features --features test-support --test custom_provider --verbose
+      # The peer connection without a built-in provider: tests/no_builtin_crypto_provider.rs
+      # exists only then (`#![cfg(not(any(feature = "crypto-ring", feature = "crypto-aws-lc-rs")))]`)
+      # and ran 0 tests in every other job (run 46129791197). `--package`, not `--workspace`:
+      # a workspace build turns on what any member asks for.
+      - name: Peer connection without a built-in provider
+        run: cargo test --package rtci --no-default-features --test no_builtin_crypto_provider --verbose
       - name: Verify publishable package
         run: cargo package --package rtci-crypto --no-default-features
       - name: Disk left after the build

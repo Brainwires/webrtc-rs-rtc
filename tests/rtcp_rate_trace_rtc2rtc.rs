@@ -46,10 +46,13 @@
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
+use rtci::crypto::{CryptoError, RTCCrypto, RTCCryptoProvider, RTCRandom, default_provider};
 use rtci::interceptor::{Interceptor, Packet, Registry, Slot, StreamInfo, TaggedPacket};
 use rtci::peer_connection::configuration::BehaviourProfile;
 use rtci::peer_connection::configuration::RTCConfigurationBuilder;
-use rtci::peer_connection::configuration::interceptor_registry::register_default_interceptors;
+use rtci::peer_connection::configuration::interceptor_registry::{
+    DefaultInterceptorOptions, register_default_interceptors_with_options,
+};
 use rtci::peer_connection::configuration::media_engine::MediaEngine;
 use rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtci::peer_connection::event::RTCPeerConnectionEvent;
@@ -69,6 +72,7 @@ use rtci::rtp_transceiver::rtp_sender::{RTCRtpEncodingParameters, RtpCodecKind};
 use rtci::rtp_transceiver::{RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use rtci::sansio::Protocol;
 use rtci::shared::error::Error;
+use rtci::shared::time::SystemInstant;
 use rtci::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -122,6 +126,58 @@ impl Interceptor for TapInterceptor {
     fn unbind_remote_stream(&mut self, _info: &StreamInfo) {}
 }
 
+/// A small deterministic generator (SplitMix64).
+struct Rng(u64);
+
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+/// The built-in crypto provider with its random source replaced by a seeded [`Rng`]: what the
+/// engine draws through `RTCCryptoProvider::random()` (ICE, DTLS, SCTP and, through
+/// `DefaultInterceptorOptions::rtcp_random`, the RTCP report times: RFC 3550 6.3.1's
+/// randomisation of the interval over [0.5, 1.5] times its computed value) is the same in every
+/// run. Unseeded, the measured RTCP share differed from run to run, and once landed above the
+/// 5% bound it is measured against (train 36 round 10b, macOS job 140696205056: 0.0516).
+struct SeededProvider {
+    inner: Arc<dyn RTCCryptoProvider>,
+    rng: Mutex<Rng>,
+}
+
+impl RTCCryptoProvider for SeededProvider {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn crypto(&self) -> &dyn RTCCrypto {
+        self.inner.crypto()
+    }
+
+    fn random(&self) -> &dyn RTCRandom {
+        self
+    }
+}
+
+impl RTCRandom for SeededProvider {
+    fn fill(&self, output: &mut [u8]) -> Result<(), CryptoError> {
+        let mut rng = self.rng.lock().map_err(|_| CryptoError::RandomnessFailed)?;
+        for chunk in output.chunks_mut(8) {
+            chunk.copy_from_slice(&rng.next_u64().to_le_bytes()[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+/// The seed of each peer's random source: fixed, so every run (and platform) measures the same
+/// trace.
+const SEEDS: [u64; 2] = [0x5eed_0001, 0x5eed_0002];
+
 struct Peer {
     pc: RTCPeerConnection,
     tap: Tap,
@@ -133,11 +189,26 @@ struct Peer {
 }
 
 impl Peer {
-    fn new(addr: &str, profile: BehaviourProfile) -> Result<Self> {
+    /// `seed`: the peer's random source; `start`: the instant the run starts at, which the
+    /// peer's clock and NTP times are anchored to, so that two runs of one seed in one process
+    /// (or on two machines) are the same run.
+    fn new(addr: &str, profile: BehaviourProfile, seed: u64, start: Instant) -> Result<Self> {
+        let provider: Arc<dyn RTCCryptoProvider> = Arc::new(SeededProvider {
+            inner: default_provider()?,
+            rng: Mutex::new(Rng(seed)),
+        });
         let mut media_engine = MediaEngine::for_profile(profile);
         media_engine.register_default_codecs()?;
         let tap = Tap::default();
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine)?.with(
+        let mut options = DefaultInterceptorOptions::for_profile(profile);
+        options.rtcp_random = Some(provider.clone());
+        options.wall_clock = Some(SystemInstant::at(start, Duration::from_secs(1_700_000_000)));
+        let (registry, _handles) = register_default_interceptors_with_options(
+            Registry::new(),
+            &mut media_engine,
+            &options,
+        )?;
+        let registry = registry.with(
             Slot::Custom(100),
             TapInterceptor {
                 tap: tap.clone(),
@@ -150,11 +221,12 @@ impl Peer {
             .with_setting_engine(
                 SettingEngineBuilder::new()
                     .with_behaviour_profile(profile)
+                    .with_crypto_provider(provider)
                     .build(),
             )
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
-            .build(Instant::now())?;
+            .build(start)?;
         Ok(Self {
             pc,
             tap,
@@ -418,12 +490,23 @@ struct Measured {
 }
 
 fn measure(sc: Scenario, profile: BehaviourProfile, drop_at: Option<u64>) -> Result<Measured> {
+    measure_seeded(sc, profile, drop_at, SEEDS)
+}
+
+/// [`measure`] with the peers' random sources seeded with `seeds`.
+fn measure_seeded(
+    sc: Scenario,
+    profile: BehaviourProfile,
+    drop_at: Option<u64>,
+    seeds: [u64; 2],
+) -> Result<Measured> {
+    let start = Instant::now();
     let mut world = World {
         peers: [
-            Peer::new("10.0.0.1:5000", profile)?,
-            Peer::new("10.0.0.2:5000", profile)?,
+            Peer::new("10.0.0.1:5000", profile, seeds[0], start)?,
+            Peer::new("10.0.0.2:5000", profile, seeds[1], start)?,
         ],
-        now: Instant::now(),
+        now: start,
         delay: Duration::from_millis(20),
         in_flight: vec![],
         order: 0,
@@ -660,6 +743,8 @@ fn print_row(sc: &Scenario, profile: BehaviourProfile, m: &Measured) {
         m.share * 100.0,
         m.nack_ms.map_or("-".to_owned(), |ms| format!("{ms:.0}"))
     );
+    // The share in full: seeded, every run on every platform prints the same value.
+    println!("RTCP-SHARE {} {}: {:?}", sc.name, profile.name(), m.share);
 }
 
 fn scenarios() -> Vec<Scenario> {
@@ -770,25 +855,123 @@ fn the_performance_profile_sends_regular_reports_about_once_a_second() -> Result
     Ok(())
 }
 
+/// The seed pairs the averaged checks use: pair `i` is `0x5eed_0001 + 2i` / `0x5eed_0002 + 2i`
+/// (pair 0 is [`SEEDS`]), as in [`rtcp_share_over_seed_pairs`].
+fn seed_pair(i: u64) -> [u64; 2] {
+    [SEEDS[0] + 2 * i, SEEDS[1] + 2 * i]
+}
+
 /// `rtcp.congestion-feedback-in-budget`, `rtcp.minimum-session-bandwidth`,
 /// `cc.feedback-share`, `cc.feedback-max-interval`: at 24 kbit/s of audio the default's RTCP is
 /// over 10% of the media (the regular reports take 5% of a 64 kbit/s floor, the congestion
 /// control feedback 5% of the media on top); under `Performance` both share RFC 3550's 5% of
 /// the media, and the sender still hears feedback every half second.
+///
+/// What "inside 5%" means here: RFC 3550 6.2 makes 5% the fraction of the session bandwidth
+/// RTCP takes, and 6.3.1 randomises each report interval over [0.5, 1.5] times the computed one
+/// and divides by e - 3/2 (1.21828) so that the LONG-RUN MEAN is that fraction. A short window
+/// holds few intervals: at 24 kbit/s the regular reports are up to 5 s apart (RFC 4585 5), so
+/// the 10 s this call measures (5 s to 15 s) holds one to three of them, and one draw of the
+/// randomisation can put the window's share on either side of the mean. Measured
+/// (`rtcp_share_over_seed_pairs`, release, run 46064872094): 15 s call, 200 seed pairs: min
+/// 0.04326, mean 0.04736, max 0.05158, sd 0.00139, 2 above 0.05 (0.0516 is what an unseeded run
+/// hit on train 36 round 10b, macOS); 30 s call (25 s measured), 50 pairs: min 0.04559, mean
+/// 0.04712, max 0.04892, none above; 60 s call, 25 pairs: mean 0.04713, max 0.04825. No row
+/// stated the averaging horizon before. So the test asserts (1) the mean over 16 fixed seed
+/// pairs on the 15 s call is at most 0.05 (standard error about 0.00035 against a margin of
+/// about 0.0026 to the measured mean), and (2) every one of 4 fixed seed pairs on the 30 s call
+/// is at most 0.05 (a window long enough for the per-draw statement: 50 of 50 measured inside).
+/// Seeded, every run on every platform measures the same values; all are printed.
 #[test]
-fn the_performance_profile_keeps_low_rate_rtcp_inside_five_percent() -> Result<()> {
+fn the_performance_profile_keeps_low_rate_rtcp_inside_five_percent_on_average() -> Result<()> {
+    const PAIRS_15S: u64 = 16;
+    const PAIRS_30S: u64 = 4;
     let rfc = measure(AUDIO_24K, BehaviourProfile::Rfc, None)?;
-    let performance = measure(AUDIO_24K, BehaviourProfile::Performance, None)?;
     print_row(&AUDIO_24K, BehaviourProfile::Rfc, &rfc);
-    print_row(&AUDIO_24K, BehaviourProfile::Performance, &performance);
     // Over RFC 3550's 5% by default. (10% and more before RED, RFC 2198, became the default for
     // audio in train 11: the redundant copy doubles the media on the wire, 38.5 to 64.5
     // kbit/s, and the RTCP share halves with it.)
     assert!(rfc.share >= 0.06, "{rfc:?}");
-    assert!(performance.share <= 0.05, "{performance:?}");
-    assert!(performance.sides[1].cc >= 1.8, "{performance:?}");
-    assert!(performance.sides[1].cc_gap_ms <= 550.0, "{performance:?}");
-    // Regular reports go on (RFC 5506 4: compound RTCP is kept up), at most five seconds apart.
-    assert!(performance.sides[1].regular > 0.0, "{performance:?}");
+
+    // (1) RFC 3550 6.2's 5%, as the mean of 6.3.1's randomised intervals.
+    let mut runs = vec![];
+    for i in 0..PAIRS_15S {
+        let m = measure_seeded(AUDIO_24K, BehaviourProfile::Performance, None, seed_pair(i))?;
+        print_row(&AUDIO_24K, BehaviourProfile::Performance, &m);
+        runs.push(m);
+    }
+    let mean = runs.iter().map(|m| m.share).sum::<f64>() / PAIRS_15S as f64;
+    println!("RTCP-SHARE-MEAN 15 s call, {PAIRS_15S} seed pairs: {mean:?}");
+    assert!(
+        mean <= 0.05,
+        "mean RTCP share {mean} over {PAIRS_15S} seed pairs: {:?}",
+        runs.iter().map(|m| m.share).collect::<Vec<_>>()
+    );
+
+    // (2) On a 30 s call (25 s measured) every draw is inside.
+    let long = Scenario {
+        seconds: 30,
+        ..AUDIO_24K
+    };
+    for i in 0..PAIRS_30S {
+        let m = measure_seeded(long, BehaviourProfile::Performance, None, seed_pair(i))?;
+        print_row(&long, BehaviourProfile::Performance, &m);
+        assert!(m.share <= 0.05, "30 s call, seed pair {i}: {m:?}");
+    }
+
+    // Every draw of the 15 s call: feedback and regular reports.
+    for performance in &runs {
+        assert!(performance.sides[1].cc >= 1.8, "{performance:?}");
+        assert!(performance.sides[1].cc_gap_ms <= 550.0, "{performance:?}");
+        // Regular reports go on (RFC 5506 4: compound RTCP is kept up), at most five seconds
+        // apart.
+        assert!(performance.sides[1].regular > 0.0, "{performance:?}");
+    }
+    Ok(())
+}
+
+/// A measurement, not a check: the `Performance` profile's RTCP share of the 24 kbit/s audio
+/// call over many seed pairs (RFC 3550 6.3.1 randomises each report interval over [0.5, 1.5]
+/// times the computed one and divides by e - 3/2, so that the long-run mean is the budget of
+/// 6.2; a window of a few intervals can lie on either side of it). `RTCP_SHARE_RUNS` lists
+/// `<call seconds>:<seed pairs>` (default `15:200,30:50,60:25`; the checks measure from 5 s to
+/// the end of a 15 s call). Prints one line per seed pair and a summary per call length. Run
+/// with `cargo test --release --test rtcp_rate_trace_rtc2rtc -- --ignored --nocapture
+/// rtcp_share_over_seed_pairs`.
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn rtcp_share_over_seed_pairs() -> Result<()> {
+    let runs = std::env::var("RTCP_SHARE_RUNS").unwrap_or_else(|_| "15:200,30:50,60:25".into());
+    for spec in runs.split(',') {
+        let (seconds, pairs) = spec
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("RTCP_SHARE_RUNS: {spec}"))?;
+        let (seconds, pairs): (u64, u64) = (seconds.parse()?, pairs.parse()?);
+        let sc = Scenario {
+            seconds,
+            ..AUDIO_24K
+        };
+        let mut shares = vec![];
+        for i in 0..pairs {
+            let seeds = seed_pair(i);
+            let m = measure_seeded(sc, BehaviourProfile::Performance, None, seeds)?;
+            println!(
+                "SEED-SHARE {seconds}s pair {i} seeds {:#x}/{:#x}: {:?}",
+                seeds[0], seeds[1], m.share
+            );
+            shares.push(m.share);
+        }
+        let n = shares.len() as f64;
+        let mean = shares.iter().sum::<f64>() / n;
+        let min = shares.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = shares.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let over = shares.iter().filter(|s| **s > 0.05).count();
+        let sd = (shares.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n).sqrt();
+        println!(
+            "SEED-SHARE-SUMMARY {seconds}s call ({} s measured), {pairs} pairs: min {min:.5} mean \
+             {mean:.5} max {max:.5} sd {sd:.5}, {over} above 0.05",
+            seconds.saturating_sub(5)
+        );
+    }
     Ok(())
 }

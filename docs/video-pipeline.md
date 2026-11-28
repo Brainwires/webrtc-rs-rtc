@@ -692,8 +692,9 @@ hostile delta frame was refused (`hostile_av1_frames_do_not_crash_dav1d` failed)
 a waiting picture is now logged as the earlier unit's and the current unit is still sent (run
 45329271661: 0 key frames refused after a hostile frame).
 
-**CI job proposal (not added: the workflows are the train's, and this job installs system
-libraries).** A job `video-codecs` on ubuntu-latest: `sudo apt-get install -y libdav1d7
+**CI job** (`video_codecs` in `cargo.yml`, added by `conf/video-1-send-tests-run-and-pass`
+as proposed here, with `libvpx-dev` / `libdav1d-dev` for the libraries; until then no job ran
+any of the crate's feature-gated tests). The proposal was: a job `video-codecs` on ubuntu-latest: `sudo apt-get install -y libdav1d7
 libvpx12`, download Cisco's `libopenh264-2.6.0-linux64.8.so.bz2` from
 `http://ciscobinary.openh264.org/` into the runner's temporary directory (a CI machine fetching
 the binary for a test is the "separately downloaded" case; it is never committed or cached in
@@ -1127,6 +1128,16 @@ arrives the source has written at 2.5 Mbit/s for the half second it takes the es
 fall, the pacer sends that at 100 to 250 kbit/s while the target reads 0, and the receiver
 plays it late rather than skip it. The capacity test's model source measured 5.59 to 9.84 s on
 the same chain. What shortens it is the stale-backlog drop planned on the congestion line.
+
+**Since the backlog flush** (`conf/flush-1r-backlog-flush-at-collapse`, train 32: the default
+pacer discards its queue at a capacity collapse and asks for a key frame; the source is not
+paused) the two rows above describe `PacerBacklog::Keep`, which the pause test now asks for.
+The default chain, measured (agent-test runs 46137495578 at v0.2.1, 46137469211 and
+46136031324 on train 36): seed 2 no pause, 5 discards (key frames 7: requests served 4,
+coalesced 1, suppressed 5), oldest picture from the cap 0.92 to 0.94 s, longest freeze 1.66 s,
+median target under the cap 277 kbit/s, 20 s after 1198 to 1285 kbit/s; seed 3 no pause, 2
+discards, oldest picture 0.93 s, freeze 1.05 s. The capacity-cap test's guard for the oldest
+picture is now 2 s (the capacity instrument's picture requirement), not 13 s.
 Guards (each about a tenth beyond the worst measured, or the capacity test's own bound): freeze
 2 s, oldest picture 13 s, under the cap 180 kbit/s, recovery 800 kbit/s, encoded / target under
 the cap 1.15, open-link windows 0.85 to 1.15, loss: longest gap within the slowest repair plus

@@ -120,18 +120,20 @@ fn rtpmap_names(media: &MediaDescription) -> Vec<(String, String)> {
 /// `<payload type> <value>`.
 ///
 /// RFC 4585 section 4.2: "The answerer MUST NOT add feedback parameters to a media section or
-/// alter values of such parameters"; RFC 9429 section 5.11 calls such a line an error. Real
-/// answerers do add them (they answer with their own configured list), so the answer is not
-/// refused for it: the extra feedback is never enabled, because what is negotiated is the
-/// intersection with this endpoint's own feedback for the format
-/// (`MediaEngine::update_from_remote_description`), as libwebrtc does. The caller logs what
-/// this returns.
+/// alter values of such parameters"; RFC 9429 section 5.11 calls such a line an error, and
+/// [`check_answer_against_offer`] refuses the answer for it by default. With
+/// `SettingEngineBuilder::with_unoffered_feedback_refused(false)` (the `Chrome` profile, as
+/// libwebrtc does) the answer is applied and the caller logs what this returns: the extra
+/// feedback is never enabled, because what is negotiated is the intersection with this
+/// endpoint's own feedback for the format (`MediaEngine::update_from_remote_description`).
 ///
 /// A feedback line of the answer is one the offer had when the offer carries the same value
 /// for the wildcard, for the same payload type, or for a payload type the offer maps to the
 /// same encoding (an answerer may number a format differently, RFC 3264 section 6.1). An
 /// answered wildcard is one the offer had as a wildcard or for every format the answer lists.
-/// `trr-int` is each side's own minimum interval, so its number is not compared.
+/// `trr-int` is each side's own minimum interval, so its number is not compared; nor are the
+/// parameters of `ccm pause` (RFC 7728 section 9.1) and `ccm tmmbr` (RFC 5104 section 7.2),
+/// which an answer may change: the mechanism is what the offer must have had.
 pub(crate) fn feedback_not_offered(
     offer: &MediaDescription,
     answer: &MediaDescription,
@@ -142,11 +144,17 @@ pub(crate) fn feedback_not_offered(
         return extra;
     }
     let offered = feedback_lines(offer);
+    // The mechanism a line names, where an answer may state other parameters for it: the
+    // number of `trr-int`, the `config` / `nowait` of `ccm pause` (RFC 7728 section 9.1: the
+    // answerer "MAY change the "config" pause attribute value"), the declarative `smaxpr` of
+    // `ccm tmmbr` (RFC 5104 section 7.2: "the highest value from offer and answer SHALL be
+    // used"). This endpoint answers both with parameters of its own (`rtcp_feedback_intersection`).
     let kind = |value: &str| -> String {
-        if value.starts_with("trr-int") {
-            "trr-int".to_owned()
-        } else {
-            value.to_owned()
+        let mut words = value.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("trr-int"), _) => "trr-int".to_owned(),
+            (Some("ccm"), Some(name @ ("pause" | "tmmbr"))) => format!("ccm {name}"),
+            _ => value.to_owned(),
         }
     };
     let offered_for = |payload_type: Option<&str>, value: &str| -> bool {
@@ -222,9 +230,9 @@ pub(crate) fn feedback_not_offered(
 ///   (section 7.3.3).
 ///
 /// The first difference is returned as [`Error::ErrAnswerDoesNotMatchOffer`]. An `a=rtcp-fb`
-/// line the offer did not have is one of them only with `unoffered_feedback_refused` (RFC 9429
-/// section 5.11, `SettingEngineBuilder::with_unoffered_feedback_refused`); otherwise it is
-/// logged and never enabled (see [`feedback_not_offered`]).
+/// line the offer did not have is one of them with `unoffered_feedback_refused`, the default
+/// (RFC 9429 section 5.11, `SettingEngineBuilder::with_unoffered_feedback_refused`); without
+/// it the line is logged and never enabled (see [`feedback_not_offered`]).
 pub(crate) fn check_answer_against_offer(
     offer: &SessionDescription,
     answer: &SessionDescription,
@@ -451,6 +459,36 @@ a=rtpmap:100 H264/90000\r\na=rtcp-fb:100 nack\r\n"
         assert!(extra(&offer, &answer).is_empty());
         let bare = format!("{HEAD}{}", video("0", ""));
         assert_eq!(extra(&bare, &answer), vec!["* trr-int 500"]);
+    }
+
+    /// RFC 7728 section 9.1 lets an answer change the `config` of `ccm pause` and drop its
+    /// `nowait`, and RFC 5104 section 7.2 lets it state its own `smaxpr` for `ccm tmmbr`:
+    /// those are the offered mechanisms, so the answer is not refused for them (RFC 9429
+    /// section 5.11 is about mechanisms the offer did not have).
+    #[test]
+    fn pause_and_tmmbr_parameters_of_the_answer_are_the_offered_mechanisms() {
+        let offer = format!(
+            "{HEAD}{}",
+            video(
+                "0",
+                "a=rtcp-fb:96 ccm pause config=2 nowait\r\na=rtcp-fb:96 ccm tmmbr\r\n"
+            )
+        );
+        let answer = format!(
+            "{HEAD}{}",
+            video(
+                "0",
+                "a=rtcp-fb:96 ccm pause config=3\r\na=rtcp-fb:96 ccm tmmbr smaxpr=120\r\n"
+            )
+        );
+        assert!(extra(&offer, &answer).is_empty());
+        assert!(check_answer_against_offer(&parse(&offer), &parse(&answer), true).is_ok());
+        // A mechanism the offer did not have is still one.
+        let bare = format!("{HEAD}{}", video("0", "a=rtcp-fb:96 nack\r\n"));
+        assert_eq!(
+            extra(&bare, &answer),
+            vec!["96 ccm pause config=3", "96 ccm tmmbr smaxpr=120"]
+        );
     }
 
     #[test]

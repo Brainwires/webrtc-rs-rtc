@@ -529,6 +529,22 @@ impl EnvPeer {
         Ok(())
     }
 
+    /// This peer's gathering is complete: its end-of-candidates indication (an empty
+    /// candidate, RFC 8838 section 13), as an application gives it once it has added its last.
+    pub fn end_of_local_candidates(&mut self) -> io::Result<()> {
+        self.pc
+            .add_local_candidate(RTCIceCandidateInit::default())
+            .map_err(io::Error::other)
+    }
+
+    /// The other peer's end-of-candidates indication (an empty candidate naming no section:
+    /// for every transport, W3C webrtc-pc 4.4.1.6 addIceCandidate).
+    pub fn add_remote_end_of_candidates(&mut self) -> io::Result<()> {
+        self.pc
+            .add_remote_candidate(RTCIceCandidateInit::default())
+            .map_err(io::Error::other)
+    }
+
     /// Adds the other peer's candidates and asks the relay to let their addresses in.
     pub fn add_remote_candidates(&mut self, cands: &[RTCIceCandidateInit]) -> io::Result<()> {
         for c in cands {
@@ -898,8 +914,10 @@ pub fn candidate_addr(line: &str) -> Option<SocketAddr> {
     ))
 }
 
-/// Offer from `a`, answer from `b`, then trickle each side's candidates to the other.
-pub fn negotiate(a: &mut EnvPeer, b: &mut EnvPeer) -> io::Result<()> {
+/// Offer from `a`, answer from `b`, then trickle each side's candidates to the other, and no
+/// end of candidates either way: an agent whose checks fail stays `disconnected` (W3C
+/// webrtc-pc 5.6.4), unless `with_ice_failed_without_end_of_candidates` is set.
+pub fn negotiate_without_end_of_candidates(a: &mut EnvPeer, b: &mut EnvPeer) -> io::Result<()> {
     let e = io::Error::other;
     let offer = a.pc.create_offer(None).map_err(e)?;
     a.pc.set_local_description(Instant::now(), offer.clone())
@@ -915,6 +933,23 @@ pub fn negotiate(a: &mut EnvPeer, b: &mut EnvPeer) -> io::Result<()> {
     a.add_remote_candidates(&cb)?;
     b.add_remote_candidates(&ca)?;
     Ok(())
+}
+
+/// Offer from `a`, answer from `b`, each side's candidates to the other, then each side's end of
+/// candidates: its own (its gathering is complete) and the peer's (W3C webrtc-pc 5.6.4: "The
+/// failed and completed states require an indication that there are no additional remote
+/// candidates"; RFC 8838 section 13), as an application relays them.
+pub fn negotiate(a: &mut EnvPeer, b: &mut EnvPeer) -> io::Result<()> {
+    negotiate_without_end_of_candidates(a, b)?;
+    exchange_end_of_candidates(a, b)
+}
+
+/// Each peer ends its gathering and is given the other's end-of-candidates indication.
+pub fn exchange_end_of_candidates(a: &mut EnvPeer, b: &mut EnvPeer) -> io::Result<()> {
+    a.end_of_local_candidates()?;
+    b.end_of_local_candidates()?;
+    a.add_remote_end_of_candidates()?;
+    b.add_remote_end_of_candidates()
 }
 
 /// As `negotiate`, but what each side receives is first passed through `edit_offer` /
@@ -942,7 +977,7 @@ pub fn negotiate_with(
     let (ca, cb) = (a.local_candidates.clone(), b.local_candidates.clone());
     a.add_remote_candidates(&cb)?;
     b.add_remote_candidates(&ca)?;
-    Ok(())
+    exchange_end_of_candidates(a, b)
 }
 
 /// `sdp` with the first byte of every `a=fingerprint:` hash changed, so the certificate the

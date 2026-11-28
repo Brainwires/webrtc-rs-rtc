@@ -35,6 +35,11 @@ zeroize.workspace = true
 criterion.workspace = true
 lazy_static.workspace = true
 
+# tests/key_residue.rs runs key handling on threads whose stacks the test maps itself
+# (mmap, pthread_attr_setstack) and, on Linux, reads the process through /proc.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [[bench]]
 name = "bench"
 harness = false

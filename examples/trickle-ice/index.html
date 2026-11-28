@@ -51,12 +51,13 @@
 
   // Handle outgoing ICE candidates
   pc.onicecandidate = e => {
-    if (e.candidate && e.candidate.candidate !== "") {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify(e.candidate))
-      } else {
-        console.warn("WebSocket not open, candidate not sent")
-      }
+    // The end of the candidates too (an empty candidate, or `null` at the very end): the
+    // server's transport is "failed" only once it has it (W3C webrtc-pc 5.6.4).
+    const candidate = e.candidate ? e.candidate : {candidate: ""}
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(candidate))
+    } else {
+      console.warn("WebSocket not open, candidate not sent")
     }
   }
   // ICE connection state change handler

@@ -1072,6 +1072,7 @@ impl RTCRtpTransceiverInternal {
         &mut self,
         media: &MediaDescription,
         media_engine: &MediaEngine,
+        answers: bool,
     ) -> Result<()> {
         let mut remote_codecs = codecs_from_media_description(media)?;
         // RFC 4585 section 4.1: the feedback of `a=rtcp-fb` is used only in a session whose
@@ -1112,6 +1113,22 @@ impl RTCRtpTransceiverInternal {
                 remote_codecs,
                 media_engine.codecs_for_section(self.kind, sframe),
             );
+        } else if answers {
+            // A remote answer: what this endpoint sends is chosen among the answer's formats
+            // it can send, not among the ones its codec preferences offered (RFC 9429 section
+            // 5.11: "choose the media format to send as the most preferred media format from
+            // the remote description that is also locally supported"; W3C webrtc-pc "set a
+            // session description": [[SendCodecs]] are "the codecs that description
+            // negotiates for sending and which the user agent is currently capable of
+            // sending"; RFC 3264 section 7: the offerer "SHOULD use the first media format
+            // listed in the answer"). A format the answer added beyond the offer (RFC 9429
+            // section 5.3.1) is one of them. The receive side keeps the preferences: the
+            // answerer sends only what the offer had (RFC 3264 section 6.1).
+            send_codecs = Self::match_remote_codecs(
+                remote_codecs,
+                media_engine.codecs_for_section(self.kind, sframe),
+            )
+            .1;
         }
 
         // The remote description's list is not a local preference.

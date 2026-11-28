@@ -128,6 +128,11 @@ impl KeySchedule {
         self.suite
     }
 
+    /// `HKDF-Expand-Label`, on a stack that is overwritten afterwards
+    /// (`crypto::on_erased_stack`): the HMAC leaves the keyed hash states of `secret` and its
+    /// output in the provider's frames (tests/key_residue.rs). Every secret of the schedule but
+    /// the extracted ones comes through here, and each extraction is followed by a call here,
+    /// whose overwrite covers what the extraction left.
     fn expand_label(
         &self,
         crypto: &dyn RTCCrypto,
@@ -136,15 +141,17 @@ impl KeySchedule {
         context: &[u8],
         length: usize,
     ) -> Result<SecretVec> {
-        hkdf_expand_label(
-            crypto,
-            self.suite.hmac(),
-            secret,
-            self.prefix,
-            label,
-            context,
-            length,
-        )
+        crypto::on_erased_stack(|| {
+            hkdf_expand_label(
+                crypto,
+                self.suite.hmac(),
+                secret,
+                self.prefix,
+                label,
+                context,
+                length,
+            )
+        })
         .map_err(crypto_error)
     }
 
@@ -193,6 +200,9 @@ impl KeySchedule {
     fn advance(&mut self, crypto: &dyn RTCCrypto, input: &[u8]) -> Result<()> {
         let empty_hash = crypto.hash(self.suite.hash(), &[]).map_err(crypto_error)?;
         let salt = self.derive_secret(crypto, self.current.as_ref(), "derived", &empty_hash)?;
+        // Not on an erased stack of its own: every caller derives a secret with
+        // `expand_label` right after, whose overwrite reaches the frames this HMAC left
+        // (tests/key_residue.rs measures it: wrapping this changed nothing it finds).
         self.current =
             hkdf_extract(crypto, self.suite.hmac(), salt.as_ref(), input).map_err(crypto_error)?;
         Ok(())
@@ -298,13 +308,16 @@ impl KeySchedule {
     ) -> Result<Vec<u8>> {
         let finished_key =
             self.expand_label(crypto, base_key, "finished", &[], self.suite.hash_len())?;
-        let mut mac = crypto
-            .new_hmac(self.suite.hmac(), finished_key.as_ref())
-            .map_err(crypto_error)?;
-        let mut verify_data = vec![0u8; mac.output_len()];
-        mac.sign(&[transcript_hash], &mut verify_data)
-            .map_err(crypto_error)?;
-        Ok(verify_data)
+        // The finished key's HMAC states stay in the provider's frames: see `expand_label`.
+        crypto::on_erased_stack(|| {
+            let mut mac = crypto
+                .new_hmac(self.suite.hmac(), finished_key.as_ref())
+                .map_err(crypto_error)?;
+            let mut verify_data = vec![0u8; mac.output_len()];
+            mac.sign(&[transcript_hash], &mut verify_data)
+                .map_err(crypto_error)?;
+            Ok(verify_data)
+        })
     }
 
     /// `application_traffic_secret_N+1` from `application_traffic_secret_N` (RFC 8446
@@ -423,6 +436,18 @@ pub(crate) fn certificate_verify_input(from_server: bool, transcript_hash: &[u8]
 
 /// `TLS-Exporter` for a completed DTLS 1.3 handshake, from its exporter secret.
 pub(crate) fn export_keying_material(
+    crypto: &dyn RTCCrypto,
+    suite: Suite13,
+    exporter_secret: &[u8],
+    label: &str,
+    context: &[u8],
+    length: usize,
+) -> Result<SecretVec> {
+    // On a stack that is overwritten afterwards: see `KeySchedule::expand_label`.
+    crypto::on_erased_stack(|| export(crypto, suite, exporter_secret, label, context, length))
+}
+
+fn export(
     crypto: &dyn RTCCrypto,
     suite: Suite13,
     exporter_secret: &[u8],

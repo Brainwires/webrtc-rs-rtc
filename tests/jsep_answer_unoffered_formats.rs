@@ -1,3 +1,5 @@
+//! `SettingEngineBuilder::with_answer_offered_formats_only(false)` (the `StrictRfc` profile;
+//! the default before 0.3.0, which lists the offered formats only):
 //! RFC 9429 section 5.3.1: without codec preferences, "Any currently available media formats
 //! that are not present in the current remote description MUST be added after all existing
 //! formats" of an answer (RFC 3264 section 6.1: the answerer "MAY" list formats the offer did
@@ -5,7 +7,9 @@
 
 mod jsep_common;
 
-use jsep_common::{TestResult, default_peer, exchange, media_sections, video_track};
+use jsep_common::{
+    TestResult, default_peer, exchange, media_sections, peer_adding_formats, video_track,
+};
 use rtci::peer_connection::configuration::media_engine::{MIME_TYPE_VP8, MIME_TYPE_VP9};
 use rtci::rtp_transceiver::RTCRtpTransceiverId;
 use rtci::rtp_transceiver::rtp_sender::{RTCRtpCodecParameters, RtpCodecKind};
@@ -29,7 +33,8 @@ fn rtpmap_of<'a>(section: &'a [String], pt: &str) -> &'a str {
 #[test]
 fn an_answer_lists_its_other_formats_after_the_offered_ones() -> TestResult {
     let mut offerer = default_peer()?;
-    let mut answerer = default_peer()?;
+    // The setting's form (the default before 0.3.0; `StrictRfc`).
+    let mut answerer = peer_adding_formats()?;
     let sender = offerer.add_track(video_track("v", 0x0e11_0101))?;
     let vp8: Vec<RTCRtpCodecParameters> = offerer
         .rtp_sender(sender)
@@ -76,20 +81,28 @@ fn an_answer_lists_its_other_formats_after_the_offered_ones() -> TestResult {
         "an added format has no feedback: {answer}"
     );
 
-    // The offerer sends only what it offered.
+    // The offerer may send with every format of the answer it can send (W3C webrtc-pc
+    // [[SendCodecs]]: "the codecs that description negotiates for sending and which the user
+    // agent is currently capable of sending"; jsep-91), VP9 included, and sends with the
+    // answer's first, VP8 (RFC 9429 section 5.11, RFC 3264 section 7). Before jsep-91 the
+    // added format was left out of the send codecs.
     let parameters = offerer
         .rtp_sender(sender)
         .expect("sender")
         .get_parameters()
         .clone();
+    let codecs = &parameters.rtp_parameters.codecs;
     assert!(
-        parameters
-            .rtp_parameters
-            .codecs
+        codecs
+            .first()
+            .is_some_and(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_VP8)),
+        "{codecs:?}"
+    );
+    assert!(
+        codecs
             .iter()
-            .all(|c| !c.rtp_codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_VP9)),
-        "{:?}",
-        parameters.rtp_parameters.codecs
+            .any(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_VP9)),
+        "{codecs:?}"
     );
     Ok(())
 }

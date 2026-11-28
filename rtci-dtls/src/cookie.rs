@@ -212,7 +212,19 @@ impl CookieSecrets {
     /// The cookie for `hello` from `remote` under `secret`: HMAC-SHA-256 over the address and
     /// the ClientHello parameters RFC 6347 4.2.1 names (version, random, session_id,
     /// cipher_suites, compression_methods), each with its length in front.
+    ///
+    /// On a stack that is overwritten afterwards (`crypto::on_erased_stack`): the HMAC leaves
+    /// the keyed hash states of the secret in the provider's frames (tests/key_residue.rs).
     fn mac(
+        secret: &[u8],
+        provider: &dyn RTCCryptoProvider,
+        remote: SocketAddr,
+        hello: &ClientHelloPrefix<'_>,
+    ) -> Result<[u8; STATELESS_COOKIE_LENGTH]> {
+        crypto::on_erased_stack(|| Self::keyed_mac(secret, provider, remote, hello))
+    }
+
+    fn keyed_mac(
         secret: &[u8],
         provider: &dyn RTCCryptoProvider,
         remote: SocketAddr,

@@ -244,6 +244,38 @@ fn add_transceiver_refuses_a_rid_that_is_not_rfc_8851_syntax() -> TestResult {
     Ok(())
 }
 
+/// W3C addTransceiver: a rid "that does not conform to the grammar requirements specified in
+/// Section 10 of [RFC8851]" is a TypeError; erratum 7132 (Verified) corrects that grammar to
+/// `rid-id = 1*255(alpha-numeric)`, so a rid with `-` or `_`, or of more than 255
+/// characters, is one too. 255 alphanumerics are taken.
+#[test]
+fn add_transceiver_refuses_a_rid_outside_the_corrected_grammar_with_a_type_error() -> TestResult {
+    for rid in ["a-b".to_owned(), "a_b".to_owned(), "a".repeat(256)] {
+        let mut pc = default_peer()?;
+        let result = pc.add_transceiver_from_kind(
+            RtpCodecKind::Video,
+            init(
+                RTCRtpTransceiverDirection::Sendonly,
+                vec![with_rid("a"), with_rid(&rid)],
+            ),
+        );
+        assert!(
+            matches!(result, Err(Error::TypeError(_))),
+            "rid {rid:?}: {result:?}"
+        );
+        assert_eq!(pc.get_transceivers().count(), 0);
+    }
+    let mut pc = default_peer()?;
+    pc.add_transceiver_from_kind(
+        RtpCodecKind::Video,
+        init(
+            RTCRtpTransceiverDirection::Sendonly,
+            vec![with_rid("a"), with_rid(&"b".repeat(255))],
+        ),
+    )?;
+    Ok(())
+}
+
 #[test]
 fn add_transceiver_refuses_out_of_range_encodings() -> TestResult {
     let mut pc = default_peer()?;
@@ -624,6 +656,186 @@ fn add_track_with_streams_associates_exactly_those_streams() -> TestResult {
             .collect();
         assert_eq!(msids, streams, "{}", offer.sdp);
     }
+    Ok(())
+}
+
+const ABS_SEND_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+const TRANSPORT_CC_URI: &str =
+    "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+
+/// A peer with the default codecs and the video header extensions `uris` only.
+fn peer_with_extensions(uris: &[&str]) -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_default_codecs()?;
+    for uri in uris {
+        media_engine.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: (*uri).to_owned(),
+            },
+            RtpCodecKind::Video,
+            None,
+        )?;
+    }
+    Ok(RTCPeerConnectionBuilder::new()
+        .with_media_engine(media_engine)
+        .build(Instant::now())?)
+}
+
+/// The `a=extmap` lines of the first video section, as (uri, id).
+fn extmaps(sdp: &str) -> Vec<(String, String)> {
+    let sections = media_sections(sdp);
+    let video = sections
+        .iter()
+        .find(|s| s[0].starts_with("m=video"))
+        .expect("a video section");
+    video
+        .iter()
+        .filter_map(|l| l.strip_prefix("a=extmap:"))
+        .filter_map(|v| {
+            let (id, rest) = v.split_once(' ')?;
+            let uri = rest.split_whitespace().next()?;
+            Some((uri.to_owned(), id.split('/').next()?.to_owned()))
+        })
+        .collect()
+}
+
+/// W3C webrtc-pc 5.2 / 5.3: `getCapabilities(kind).headerExtensions` is "the list of
+/// implemented header extensions for sending" ("for receiving"), "the most optimistic view of
+/// the header extensions the user agent supports", whatever was negotiated: an answer that
+/// accepts MID alone leaves abs-send-time and transport-cc in both lists. The later offer keeps
+/// each extension's id (RFC 8285 section 6: the mapping stays for the session) and lists no
+/// extension the first offer did not.
+#[test]
+fn get_capabilities_lists_the_registered_header_extensions_after_a_negotiation() -> TestResult {
+    let all = [MID_URI, ABS_SEND_TIME_URI, TRANSPORT_CC_URI];
+    let mut offerer = peer_with_extensions(&all)?;
+    let mut answerer = peer_with_extensions(&[MID_URI])?;
+    let id = offerer
+        .add_transceiver_from_kind(RtpCodecKind::Video, Some(RTCRtpTransceiverInit::default()))?;
+    let uris = |pc: &mut RTCPeerConnection| -> (Vec<String>, Vec<String>) {
+        let mut send: Vec<String> = pc
+            .rtp_sender(id.into())
+            .expect("sender")
+            .get_capabilities(RtpCodecKind::Video)
+            .expect("video")
+            .header_extensions
+            .into_iter()
+            .map(|h| h.uri)
+            .collect();
+        let mut recv: Vec<String> = pc
+            .rtp_receiver(id.into())
+            .expect("receiver")
+            .get_capabilities(RtpCodecKind::Video)
+            .expect("video")
+            .header_extensions
+            .into_iter()
+            .map(|h| h.uri)
+            .collect();
+        send.sort();
+        recv.sort();
+        (send, recv)
+    };
+    let before = uris(&mut offerer);
+    let mut expected: Vec<String> = all.iter().map(|u| (*u).to_owned()).collect();
+    expected.sort();
+    assert_eq!(
+        before,
+        (expected.clone(), expected.clone()),
+        "before the negotiation"
+    );
+
+    let (first_offer, answer) = exchange(&mut offerer, &mut answerer)?;
+    let answered: Vec<String> = extmaps(&answer).into_iter().map(|(u, _)| u).collect();
+    assert_eq!(
+        answered,
+        vec![MID_URI.to_owned()],
+        "the answer accepts MID alone: {answer}"
+    );
+    assert_eq!(
+        uris(&mut offerer),
+        (expected.clone(), expected),
+        "getCapabilities after the negotiation"
+    );
+
+    // RFC 8285 section 6: a later offer keeps the ids, and adds nothing new.
+    let later = offerer.create_offer(None)?.sdp;
+    let first = extmaps(&first_offer);
+    for (uri, id) in extmaps(&later) {
+        let earlier = first.iter().find(|(u, _)| *u == uri);
+        assert_eq!(
+            earlier.map(|(_, i)| i.as_str()),
+            Some(id.as_str()),
+            "{uri} keeps its id in the later offer:\n{first_offer}\n---\n{later}"
+        );
+    }
+    Ok(())
+}
+
+/// W3C webrtc-pc 5.2 / 5.3: `getCapabilities` is "the list of implemented send codecs" ("receive
+/// codecs"), "the most optimistic view of the codecs the user agent supports", whatever was
+/// negotiated: after an exchange that negotiated VP8 alone (an answer with the offered formats
+/// only, the default since 0.3.0) it still lists VP9, H.264, AV1 and H.265.
+#[test]
+fn get_capabilities_is_the_same_after_a_negotiation_that_narrowed_the_formats() -> TestResult {
+    let mut offerer = default_peer()?;
+    let mut answerer = default_peer()?;
+    let id = offerer
+        .add_transceiver_from_kind(RtpCodecKind::Video, Some(RTCRtpTransceiverInit::recvonly()))?;
+    let names = |pc: &mut RTCPeerConnection, id: RTCRtpTransceiverId| -> Vec<String> {
+        let mut out: Vec<String> = pc
+            .rtp_receiver(id.into())
+            .expect("receiver")
+            .get_capabilities(RtpCodecKind::Video)
+            .expect("video")
+            .codecs
+            .iter()
+            .map(|c| format!("{} {}", c.mime_type.to_ascii_lowercase(), c.sdp_fmtp_line))
+            .collect();
+        out.sort();
+        out
+    };
+    let before = names(&mut offerer, id);
+    let vp8 = offerer
+        .rtp_sender(id.into())
+        .expect("sender")
+        .get_capabilities(RtpCodecKind::Video)
+        .expect("video")
+        .codecs
+        .into_iter()
+        .filter(|c| c.mime_type.eq_ignore_ascii_case(MIME_TYPE_VP8))
+        .map(|rtp_codec| RTCRtpCodecParameters {
+            rtp_codec,
+            payload_type: 0,
+        })
+        .collect();
+    offerer
+        .rtp_transceiver(id)
+        .expect("transceiver")
+        .set_codec_preferences(vp8)?;
+    let (_, answer) = exchange(&mut offerer, &mut answerer)?;
+    assert!(
+        !answer.contains("VP9/90000"),
+        "VP8 alone is negotiated: {answer}"
+    );
+    let after = names(&mut offerer, id);
+    assert_eq!(after, before, "getCapabilities after the negotiation");
+    assert!(
+        after.iter().any(|c| c.starts_with("video/vp9")),
+        "{after:?}"
+    );
+    let sender_after: Vec<String> = offerer
+        .rtp_sender(id.into())
+        .expect("sender")
+        .get_capabilities(RtpCodecKind::Video)
+        .expect("video")
+        .codecs
+        .iter()
+        .map(|c| c.mime_type.to_ascii_lowercase())
+        .collect();
+    assert!(
+        sender_after.iter().any(|m| m == "video/vp9"),
+        "the sender's capabilities too: {sender_after:?}"
+    );
     Ok(())
 }
 

@@ -200,6 +200,12 @@ fn a_default_peer_connection_carries_its_profiles_values() -> shared::error::Res
             agent.hold_local_candidates_until_conveyed, !ice.pair_before_conveyed,
             "{profile}"
         );
+        // Set on the agent once it is made (not an `AgentConfig` field).
+        assert_eq!(
+            pc.ice_transport().agent.failed_without_end_of_candidates(),
+            pc.setting_engine.ice_failed_without_end_of_candidates,
+            "{profile}"
+        );
         // SOFTWARE: the ICE agent's checks and responses and the TURN clients' requests.
         assert_eq!(
             agent.software,

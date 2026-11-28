@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use jsep_common::{TestResult, default_peer, video_track};
 use rtci::peer_connection::sdp::RTCSessionDescription;
+use rtci::peer_connection::state::RTCSignalingState;
 use rtci::shared::error::Error;
 use sansio::Protocol;
 
@@ -114,5 +115,114 @@ fn a_local_description_is_the_last_one_created() -> TestResult {
     answerer.set_local_description(Instant::now(), implicit)?;
     assert!(answerer.current_local_description().is_some());
     offerer.set_remote_description(Instant::now(), answer)?;
+    Ok(())
+}
+
+/// W3C "set a session description": a description whose type "is invalid for the current
+/// [[SignalingState]] as described in [RFC9429]" rejects with an InvalidStateError, for a
+/// local description too (RFC 9429 section 5.5: an answer or pranswer only in
+/// have-remote-offer / have-local-pranswer, an offer not in have-remote-offer). Each
+/// description is the last one created, so setLocalDescription's InvalidModificationError
+/// (another SDP) does not come first; the state is left as it was.
+#[test]
+fn a_local_description_of_a_type_the_state_does_not_take_is_an_invalid_state_error() -> TestResult {
+    let now = Instant::now();
+    let refused = |pc: &mut rtci::peer_connection::RTCPeerConnection,
+                   description: RTCSessionDescription,
+                   what: &str| {
+        let state = pc.signaling_state();
+        let err = pc.set_local_description(now, description).expect_err(what);
+        assert_eq!(
+            err.dom_exception_name(),
+            Some("InvalidStateError"),
+            "{what}: {err:?}"
+        );
+        assert_eq!(pc.signaling_state(), state, "{what}: the state changed");
+    };
+
+    let mut offerer = default_peer()?;
+    offerer.add_track(video_track("offered", 0x0505_0505))?;
+    let offer = offerer.create_offer(None)?;
+
+    // An answer and a pranswer in stable and in have-local-offer: the answerer creates an
+    // answer to a remote offer, rolls the offer back ([[LastCreatedAnswer]] stays), and offers
+    // itself.
+    let mut answerer = default_peer()?;
+    answerer.set_remote_description(now, offer.clone())?;
+    let answer = answerer.create_answer(None)?;
+    answerer.set_remote_description(now, RTCSessionDescription::rollback(None)?)?;
+    assert_eq!(answerer.signaling_state(), RTCSignalingState::Stable);
+    refused(
+        &mut answerer,
+        RTCSessionDescription::answer(answer.sdp.clone())?,
+        "an answer in stable",
+    );
+    refused(
+        &mut answerer,
+        RTCSessionDescription::pranswer(answer.sdp.clone())?,
+        "a pranswer in stable",
+    );
+    let own_offer = answerer.create_offer(None)?;
+    answerer.set_local_description(now, own_offer)?;
+    assert_eq!(
+        answerer.signaling_state(),
+        RTCSignalingState::HaveLocalOffer
+    );
+    refused(
+        &mut answerer,
+        RTCSessionDescription::answer(answer.sdp.clone())?,
+        "an answer in have-local-offer",
+    );
+    refused(
+        &mut answerer,
+        RTCSessionDescription::pranswer(answer.sdp)?,
+        "a pranswer in have-local-offer",
+    );
+
+    // An offer in have-remote-offer: one created in stable, before the remote offer came.
+    let mut glare = default_peer()?;
+    glare.add_track(video_track("glare", 0x0606_0606))?;
+    let own_offer = glare.create_offer(None)?;
+    glare.set_remote_description(now, offer)?;
+    assert_eq!(glare.signaling_state(), RTCSignalingState::HaveRemoteOffer);
+    refused(&mut glare, own_offer, "an offer in have-remote-offer");
+    // The valid call still works.
+    let answer = glare.create_answer(None)?;
+    glare.set_local_description(now, answer)?;
+    assert_eq!(glare.signaling_state(), RTCSignalingState::Stable);
+    Ok(())
+}
+
+/// W3C setLocalDescription: "If type is "answer" or "pranswer", and sdp is not the empty string
+/// and not equal to [[LastCreatedAnswer]]", InvalidModificationError: the pranswer branch. The
+/// answer last created, applied as a pranswer, is taken (have-local-pranswer).
+#[test]
+fn a_local_pranswer_is_the_last_answer_created() -> TestResult {
+    let now = Instant::now();
+    let mut offerer = default_peer()?;
+    offerer.add_track(video_track("offered", 0x0707_0707))?;
+    let offer = offerer.create_offer(None)?;
+    let mut answerer = default_peer()?;
+    answerer.set_remote_description(now, offer)?;
+    let answer = answerer.create_answer(None)?;
+
+    let edited = answer.sdp.replace("s=-", "s=edited");
+    assert_ne!(edited, answer.sdp);
+    let err = answerer
+        .set_local_description(now, RTCSessionDescription::pranswer(edited)?)
+        .expect_err("a pranswer that is not the last answer created");
+    assert!(matches!(err, Error::ErrSDPDoesNotMatchAnswer), "{err:?}");
+    assert_eq!(err.dom_exception_name(), Some("InvalidModificationError"));
+    assert_eq!(
+        answerer.signaling_state(),
+        RTCSignalingState::HaveRemoteOffer
+    );
+    assert!(answerer.pending_local_description().is_none());
+
+    answerer.set_local_description(now, RTCSessionDescription::pranswer(answer.sdp)?)?;
+    assert_eq!(
+        answerer.signaling_state(),
+        RTCSignalingState::HaveLocalPranswer
+    );
     Ok(())
 }

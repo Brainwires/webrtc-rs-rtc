@@ -10,7 +10,7 @@ use sansio::Protocol;
 use shared::TransportContext;
 use shared::error::Error;
 use shared::marshal::MarshalSize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Builder for the NackResponderInterceptor.
@@ -789,6 +789,9 @@ pub struct NackResponderInterceptor {
     /// The RTP session (transport) of each SSRC, from the peer connection's
     /// [`RtpSessionAssignment`](crate::RtpSessionAssignment)s; empty while there is one.
     sessions: HashMap<u32, usize>,
+    /// The streams that may not send ([`StreamsNotSending`](crate::StreamsNotSending)): no
+    /// NACK for them is answered and no probe is padded on their RTX streams.
+    not_sending: HashSet<u32>,
 
     /// See [`NackResponderBuilder::with_rate_limit`].
     rate_limit: RetransmissionRateLimit,
@@ -846,6 +849,7 @@ impl NackResponderInterceptor {
             write_queue: VecDeque::new(),
             retransmissions_queued: 0,
             sessions: HashMap::new(),
+            not_sending: HashSet::new(),
             rate_limit: RetransmissionRateLimit::default(),
             target_bps: None,
             minimum_bps: None,
@@ -1395,12 +1399,19 @@ impl NackResponderInterceptor {
         session: Option<usize>,
     ) {
         let sessions = &self.sessions;
+        let not_sending = &self.not_sending;
         let Some(stream) = self
             .streams
             .iter_mut()
             .filter(|(ssrc, _)| match session {
                 Some(session) if !sessions.is_empty() => sessions.get(ssrc) == Some(&session),
                 _ => true,
+            })
+            .filter(|(ssrc, stream)| {
+                !not_sending.contains(ssrc)
+                    && !stream
+                        .ssrc_rtx
+                        .is_some_and(|rtx| not_sending.contains(&rtx))
             })
             .map(|(_, stream)| stream)
             .filter(|stream| stream.ssrc_rtx.is_some() && stream.payload_type_rtx.is_some())
@@ -1593,7 +1604,8 @@ impl NackResponderInterceptor {
 
     /// Gives up the repair of everything sent so far on the video streams among `ssrcs` and
     /// asks the application for a key frame of each (a Picture Loss Indication with sender
-    /// SSRC 0 marked [`Attribute::DeliverToApplication`], as the pacer's flush does). The
+    /// SSRC 0 marked [`Attribute::DeliverToApplication`], as the pacer's flush does, and
+    /// carrying [`LocalKeyFrameRequest::RepairGivenUp`](crate::LocalKeyFrameRequest)). The
     /// reserve those repairs held is released: the retransmissions made so far no longer count
     /// as in use. Audio streams are left as they are.
     fn give_up(&mut self, now: Instant, ssrcs: &[u32]) {
@@ -1626,7 +1638,10 @@ impl NackResponderInterceptor {
                         media_ssrc: ssrc,
                     },
                 )]))
-                .with(Attribute::DeliverToApplication),
+                .with(Attribute::DeliverToApplication)
+                .with(Attribute::Custom(std::sync::Arc::new(
+                    crate::LocalKeyFrameRequest::RepairGivenUp,
+                ))),
             });
         }
     }
@@ -2000,6 +2015,10 @@ impl NackResponderInterceptor {
         }
 
         let ssrc = nack.media_ssrc;
+        // A stream that may not send is not repaired either (RFC 8866 section 6.7.4).
+        if self.not_sending.contains(&ssrc) {
+            return;
+        }
         let resend_interval = resend_interval(self.round_trip_time);
         let Some(stream) = self.streams.get_mut(&ssrc) else {
             return;
@@ -2345,6 +2364,18 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for NackResponderInterceptor {
             for ssrc in &assignment.ssrcs {
                 self.sessions.insert(*ssrc, assignment.session);
             }
+        }
+        // Streams that may not send from now on: what was sent of them is forgotten, so that
+        // nothing of it is sent again, now or once they send again.
+        if let Some(notice) = msg.message.custom::<crate::StreamsNotSending>() {
+            let stopped: Vec<u32> = notice
+                .ssrcs
+                .iter()
+                .copied()
+                .filter(|ssrc| !self.not_sending.contains(ssrc))
+                .collect();
+            self.not_sending = notice.ssrcs.iter().copied().collect();
+            self.forget_streams(&stopped);
         }
         if let Some(super::NackControl::LocalRtxTime {
             payload_type_rtx,

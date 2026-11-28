@@ -12,9 +12,15 @@
 # for odd r and the other way round for even r, so drift during the job (a neighbour on the host,
 # thermal state) falls on both trees alike.
 #
-# Environment (defaults in brackets): BENCH_ROUNDS [2], BENCH_WARMUP seconds [1],
-# BENCH_MEASURE seconds [2], BENCH_OUT directory [target/bench-compare-out], and any
-# bench-compare.py option in BENCH_COMPARE_ARGS (for example --threshold 0.3).
+# A bench whose trees come out separated after these rounds (every head round beyond every base
+# round, bench-compare.py's second rule, row bench-2 of docs/performance.md) is run again, alone,
+# for BENCH_CONFIRM_ROUNDS more alternating rounds before the verdict: two rounds are too few to
+# tell a separation from noise, and re-running a few benches costs seconds.
+#
+# Environment (defaults in brackets): BENCH_ROUNDS [2], BENCH_CONFIRM_ROUNDS [4],
+# BENCH_WARMUP seconds [1], BENCH_MEASURE seconds [2], BENCH_OUT directory
+# [target/bench-compare-out], and any bench-compare.py option in BENCH_COMPARE_ARGS (for example
+# --threshold 0.3).
 # A benchmark target the base does not have (or cannot build) is reported as new, not compared.
 set -euo pipefail
 
@@ -28,6 +34,7 @@ shift
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 rounds=${BENCH_ROUNDS:-2}
+confirm_rounds=${BENCH_CONFIRM_ROUNDS:-4}
 warmup=${BENCH_WARMUP:-1}
 measure=${BENCH_MEASURE:-2}
 out=${BENCH_OUT:-$root/target/bench-compare-out}
@@ -77,9 +84,9 @@ for target in "$@"; do
   echo "::endgroup::"
 done
 
-run() { # tree crate bench output
+run() { # tree crate bench output [criterion filter]
   (cd "$1" && CARGO_TARGET_DIR=$(target_of "$1") cargo bench --quiet -p "$2" --bench "$3" -- --output-format bencher \
-     --warm-up-time "$warmup" --measurement-time "$measure" --noplot) >> "$4"
+     --warm-up-time "$warmup" --measurement-time "$measure" --noplot ${5:+"$5"}) >> "$4"
 }
 
 in_base() {
@@ -88,36 +95,61 @@ in_base() {
   return 1
 }
 
-start=$SECONDS
-for r in $(seq 1 "$rounds"); do
-  : > "$out/base-$r.txt"
-  : > "$out/head-$r.txt"
-  for target in "$@"; do
+round() { # r [criterion filter]
+  : > "$out/base-$1.txt"
+  : > "$out/head-$1.txt"
+  for target in "${targets[@]}"; do
     crate=${target%%:*} bench=${target#*:}
-    echo "round $r: $target ($((SECONDS - start)) s)"
-    if [ $((r % 2)) -eq 0 ]; then
-      run "$root" "$crate" "$bench" "$out/head-$r.txt"
+    echo "round $1: $target ($((SECONDS - start)) s)"
+    if [ $(($1 % 2)) -eq 0 ]; then
+      run "$root" "$crate" "$bench" "$out/head-$1.txt" "${2:-}"
     fi
     if in_base "$target"; then
-      run "$base_dir" "$crate" "$bench" "$out/base-$r.txt"
+      run "$base_dir" "$crate" "$bench" "$out/base-$1.txt" "${2:-}"
     fi
-    if [ $((r % 2)) -eq 1 ]; then
-      run "$root" "$crate" "$bench" "$out/head-$r.txt"
+    if [ $(($1 % 2)) -eq 1 ]; then
+      run "$root" "$crate" "$bench" "$out/head-$1.txt" "${2:-}"
     fi
   done
+}
+
+round_files() { # first last
+  base_files=() head_files=()
+  for r in $(seq "$1" "$2"); do
+    base_files+=("$out/base-$r.txt")
+    head_files+=("$out/head-$r.txt")
+  done
+}
+
+targets=("$@")
+start=$SECONDS
+for r in $(seq 1 "$rounds"); do
+  round "$r"
 done
+total=$rounds
+
+# The separated benches, measured again alone (criterion takes one regular expression).
+round_files 1 "$rounds"
+# shellcheck disable=SC2086
+mapfile -t suspect < <(python3 "$root/scripts/bench-compare.py" --base "${base_files[@]}" \
+  --head "${head_files[@]}" --suspects ${BENCH_COMPARE_ARGS:-})
+if [ "${#suspect[@]}" -gt 0 ] && [ "$confirm_rounds" -gt 0 ]; then
+  echo "separated after $rounds rounds, measured again for $confirm_rounds rounds: ${suspect[*]}"
+  filter=$(python3 -c 'import re, sys; print("^(" + "|".join(re.escape(n) for n in sys.argv[1:]) + ")$")' "${suspect[@]}")
+  for r in $(seq $((rounds + 1)) $((rounds + confirm_rounds))); do
+    round "$r" "$filter"
+  done
+  total=$((rounds + confirm_rounds))
+fi
 echo "benchmarks ran for $((SECONDS - start)) s"
 for f in "$out"/base-*.txt "$out"/head-*.txt; do
+  [ -e "$f" ] || continue
   echo "::group::$(basename "$f"): $(grep -c '^test ' "$f") bench lines"
   cat "$f"
   echo "::endgroup::"
 done
 
-base_files=() head_files=()
-for r in $(seq 1 "$rounds"); do
-  base_files+=("$out/base-$r.txt")
-  head_files+=("$out/head-$r.txt")
-done
+round_files 1 "$total"
 summary=()
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && summary=(--summary "$GITHUB_STEP_SUMMARY")
 # shellcheck disable=SC2086

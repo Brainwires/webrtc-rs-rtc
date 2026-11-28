@@ -152,8 +152,13 @@ pub type IpFilter = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 pub struct AddressFilter {
     /// Only these addresses (bind addresses); empty: every address of every interface.
     pub bind_addresses: Vec<IpAddr>,
-    /// Loopback addresses too (off by default: RFC 8445 section 5.1.1.1 says they SHOULD NOT
-    /// be included unless needed).
+    /// Loopback addresses too (off by default: RFC 8445 section 5.1.1.1: "Addresses from a
+    /// loopback interface MUST NOT be included in the candidate addresses"; turning this on
+    /// departs from that rule, for local use and tests only). On Windows a driver with mDNS on a loopback address leaves a
+    /// destination-cache route for 224.0.0.251 via loopback after the process exits, and the
+    /// system then routes the group by loopback for other processes until the entry is deleted
+    /// (`peer` module documentation), so on Windows a `PeerDriver` sends no mDNS on loopback
+    /// unless `PeerDriverConfig::mdns_on_loopback_on_windows` asks.
     pub include_loopback: bool,
     /// IPv6 link-local addresses too (off by default).
     pub include_link_local: bool,

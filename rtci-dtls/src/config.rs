@@ -764,8 +764,9 @@ impl ConfigBuilder {
     ///
     /// A client with no server name takes the remote address `build` is given. With neither,
     /// a client that verifies nothing by name (`with_insecure_skip_verify(true)` or a PSK)
-    /// sends no server_name extension (in 0.2.0 it sent "localhost"); one that verifies the
-    /// certificate by name still uses "localhost", with a warning. A WebRTC peer connection
+    /// sends no server_name extension (in 0.2.0 it sent "localhost"); for one that verifies
+    /// the certificate by name `build` returns an error, as there is no name to verify against
+    /// (in 0.2.0 it verified against "localhost", with a warning). A WebRTC peer connection
     /// verifies the certificate by its fingerprint in the session description (RFC 8122,
     /// RFC 8827) and sends none.
     pub fn with_server_name(mut self, server_name: String) -> Self {
@@ -1122,15 +1123,16 @@ impl ConfigBuilder {
         // is "the fully qualified DNS hostname of the server, as understood by the client",
         // which this client does not know). A WebRTC peer connection is such a client: it
         // checks the certificate by its fingerprint. A client that verifies by name and has
-        // neither still falls back to "localhost", as in 0.2.0.
+        // neither has nothing to verify against and is refused (0.2.0 used "localhost").
         if is_client && server_name.is_empty() {
             if let Some(remote_addr) = remote_addr {
                 server_name = remote_addr.ip().to_string();
             } else if !self.insecure_skip_verify && self.psk.is_none() {
-                warn!(
-                    "conn.remote_addr is empty, please set explicitly server_name in Config! Use default \"localhost\" as server_name now"
-                );
-                "localhost".clone_into(&mut server_name);
+                return Err(Error::Other(
+                    "a client that verifies the server's certificate needs a server name \
+                     (with_server_name) or a remote address"
+                        .to_owned(),
+                ));
             }
         }
 

@@ -54,6 +54,11 @@ It writes ``docs/conformance/audit/COUNTS.md``, which reports for each level bot
 tested" (``tested`` + ``setting`` + ``conflict``) and "tested as the default" (``tested``). ``--check`` writes nothing and fails when that
 file is not what it would write (CI runs it that way).
 
+``--check`` also compares README.md's status figures with what it computes (the status table's
+MUST / SHOULD / MAY rows, "N MUST rows are open (...)", "audited ... against N specifications"),
+naming the line and both figures; the train integrator's README updater writes the same patterns.
+Self-test: ``python3 scripts/test_audit_count.py``.
+
 Usage: ``python3 scripts/audit-count.py [--check]``. Standard library only.
 """
 
@@ -395,6 +400,75 @@ def render(per_file: dict[str, dict[str, dict[str, int]]]) -> str:
     return "\n".join(out) + "\n"
 
 
+README = os.path.join(ROOT, "README.md")
+
+
+def readme_count_errors(counts_text: str, specifications: int, readme_text: str) -> list[str]:
+    """README.md's figures that come from the audit, against `counts_text` (COUNTS.md as this
+    script renders it) and the number of audited specifications: the status table's MUST /
+    SHOULD / MAY rows, the open-MUST sentence and "audited ... against N specifications". The
+    patterns are the ones the train integrator's README updater (handoff/train36/tools/
+    readme_counts.py) reads and writes, so the two agree. Each error names README's line and
+    both figures."""
+    errors: list[str] = []
+    lines = readme_text.split("\n")
+
+    def line_of(pattern: str) -> int | None:
+        for no, line in enumerate(lines, 1):
+            if re.search(pattern, line):
+                return no
+        return None
+
+    tot = {
+        m.group(1): list(map(int, m.groups()[1:]))
+        for m in re.finditer(
+            r"^\| (MUST|SHOULD|MAY|PROC|all) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \| (\d+) \|$",
+            counts_text,
+            re.M,
+        )
+    }
+    pct = {
+        m.group(1): m.groups()[1:]
+        for m in re.finditer(
+            r"^\| (MUST|SHOULD|MAY|PROC) \| (\d+) \| (\d+) \| ([\d.]+) \| (\d+) \| ([\d.]+) \|$",
+            counts_text,
+            re.M,
+        )
+    }
+    for lvl in ("MUST", "SHOULD", "MAY"):
+        if lvl not in pct:
+            continue
+        a, b, bp, d, dp = pct[lvl]
+        want = f"| {lvl} | {a} | {b} ({bp} %) | {d} ({dp} %) |"
+        no = line_of(rf"^\| {lvl} \| \d+ \| \d+ \([\d.]+ %\) \| \d+ \([\d.]+ %\) \|$")
+        if no is None:
+            errors.append(f"README.md: no status table row for {lvl} (COUNTS.md: {want})")
+        elif lines[no - 1] != want:
+            errors.append(f"README.md:{no}: {lines[no - 1]!r}, COUNTS.md gives {want!r}")
+    if "MUST" in tot:
+        _tested, _setting, _conflict, untested, partial, missing, violated, _na, _rows = tot["MUST"]
+        opn = untested + partial + missing + violated
+        viol = "none violated" if violated == 0 else f"{violated} violated"
+        want = f"{opn} MUST rows are open ({untested} untested, {partial} partial, {missing} missing, {viol})"
+        flat = " ".join(readme_text.split())
+        m = re.search(r"\d+ MUST rows are open \(\d+ untested, \d+ partial, \d+ missing, [^)]*\)", flat)
+        no = line_of(r"\d+ MUST rows are open")
+        if m is None:
+            errors.append(f"README.md: no open-MUST sentence (COUNTS.md: {want})")
+        elif m.group(0) != want:
+            errors.append(f"README.md:{no}: {m.group(0)!r}, COUNTS.md gives {want!r}")
+    m = re.search(r"audited clause by clause against (\d+) specifications", readme_text)
+    no = line_of(r"audited clause by clause against \d+ specifications")
+    if m is None:
+        errors.append(f"README.md: no 'audited clause by clause against N specifications' ({specifications})")
+    elif int(m.group(1)) != specifications:
+        errors.append(
+            f"README.md:{no}: {m.group(1)} specifications, the audit has {specifications} "
+            "(the files of docs/conformance/audit/ with clause tables)"
+        )
+    return errors
+
+
 def main() -> int:
     check = "--check" in sys.argv[1:]
     errors: list[str] = []
@@ -422,6 +496,10 @@ def main() -> int:
                 file=sys.stderr,
             )
             errors.append("stale COUNTS.md")
+        with open(README, encoding="utf-8") as f:
+            for e in readme_count_errors(text, len(per_file), f.read()):
+                print(f"audit-count: {e}", file=sys.stderr)
+                errors.append(e)
     else:
         with open(COUNTS, "w", encoding="utf-8") as f:
             f.write(text)

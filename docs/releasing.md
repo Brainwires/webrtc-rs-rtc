@@ -103,7 +103,12 @@ A fix needed after step 5 (the tag) is a new commit and a patch release (`0.1.1`
    empty `## [Unreleased]` above it. The version in `[workspace.package]` and in every
    `[workspace.dependencies]` requirement on a workspace crate is `X.Y.Z`.
 3. `SECURITY.md`'s supported-versions table names the new line if it is a new minor version.
-4. A crates.io API token with the `publish-new` and `publish-update` scopes, given to cargo
+4. The draft-work register (`docs/conformance/draft-work.md`) is re-checked: for each entry,
+   the W3C editor's draft and its `amendments.json`, the issues and PRs it names, the RFC errata
+   and the datatracker; dates updated, and a default whose draft work has moved is changed (or
+   the entry says why not) before the release commit (`docs/conformance/audit/RULES.md`,
+   "Contradictions").
+5. A crates.io API token with the `publish-new` and `publish-update` scopes, given to cargo
    with `cargo login` (it stays in `~/.cargo/credentials.toml`; never commit it or put it in
    the repository's secrets until publishing moves to CI).
 
@@ -121,6 +126,12 @@ body from the conventional commits since the previous tag (breaking changes firs
 section per kind, each capped with a link to `CHANGELOG.md`), and the GitHub release is
 created. Read the generated release, and edit its text on GitHub where a summary of the
 release's main changes at the top helps; `CHANGELOG.md` stays the full record.
+
+For a patch release, correct the generated text by hand: git-cliff files every commit whose
+type carries `!` (or a `BREAKING CHANGE` footer) under "Breaking changes", and the train's
+behaviour-change commits use `!` too. A patch release has no breaking change (the SemVer Check
+of its pull request says so), so move those entries under the release's behaviour changes
+before the page is announced. 0.2.1's page needed it.
 
 What a tag starts:
 
@@ -159,6 +170,11 @@ cargo publish --workspace --dry-run
 # A crate whose workspace dependencies are already on crates.io (or that has none) can be
 # checked on its own as well:
 cargo publish --dry-run -p rtci-crypto
+
+# Cargo.lock is gitignored, and the dry run does not leave one in the checkout on the current
+# toolchain (0.2.1: none was written). Make it explicitly before the publish, from the same
+# tree, so that a check of "the lock file is there and current" has something to read:
+cargo generate-lockfile
 ```
 
 `cargo publish -p <crate> --dry-run` on a crate whose workspace dependencies are not yet on
@@ -194,6 +210,18 @@ cargo publish -p rtci-crypto
 cargo publish -p rtci-interceptor-derive
 # ... every crate of the list, in order ...
 cargo publish -p rtci
+```
+
+A script that checks the release commit before publishing (the 0.2.1 kit's checks that the
+commit is the tag's, on `origin/master`'s first-parent line, with a clean tree and a current
+lock file) must not test membership with `git rev-list --first-parent origin/master | grep -q
+<sha>` under `set -o pipefail`: `grep -q` exits at the first match, `rev-list` is then killed by
+SIGPIPE, and the pipeline fails although the commit is there. That refused the real v0.2.1
+commit, master's tip. Take the list whole first, then search it:
+
+```sh
+fp=$(git rev-list --first-parent origin/master) || exit 1
+grep -qx "$sha" <<<"$fp" || { echo "$sha is not on origin/master's first-parent line"; exit 1; }
 ```
 
 `cargo publish` returns only once the crate is in the crates.io index (it waits up to

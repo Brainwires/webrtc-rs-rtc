@@ -18,9 +18,9 @@
 //! `docs/capacity-collapse.md`.
 
 use rtci_interceptor::{
-    Attribute, AttributedPacket, Interceptor, NACK_MAX_REPAIR_AGE, NackResponderBuilder, Packet,
-    ProbePacket, ProbeRequest, RTCPFeedback, Registry, RetransmissionRateLimit,
-    RetransmissionReserve, Slot, StreamInfo, TaggedPacket,
+    Attribute, AttributedPacket, Interceptor, LocalKeyFrameRequest, NACK_MAX_REPAIR_AGE,
+    NackResponderBuilder, Packet, ProbePacket, ProbeRequest, RTCPFeedback, Registry,
+    RetransmissionRateLimit, RetransmissionReserve, Slot, StreamInfo, TaggedPacket,
 };
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtcp::transport_feedbacks::transport_layer_nack::{
@@ -156,6 +156,11 @@ fn drain(chain: &mut impl Interceptor, seen: &mut Seen) {
                 assert!(
                     read.message.has(&Attribute::DeliverToApplication),
                     "the request must reach the application"
+                );
+                assert_eq!(
+                    Some(&LocalKeyFrameRequest::RepairGivenUp),
+                    read.message.custom::<LocalKeyFrameRequest>(),
+                    "the request says the repair was given up"
                 );
                 seen.key_frames.push(pli.media_ssrc);
             }

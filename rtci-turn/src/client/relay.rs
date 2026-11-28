@@ -914,6 +914,17 @@ impl Relay<'_> {
     /// confirms, answers 437 (it no longer had the allocation), or never answers; in that last
     /// case the server drops the allocation when its lifetime runs out.
     ///
+    /// # Re-allocating on the same socket after a release
+    ///
+    /// An allocation is its 5-tuple's (RFC 8656 §2.2): an [`allocate`](Client::allocate) from
+    /// the same local address to the same server before [`Event::AllocationReleased`] can be
+    /// refused with 437 (Allocation Mismatch, §7.2). On a 437 the client "SHOULD pick another
+    /// client transport address and retry", tries three, and then "SHOULD NOT try to create
+    /// another allocation on the server for 2 minutes" (§7.4): never retry on the refused
+    /// 5-tuple. RFC 8656 §8.2 has the server delete the allocation when it answers; coturn
+    /// keeps it for one second more and answers 437 meanwhile, so wait about two seconds after
+    /// [`Event::AllocationReleased`] (or use another socket) before allocating there again.
+    ///
     /// # Errors
     ///
     /// Fails if the refresh request cannot be sent.

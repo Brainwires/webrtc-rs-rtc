@@ -7,6 +7,1374 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **SRTP keys are no longer left in dead stack frames by the default provider**
+  (`conf/zeroize-3-stack-residue-measurement`; RFC 7714 section 13.1: "All keys MUST be properly
+  erased when no longer needed"; docs/key-erasure.md; audit row RFC7714-13.1-3). 0.2.0 erased
+  every heap copy of a key and said of stack copies "not guaranteed". Measured on 0.2.0 with a
+  test that reads the stack itself (below): after building an SRTP context the thread's dead
+  stack frames held the master key with both of its AES schedules, session round keys, the
+  AES-GCM GHASH key and the SRTCP HMAC-SHA1 states; after protecting or unprotecting packets,
+  both AES schedules of the SRTCP and header-extension encryption keys and the HMAC-SHA1 states
+  (ring provider: 2137 key forms over the ten profiles with and without a key derivation rate,
+  rustc 1.100, x86-64 Linux; 1995 on AArch64 macOS). Nothing was ever left in the heap or
+  anywhere else in the process: the 0.2.0 statement about heap copies stands. Now:
+  - **Building a context, deriving session keys again (a non-zero key derivation rate) and
+    adding a master key** run under `crypto::on_erased_stack` (new, `rtci-crypto`), which runs
+    the work in a frame of its own and overwrites the stack below it afterwards (`scrub_stack`:
+    32 KiB in an optimised build, where building a context uses about 3 KiB; 128 KiB in an
+    unoptimised one, where it uses 42 to 47 KiB depending on the compiler). Nothing is left by
+    these steps, with either provider, in unoptimised and optimised builds, asserted with the
+    oldest supported compiler (the workspace's `rust-version`) and with stable
+    (`conf/zeroize-4-scrub-covers-the-key-setup-frames`: with 32 KiB in every build, rustc
+    1.99.1's unoptimised build left the master key and its AES round keys 37.7 to 42.2 KB
+    deep, below the overwrite's reach, in all 20 measurements of the test environment, run
+    45970063627; now 0 with rustc 1.89, 1.99.1 and 1.100 in both builds, runs 45983045311,
+    45983054507, and the test environment passes, 45983033708).
+  - **AES-CM** (the payload cipher of the AES-CM profiles, and the RFC 6904 header-extension
+    keystream of every profile): the cipher object keeps its expanded key schedule and a
+    packet runs the counter mode over a reference to it. It kept the key and expanded both
+    schedules on the stack for every packet. The object is overwritten whole when dropped
+    (`aes`'s cipher types are unions whose unused bytes it never writes) and is built over
+    freshly overwritten stack.
+  - **HMAC-SHA1 of the ring provider** (SRTP and SRTCP authentication with the AES-CM and NULL
+    profiles; also the DTLS CBC record MAC and STUN message integrity): computed in the keyed
+    object, in place, with `hmac` 0.13 and `sha1` 0.11 and their `zeroize` features (were 0.12
+    and 0.10, which have none). It was computed on a copy of the keyed object in a stack frame
+    for every packet, which left the SHA-1 states after `key XOR ipad` and `key XOR opad` (the
+    key in another form) there: 42 key forms over the profiles in an optimised build on x86-64
+    Linux, 36 on AArch64 macOS, with the other two changes in place.
+  - Result, ring provider, every profile, with `Context::new` and with an MKI and a key
+    derivation rate: 0 key forms in dead stack frames after building, protecting and
+    unprotecting RTP and RTCP, re-keying and tearing down, in an optimised build on x86-64
+    Linux and AArch64 macOS (asserted in CI), and nothing anywhere else in the process (Linux).
+    In an unoptimised build building and tearing down are asserted the same way; the packet
+    path is measured and printed there, not asserted (see Known limits).
+  No wire format, API signature or default changes. Cost, against 0.2.0 in one job: SRTP
+  context set-up 1.26 → 2.99 µs with the AES-CM profiles and 1.26 → 2.09 µs with AES-GCM (the
+  stack overwrites, once per context); per packet nothing slower, SRTCP 12 to 15 % faster (no
+  key expansion per packet).
+  Performance: zeroize-3
+- **DTLS key derivation no longer leaves its secrets in dead stack frames**
+  (`conf/zeroize-5-dtls-key-setup-on-an-erased-stack`; RFC 5246 section 8.1, RFC 8446 section
+  7.1, RFC 7714 section 13.1 for the exported SRTP keying material; docs/key-erasure.md; audit
+  row RFC7714-13.1-3). Measured first with a new test that reads the stack itself (below):
+  every DTLS association left the HMAC states of its master secret after each use of the PRF
+  (ring copies the keyed HMAC context onto the stack for every MAC; AWS-LC both states, many
+  times), the exported keying material itself, the cookie secrets' HMAC states, and in DTLS 1.3
+  the HMAC states and outputs of the key schedule's secrets: 107 to 308 key forms per provider
+  and build over nine scenarios, rustc 1.89, 1.99.1 and 1.100 on x86-64 Linux and 1.100 on
+  AArch64 macOS, down to 61.5 KB below the measurement's floor. Such a key is later carried
+  into heap blocks through bytes no field owns (padding, the payload of a `None`): the two
+  Windows-only failures of the heap quarantine test seen in this release cycle (an exporter
+  output, an AES-CCM write key) were that. Now `prf_p_hash` (master secret, extended master
+  secret, key block, verify_data, exporter), the DTLS 1.2 cookie MAC, the DTLS 1.3 key
+  schedule's `HKDF-Expand-Label` and Finished HMAC, the DTLS 1.3 exporter and the DTLS 1.3
+  HelloRetryRequest cookie MAC run under `crypto::on_erased_stack`. Result: no secret of key
+  derivation in any form after any step, with either provider, in unoptimised and optimised
+  builds, on every compiler and platform measured; no key at all after the configuration,
+  connect, export and teardown steps. With ring in an optimised build also no record key of an
+  AES suite (AES-CCM from rustc 1.99.1 on: Known limits). Each of the six is held by the test:
+  taken away alone, the test fails. Eight more wraps that were tried (the DTLS 1.2 suite
+  set-ups, the DTLS 1.3 record-key set-up, both HKDF-Extract steps) changed nothing measured and
+  were left out. The record path is unchanged. No wire format, API or default changes. Cost:
+  DTLS 1.2 handshake x1.004 to x1.011 against zeroize-4; record protection unchanged (one
+  benchmark at x1.127 in a first run, x0.97 to x1.01 in a five-round repeat on three heads with
+  the same record-path code: docs/key-erasure.md).
+- **The record path of RustCrypto's AES no longer leaves round keys on the stack in an
+  unoptimised build** (`conf/dtls-34-final-flight-on-erased-stack`; RFC 7714 section 13.1, RFC
+  5246 section 8.1; docs/key-erasure.md, worked example). At opt-level 0 the AES-NI intrinsics
+  of `aes` pass their vector arguments through stack copies, so every block of AES-CCM, AES-CBC
+  and AES-CTR (DTLS AES-CCM and AES-CBC, SRTP AES-CM and the RFC 6904 keystream, with either
+  provider) left round keys and AES states in stack temporaries: 452 AES-CCM / AES-CBC forms in
+  the DTLS measurement with rustc 1.89, 446 with 1.99.1, 119 on AArch64 macOS, and 72 / 108 / 18
+  AES-CTR forms in the SRTP one. On Windows one of them, a DTLS 1.2 AES-CCM write key, reached a
+  freed heap block through the unwritten bytes of a handshake message moved into the handshake
+  cache's map. rtci-crypto now runs each such record operation in a frame of its own and
+  overwrites 48 KiB of stack below it afterwards, in builds with `debug_assertions` only: 0
+  forms then, asserted in every build by both residue tests. An optimised build compiles none of
+  it.
+
+### Breaking changes
+
+- **stream driver: on Windows a `PeerDriver` sends no IPv4 mDNS on loopback unless asked**
+  (`conf/mdns-4-windows-poisoned-route-and-loopback-default`). SemVer-visible: `rtci-stream-driver`'s
+  `PeerDriverConfig` (an exhaustive struct) has a new public field,
+  `mdns_on_loopback_on_windows: bool`, so a struct literal without `..PeerDriverConfig::on(..)`
+  no longer compiles; and a default changes on Windows. On Windows a socket joined to
+  224.0.0.251 on the loopback interface that sends to the group there leaves the group's
+  destination-cache entry on loopback (source 127.0.0.1) after the process has exited, and every
+  later process on the host then sends its mDNS from 127.0.0.1, where nobody on the network hears
+  it, until an administrator deletes the entry (measured on Windows 11 and on GitHub's Windows
+  image, ci-3: agent-test runs 46045692164, 46049295359, 46049306566). 0.2 did exactly that for
+  every driver given 127.0.0.1 with mDNS on, and only logged a warning. Now, on Windows and by
+  default (`mdns_on_loopback_on_windows: false`), the driver does not join the IPv4 group on a
+  loopback interface and sends no message about a loopback address's name to the group (each
+  is dropped and counted in `unsent_datagrams`); a driver whose only IPv4 addresses are loopback
+  binds no IPv4 mDNS socket (`mdns_available(false)` is `false`) and tells the connection its
+  IPv4 names cannot be published, so its loopback candidates go out under unpublished `.local`
+  names (or not at all with `with_multicast_dns_fail_closed`). Rules: RFC 8445 section 5.1.1.1
+  ("Addresses from a loopback interface MUST NOT be included in the candidate addresses";
+  loopback candidates are for local use); RFC 6762 asks no mDNS on loopback;
+  draft-ietf-mmusic-mdns-ice-candidates says nothing of loopback. Upgrade: an application or
+  test that runs drivers on loopback on Windows and wants their names resolved sets
+  `mdns_on_loopback_on_windows: true` (0.2's behaviour, with the warning) and cleans the entry
+  when done (`netsh interface ipv4 delete destinationcache interface=<loopback index>
+  address=224.0.0.251`). IPv6 (ff02::fb on ::1) is unchanged: not measured to leave a route.
+  Other systems: no change, the field is ignored. Tests: `peer.rs` unit tests (the address and
+  route choice, on every platform); `mdns_virtual_time.rs`:
+  `drivers_asked_for_mdns_on_loopback_send_it_there_and_connect` (baseline) and
+  `by_default_drivers_on_loopback_send_no_mdns_there_on_windows_only` (varies only the setting;
+  its Windows branch runs in every Windows job's virtual-time step); on a real Windows host
+  `mdns.rs::by_default_drivers_on_loopback_leave_the_group_route_off_loopback` asserts the
+  group's route is off loopback before, and still off loopback after, default drivers on
+  127.0.0.1, run by `scripts/windows-poisoned-mdns-route.sh` before it moves the route.
+- **rtci-dtls: a client that verifies the server's certificate by name but has no name is
+  refused** (`conf/dtlssni-2-nameless-verifying-client-refused`, on top of
+  `conf/dtlssni-1-no-sni-from-peer-connection`; RFC 6066 section 3, RFC 6125: a certificate
+  is verified against the name the client meant to reach). `ConfigBuilder::build(true, None)`
+  with no `with_server_name`, no `with_insecure_skip_verify(true)` and no PSK returns
+  `Error::Other("a client that verifies the server's certificate needs a server name ...")`;
+  0.2.0 verified against a made-up `localhost` and sent it as SNI, with a warning. Breaking for
+  a stand-alone rtci-dtls caller that relied on that: a configuration that built now fails.
+  Migration: `with_server_name(<the server's DNS name>)` (`"localhost"` for a local test
+  server), or pass the remote address to `build`. The peer connection is not affected (it
+  verifies by fingerprint with `insecure_skip_verify`). Marked for 0.3.0: not for a 0.2.x
+  release. Tests that built such clients now name the server (`config_test.rs`).
+
+### Behaviour changes
+
+- **`rtci_mdns::MulticastSocket::new()` on Windows joins and sends on the default route's interface**
+  (`conf/mdns-4-windows-poisoned-route-and-loopback-default`; RFC 6762 section 14). Without `with_interface` the socket
+  joined on `INADDR_ANY` and sent by the system's route for 224.0.0.251, which on Windows comes
+  from the destination cache: on a host where any process had sent to the group from 127.0.0.1
+  (see the stream driver entry under Breaking changes) it sent from 127.0.0.1 and nobody on the
+  network heard it, silently. On Windows, when neither an interface nor a local IPv4 address
+  (`with_multicast_local_ipv4`) is given, it now joins the group on the default route's
+  interface (the local address of a UDP socket connected to 192.0.2.1:9, which sends nothing)
+  and sets `IP_MULTICAST_IF` to it, as `with_interface` with that address would. The join
+  moved too: on such a host a join on `INADDR_ANY` also lands on loopback, and a socket that
+  sent by the network interface but stayed joined on `INADDR_ANY` never heard its own datagrams
+  (agent-test run 46123619860, the interop probe). A default route on loopback or none leaves
+  `INADDR_ANY` and the system's route. Where the system's route for the group was not the
+  default route's interface (a hosted image answered 172.25.176.1, "vEthernet (nat)", for the
+  group and 10.1.0.100 for the default route), the socket now uses the default route's.
+  Linux, macOS and other systems: unchanged (GitHub's macOS image routes the group to lo0 on
+  purpose). Not SemVer-breaking (no API change). **Limit:** on a multi-homed Windows host whose
+  mDNS link is not the default route's, the system's route might have been right where the
+  default route is wrong; `with_interface` is the answer there, and its documentation says so.
+  Tests: `socket.rs` unit tests of the choice (every platform);
+  `multicast_interface.rs::on_windows_a_socket_without_an_interface_sends_by_the_default_route`
+  (receiver joined on the default route's interface, the source must be that interface) and
+  `on_windows_a_socket_without_an_interface_hears_the_default_route` (a `new()` receiver gets
+  what a sender given the default route's interface sends), run by
+  `scripts/windows-poisoned-mdns-route.sh` on a host whose route is on loopback. Each first
+  checks its precondition on the host it runs on: a socket made as 0.2's `new()` must not get
+  the datagram through there. The listening test asserts it ("PRECONDITION"). The sends test
+  cannot: on one hosted image shape, whose group answer before the poisoning was "vEthernet
+  (nat)", a sender without `IP_MULTICAST_IF` still left by the default route (agent-test run
+  46124346568), so there it prints `### CANNOT PROVE HERE: ...`, which the script raises as a
+  warning on the run, and still asserts that `new()` sends by the default route. The script also
+  prints, after poisoning, where an unconnected send to the group actually arrives (per joined
+  interface, or "nowhere"). The file's tests run one at a time.
+- **RTCP session: a NACK larger than the MTU is split; a repeated TMMBR waits for a Regular
+  packet** (`conf/rtcp-session-3-split-nack-regular-tmmbr`). (1) RFC 3550 section 6.1: "If the overall
+  length of a compound packet would exceed the MTU of the network path, it SHOULD be segmented
+  into multiple shorter compound packets". A NACK too large for one compound packet
+  (`RtcpSessionBuilder::with_mtu`, 1200 octets by default: about 280 PID/BLP pairs) used to
+  leave whole, in one datagram over the MTU; its pairs are now cut into NACKs that fit, the
+  first in the compound packet being built and the rest, at the same instant, in compound
+  packets of their own (the leading SSRC's report without blocks, its CNAME, the NACK). Any
+  other single packet larger than the MTU still leaves as it is: it cannot be split. (2) RFC 5104
+  section 4.2.1.3: "Any repetition of a request message SHOULD use regular RTCP mode for its
+  transmission timing". The congestion control interceptor's repetitions of an unacknowledged
+  TMMBR (`TMMBR_REPEAT_INTERVAL`) used to enter the RTCP session as any feedback and leave in
+  an Early packet when RFC 4585 3.5.2 allowed one; they are now held for the next Regular
+  compound packet (a newer TMMBR replaces the held entries for the same media senders). The
+  first TMMBR still goes at once. API unchanged. Tests
+  `rtcp_session_feedback.rs::a_nack_larger_than_the_mtu_is_split_into_several_compound_packets`,
+  `rtcp_session_feedback.rs::a_repeated_tmmbr_waits_for_the_regular_compound_packet`.
+- **ICE-TCP between two lite agents (RFC 6544 section 6.1)** (`conf/ice-30-lite-lite-tcp`, a
+  re-cut of the parked `conf/ice-22-lite-tcp` on 0.2.0). Before, two lite agents could not use a
+  TCP pair at all: nothing opened its connection, since neither sends connectivity checks. Now
+  the side whose candidate of the selected pair is `tcptype active` opens the connection (the
+  TCP role; 6.1's `a=setup:active` is read as that, `a=setup` being the DTLS role in WebRTC):
+  the controlling agent as soon as it selects the pair, in parallel with its updated offer
+  (6.1's MAY), the controlled one once its pair is final. The answerer carries the pair on the
+  connection it accepted on the pair's passive candidate from the active candidate's IP,
+  closes nothing while the updated offer is awaited, keeps the matching connection once the
+  offer is applied, and closes a connection that does not match and restarts ICE (6.1's MUST
+  and SHOULD), whether the connection came before the offer or after it. On the way: a lite
+  agent takes one UDP, one passive TCP and one active TCP candidate per address, no
+  simultaneous-open one (section 4.4; before, its UDP candidate shut every TCP one on the
+  address out, so a lite agent had no TCP candidate and could not connect over TCP even with a
+  full peer; it can now); two lite agents keep each other's active TCP candidates as remote candidates
+  (a full agent, or a lite one with a full peer, still drops them and notes that the peer may
+  dial); the peer's `a=ice-lite` reaches the agent before the first description's candidate
+  lines; and between two lite agents a first non-STUN message on a connection the agent opened
+  does not reset it. Only when both sides are lite (`with_lite(true)` and the peer's
+  `a=ice-lite`); full mode stays the default, as 6.1 RECOMMENDS. New `Agent::is_remote_lite`,
+  `Agent::awaits_lite_update` (additive). Conformance rows RFC6544-4.4-1, RFC6544-6.1-1,
+  RFC6544-6.1-2 and RFC6544-6.1-3 (the last open MUST of RFC 6544) are `tested`.
+- **An end of candidates before the first stream poll releases the engine's TCP listeners**
+  (`conf/ice-33-lite-lite-nothing-closed-while-awaiting-the-update`). An application that adds
+  its UDP host candidate and its end of candidates before it first serves the stream interface
+  gets no TCP candidate: the end of gathering waits for listeners only of an application that
+  has served it, and none may follow the end of candidates (RFC 8838 section 13). That is
+  unchanged. Before, the listeners the engine had asked for were still bound once it polled and
+  stayed open, accepting connections no candidate announced, and only the agent's generic
+  "gathering was declared complete" line said anything. Now the engine warns at the end of
+  candidates, naming the cause and the fix (poll `poll_stream_command` first), and releases
+  those listeners: a driver that polls later sees each `Listen` followed by its
+  `StopListening`. An ICE restart gathers them afresh.
+- **The examples say when their candidates end** (`conf/examples-3-end-of-candidates`, after
+  `conf/ice-32-failed-needs-end-of-candidates`: W3C webrtc-pc 5.6.4 "failed" needs the end of
+  the candidates). Examples whose signalling carries candidates relay the end-of-candidates
+  and add their own when their gathering is done (`data-channels-flow-control`,
+  `data-channels-offer-answer`, `ice-tcp-active-passive`, `trickle-ice`, `trickle-ice-host`,
+  `trickle-ice-srflx`, `trickle-ice-relay`, `perfect-negotiation`, `data-channels-simple`; the
+  browser pages now forward the empty or `null` candidate, and `data-channels-offer-answer`
+  hands the peer's trickled candidate to `add_remote_candidate`, not `add_local_candidate`:
+  it connected before only because the offerer, which had the answerer's candidate from the
+  answer's SDP, checked it and the answerer learnt the offerer as a peer-reflexive candidate;
+  the offer it posted was created before its candidate and carried none).
+  Browser examples whose page sends only its description (`ice-restart`, `ice-tcp`,
+  `play-from-disk-renegotiation`, `play-from-disk-playlist-control`) give up after 30 s of
+  "disconnected" on their own timer. The copy-paste examples (`data-channels`, `reflect`,
+  `save-to-disk-*`, `play-from-disk-{vpx,h26x,fec}`, `simulcast`, `stats`, and the rest of the
+  base64 ones) set `SettingEngineBuilder::with_ice_failed_without_end_of_candidates(true)`
+  (Chromium's pasted description has no `a=end-of-candidates`) and add their own
+  end-of-candidates local candidate. Examples only; no engine change.
+- **ICE: a transport is "failed" only once no candidate is to come; until then "disconnected"**
+  (`conf/ice-32-failed-needs-end-of-candidates`; W3C webrtc-pc 5.6.4 `RTCIceTransportState`:
+  "failed" is a transport that "has finished gathering, received an indication that there are
+  no more remote candidates, finished checking all candidate pairs, and all pairs have either
+  failed connectivity checks or lost consent"; "disconnected" one that "has finished checking
+  all existing candidates pairs and not found a connection (or consent checks [RFC7675] once
+  successful, have now failed), but it is still gathering and/or waiting for additional remote
+  candidates"; "The failed and completed states require an indication that there are no
+  additional remote candidates"). The checking timeout (`disconnected_timeout +
+  failed_timeout`), a failed nomination (RFC 8445 7.2.5.3.4) and consent expiry (RFC 7675
+  5.1) failed the transport whether or not the end of the candidates had been indicated; they
+  now make it "disconnected" until it is, and "failed" the moment it is and the PAC timer has
+  expired (5.6.4 again: "and either zero local candidates were gathered or the PAC timer has
+  expired [RFC8863]"; so consent lost inside the first 39.5 s fails the transport as the timer
+  expires, the media path going at once as before). The indication is:
+  gathering finished (the application's end-of-candidates local candidate, as before) and the
+  peer's end-of-candidates (`add_remote_candidate` with an empty `candidate`, or
+  `a=end-of-candidates`) or a remote description without `a=ice-options:trickle`
+  (`canTrickleIceCandidates` false, which now also lets such a transport be "completed"). While
+  "disconnected" so, the agent keeps its candidates, nominates nothing more, checks again
+  ("checking") when a new pair is formed, and an ICE restart starts it over as before. A pair
+  whose consent expired is removed and the peer's requests on it go unanswered (RFC 7675 5.1:
+  "the same ICE credentials MUST NOT be used on the affected 5-tuple again"), and no other
+  valid pair takes its place without a nomination (RFC 8445 8.1.2). **What changes
+  for an application**: one that never relays the peer's end-of-candidates, or never adds its
+  own when gathering is done, sees "disconnected", never "failed", when the path is lost or
+  never found, and should restart ICE or close on its own timer; one that relays both (or
+  exchanges complete descriptions) sees "failed" as in 0.2.1. The examples that leave their
+  loop on "failed" (`examples/data-channels` and the others) add no end-of-candidates local
+  candidate, so they now stay "disconnected" when the browser goes away. The stream driver
+  (`rtci-stream-driver`) ends each generation's gathering itself and tears nothing down: the
+  application has to relay the end-of-candidates candidate the driver surfaces as an
+  `OnIceCandidateEvent` (as its tests now do) or keep a timer of its own. The transport
+  statistics drop the selected pair when consent is lost without the indications too
+  (`selectedCandidatePairId` gone, `selectedCandidatePairChanges` counted), as on "failed". New
+  `SettingEngineBuilder::with_ice_failed_without_end_of_candidates(bool)` (default `false`;
+  `true` in the `Chrome` behaviour profile, row `ice.failed-without-end-of-candidates`:
+  libwebrtc fails a transport without the indication) makes the PAC timer the
+  end-of-candidates fallback RFC 8863 section 5 allows ("ICE agents MAY use the PAC timer to
+  also serve as an end-of-candidates fallback"): those events fail the transport once the
+  timer has expired (39.5 s after the checks began, with the defaults), as before. Agent API
+  (additive): `Agent::set_remote_trickles`, `Agent::set_failed_without_end_of_candidates`,
+  `Agent::failed_without_end_of_candidates`. Audit rows WEBRTC-5.6.4-2 and WEBRTC-5.6.4-9
+  `partial` -> `tested` (open MUST 29 -> 27). Tests
+  `agent_checklist_test.rs::checks_that_all_failed_are_disconnected_until_no_candidate_is_to_come`,
+  `a_candidate_that_comes_after_the_checks_failed_is_checked`,
+  `consent_lost_before_the_end_of_candidates_is_disconnected_and_then_failed`,
+  `a_restart_of_an_agent_whose_checks_failed_checks_and_connects`,
+  `consent_lost_inside_the_pac_timer_is_failed_as_the_timer_expires`,
+  `a_failed_nomination_before_the_end_of_candidates_is_disconnected`,
+  `a_lite_agent_whose_peer_falls_silent_is_failed_only_after_the_end_of_candidates`,
+  `the_pac_timer_ends_the_candidates_when_set_to`; `tests/states_events_rtc2rtc.rs`
+  (`transport_state_events_come_before_the_connection_events_they_cause` now relays the end of
+  the candidates before "failed", `a_peer_that_cannot_trickle_is_the_indication_that_no_candidate_is_to_come`,
+  `a_cut_link_fails_without_the_end_of_candidates_when_set_to`). Tests that expected "failed"
+  after a lost path now signal the end of the candidates first (agent consent, nomination and
+  ported tests, `tests/lossy_link_rtc2rtc.rs`, `tests/stats_conformance_rtc2rtc.rs`,
+  `tests/webrtc_pc_transport_clauses_rtc2rtc.rs`, stream-driver `virtual_time.rs`); the
+  consent timing tests measure the loss of consent by the media path, and "failed" then or at
+  the PAC timer.
+- **An answer lists only the offered formats by default**
+  (`conf/jsep-95-answers-list-offered-formats-by-default`; owner decision 2026-11-27). Without
+  codec preferences an answer now lists the offered formats this endpoint supports, in the
+  offer's order, each repair format with its primary, and nothing else:
+  `SettingEngineBuilder::with_answer_offered_formats_only` defaults to `true` (the `Rfc`,
+  `Chrome` and `Performance` profiles; `StrictRfc` sets `false`). RFC 9429 section 5.3.1 says
+  both "Any currently available media formats that are not present in the current remote
+  description MUST be added after all existing formats" and "the media formats in the answer
+  MUST include at least one format that is present in the offer but MAY include formats that
+  are locally supported but not present in the offer"; the default now takes the second, as
+  every browser does (libwebrtc `pc/codec_vendor.cc` `NegotiateCodecs`), and is listed as a
+  standing departure from the first in docs/conformance.md (audit rows RFC9429-5.3.1-16 and
+  RFC3264-6.1-7: `setting`). Reasons: the added formats are live (WebKit switched its sender
+  to an added VP9, test-env run 45878070327), they become the offerer's send codecs (jsep-91),
+  they spend dynamic payload type numbers in the peer's session (RFC 3264 section 8.3.2), and
+  the web-platform-tests assume the offered form (`webrtc/protocol/h265-level-id.https.html`).
+  **Upgrading from 0.2.1:** answers shrink to the offered formats; an offerer that switched to
+  a format only the answer listed can no longer do so; `getParameters().codecs` of the remote
+  offerer lists fewer codecs. For the old form call
+  `SettingEngineBuilder::with_answer_offered_formats_only(false)` (or use the `StrictRfc`
+  profile). The pinned browser answers (`tests/fixtures/browser-sdp-answers/`) lose the added
+  formats. Tests that cover the added formats run with the setting:
+  `answer_added_formats_rtc2rtc.rs`, `jsep_answer_unoffered_formats.rs`,
+  `jsep_payload_type_meaning.rs` (answer side), `jsep_sframe_payload_types.rs`,
+  `additional_codec_sent_rtc2rtc.rs`, `offerer_sends_answers_preferred_format.rs`; the new
+  default is asserted by `jsep_answer_offered_formats_only.rs` and
+  `additional_codec_sent_rtc2rtc.rs::by_default_the_answer_is_h264_on_63_alone_and_it_is_sent`.
+- **A remote answer with `a=rtcp-fb` its offer did not have is refused by default** (RFC 9429
+  section 5.11: "If the 'm=' section references RTCP feedback mechanisms that were not present
+  in the corresponding 'm=' section in the offer, this indicates a negotiation problem and MUST
+  result in an error"; RFC 4585 section 4.2: "The answerer MUST NOT add feedback parameters").
+  `SettingEngineBuilder::with_unoffered_feedback_refused` now defaults to `true` (it was
+  `false` in 0.2.x, where such an answer was applied and the extra feedback never enabled):
+  `set_remote_description` returns `ErrAnswerDoesNotMatchOffer` naming the line and leaves the
+  offer pending. The check compares mechanisms: an answer that restates the parameters of
+  `trr-int`, `ccm pause` (RFC 7728 section 9.1) or `ccm tmmbr`'s `smaxpr` (RFC 5104 section 7.2),
+  as this engine's own answers do, is not refused for them. This changes what a 0.2 application sees, so it belongs to the next minor
+  release, 0.3.0. The lenient form stays: `with_unoffered_feedback_refused(false)`, which the
+  `Chrome` behaviour profile now sets (`jsep.unoffered-feedback-refused`: `Rfc` `true`,
+  `Chrome` `false`, `StrictRfc` `true`, `Performance` `true`), as libwebrtc applies such answers
+  (pc/sdp_offer_answer.cc @ a222406d checks no feedback in a remote answer). No answer recorded
+  from Chromium, Firefox, WebKit, Pion v4.2.29, aiortc 1.16.0, str0m 0.26.0 or webrtc-rs 0.17
+  carries such a line (`scripts/answer-feedback-evidence.py` over the interop matrix's recorded
+  descriptions); webrtc-rs 0.17 can write one when its application sets codec preferences with
+  feedback the offer lacked. Audit row RFC9429-5.11-6 `partial` -> `tested`; the standing
+  departure from RFC 9429 section 5.11 is withdrawn from `docs/conformance.md`. Tests:
+  `tests/jsep_answer_feedback_profile.rs` (the default refuses, under `Rfc`, `StrictRfc`,
+  `Performance` and with no profile named; `Chrome` and the setting `false` apply), and the
+  refusal case in `a_remote_answer_that_does_not_answer_the_offer_changes_nothing`;
+  `pause_and_tmmbr_parameters_of_the_answer_are_the_offered_mechanisms`.
+- **An engine TURN link allocates again on a 5-tuple it released only once the server has
+  answered the release** (RFC 8656 sections 2.2, 7.2 step 2 and 7.4). One UDP socket and an ICE
+  restart with new TURN credentials (break before make) sent the Refresh of LIFETIME 0 and the new
+  Allocate back to back; with the release lost or late, the server still had the allocation, the
+  Allocate met a 437, and the engine (one socket, nothing else to try) left the server alone for
+  two minutes, so the restart's generation had no relayed candidate. The Allocate now waits for
+  the release transaction to end (answered, 437 or timed out). No 437 is ever retried on the
+  refused 5-tuple: section 7.4's "SHOULD NOT try to create another allocation on the server for 2
+  minutes" stands. turn-9.
+- **A later remote offer that asks a simulcast sender for rids outside its envelope is
+  answered, not refused** (`conf/jsep-96-remote-offer-rid-changes-are-answered`; W3C
+  webrtc-pc Candidate Correction 37, w3c/webrtc-pc PR #2794, 2022-12-08: "Don't fail
+  sRD(offer) over rid mismatch, just answer with unicast"). The engine refused such an offer
+  with InvalidAccessError, from the step of the Recommendation that the correction emptied
+  ("This specification does not allow remotely initiated RID renegotiation"). Now it is
+  applied: the sender's encodings stay, the answer lists only the offered rids the sender has
+  (none, and no `a=simulcast`, when every rid is new), and applying the answer removes the
+  encodings it does not list, the first staying when it lists none. Upgrade: an application
+  that relied on the refusal sets `SettingEngineBuilder::with_remote_rid_renegotiation_refused(true)`
+  (new; in no behaviour profile). Audit rows WEBRTC-4.4.1.4-10, WEBRTC-5.4.1-3.
+- **A remote SSRC that times out no longer mutes its track** (`conf/jsep-97-rtp-timeout-does-not-mute`;
+  W3C webrtc-pc Candidate Correction 57, w3c/webrtc-pc PR #3082, 2025-10-23: "RTCP timeout is
+  not a reason to mute a remote track"). Section 9.3 of the Recommendation muted the track when
+  an SSRC was removed "either due to reception of a BYE or via timeout"; the correction keeps
+  the BYE only. The engine muted on the RTP timeout (RFC 3550 section 6.3.5, the RTCP
+  session's `SourceTimedOut`) as well; now the source is forgotten and the track left as it
+  is. A BYE still mutes it, and `with_source_departure_ends_track(true)` still ends a track
+  whose SSRCs have all left by BYE or timeout. Upgrade: the previous form is
+  `SettingEngineBuilder::with_rtp_timeout_mutes_track(true)` (new; in no behaviour profile).
+  Audit rows RFC8830-3-8, WEBRTC-9.3-2.
+- **A remote SSRC whose RTCP SDES CNAME contradicts its `a=ssrc ... cname:` is no longer taken
+  to be the source the description declares** (`conf/cname-1-sdes-cname-mismatch-undeclares-ssrc`).
+  RFC 5576 section 6.1: a receiver of "an RTCP SDES packet associating this SSRC with a
+  different CNAME ... SHOULD assume there has been an SSRC collision and that the description
+  of the source that was carried in the SDP description is not applicable to the actual source
+  being received"; section 5: such packets "SHOULD be handled in the same manner as packets from
+  additional sources would be handled had the endpoint not received any a=ssrc: attributes at
+  all". The engine threw the declared CNAME away when it read the remote description, so it
+  never compared. It now keeps it per SSRC and compares it with each SDES CNAME. On a mismatch:
+  the new event `RTCPeerConnectionEvent::OnRemoteCnameMismatch(ssrc)` (once per SSRC and
+  declared CNAME); a declared stream that no packet has established yet and is its receiver's
+  only stream is taken off the receiver, so that its media opens the same track as a stream of
+  an undeclared SSRC (by the single section, its MID or its payload type; without the
+  description's `a=ssrc-group` repair pairing, an RTX stream then associated by its `apt`), where
+  the packets can be placed that way (one media section, or the MID header extension
+  negotiated); a stream already flowing, or declared beside others (`a=ssrc-group:SIM`, beside
+  `a=rid`), keeps its place: the media keeps flowing and no track is unbound or ended. A later
+  description declaring the SSRC with the same contradicted CNAME is not applied to it again.
+  This is a collision between remote sources: no local SSRC moves (RFC 3550 8.2 collisions with
+  a local SSRC are unchanged, `OnSsrcCollision`) and nothing asks for negotiation. API: one new
+  variant of the non-exhaustive `RTCPeerConnectionEvent`. A peer whose descriptions name another
+  CNAME than its RTCP SDES gets this treatment for all its declared SSRCs. Tests
+  `rtcp_session_rtc2rtc.rs::an_sdes_cname_other_than_the_declared_one_leaves_the_ssrc_undeclared`,
+  `a_flowing_stream_whose_sdes_contradicts_its_declared_cname_keeps_flowing`,
+  `an_sdes_cname_that_matches_the_declared_one_changes_nothing`.
+- **A lite agent's descriptions say `a=ice-options:trickle ice2`, not `ice2` alone**
+  (`conf/ice-36-followups-frozen-pair-lite-trickle-loopback-doc`; RFC 8840 section 4: "Trickle
+  ICE Agents MUST indicate support for Trickle ICE by including the ice-option "trickle" within
+  all SDP Offers and Answers"; RFC 8838 Appendix B: an ICE-lite agent capable of Trickle ICE
+  "would indicate support for Trickle ICE"). A lite agent of this engine takes trickled
+  candidates and trickles its own (its TCP candidates come after the description), yet its
+  offers and answers said it could not, so a full peer took the lite agent's description for
+  every candidate it would have (W3C webrtc-pc 5.6.4, `canTrickleIceCandidates` false) and
+  could report "failed" before the trickled TCP candidates arrived. A peer of a lite `rtci`
+  agent now sees `canTrickleIceCandidates` true and waits for its end-of-candidates. Test
+  `a_lite_agent_says_trickle_in_its_offer_and_its_answer`; `test_set_lite` updated. Audit
+  RFC8838-3-3, RFC8445-10-1, RFC8839-4.2.1.5-1, RFC9429-5.2.1-11 (notes).
+- **An answer's `a=ice-options` says `trickle` and `ice2` only when the offer did** (RFC 9429
+  section 5.3.1: the line, "with the "trickle" option ... and the "ice2" option ..., is only
+  included if such an option was present in the offer"; `conf/jsep-98-answer-ice-options-conflict`).
+  Answers to browsers (which offer `trickle` alone) now say `a=ice-options:trickle`; an answer to
+  an offer without the line (webrtc-rs 0.17, RFC 5245 peers) has none; answers to `rtci` are
+  unchanged (`trickle ice2`), and offers always say `trickle ice2` (5.2.1, 5.2.2). Until now
+  every answer said `trickle ice2`, the form of RFC 8840 section 4.1.3 ("In any case, the
+  Answerer MUST include the "ice-options:trickle" attribute"), RFC 8445 section 10 and RFC 8839
+  sections 4.2.1.5 / 4.3.2, which contradict RFC 9429 here (`docs/conformance/spec-issues.md`
+  row 28, `draft-work.md` #24): RFC 9429 governs a JSEP endpoint and its working group made the
+  condition on `trickle` deliberate (`rtcweb-wg/jsep#23`). New setting
+  `SettingEngineBuilder::with_answer_ice_options(AnswerIceOptions)`: `AsOffered` (default, `Rfc`,
+  `Performance`), `TrickleAlways` (`Chrome`: libwebrtc's `CreateAnswer` adds `trickle` whatever
+  the offer had; `ice2` as offered), `Always` (`StrictRfc`, the other texts' form). 35 pinned
+  browser answers (`tests/fixtures/browser-sdp-answers/`) lose `ice2`, the 4 webrtc-rs 0.17 ones
+  their `a=ice-options` line; nothing else in them changes. Consequence, recorded in row 28: an
+  answerer whose answer said `trickle` alone says `trickle ice2` in its later offer, a change
+  RFC 8839 section 4.4.1.1.1 forbids outside a restart; libwebrtc and Firefox do not check it, an
+  `rtci` peer does (RFC 8839 4.4.2.1) but never sees it from another `rtci` peer, whose offers
+  carry both options. Audit: RFC9429-5.3.1-43 (new, `tested`; split from 5.3.1-2), RFC8839-4.3.2-3,
+  RFC8839-4.2.1.5-1, RFC8445-10-1 (`conflict`); open MUST rows unchanged (6).
+  `scripts/behaviour-profiles.py` matches a standing departure to its governed row by the
+  setting it names (two rows share RFC 9429 5.3.1). Tests `tests/jsep_answer_ice_options.rs`.
+
+### Changed
+
+- **Behaviour change (0.3.0): received rid-ids follow RFC 8851 as corrected by erratum 7132**
+  (`conf/rid-1-rid-id-grammar-follows-erratum-7132`; audit row RFC8851-10-1). Erratum 7132
+  (Verified 2022-10-13) corrects section 10 to `rid-id = 1*255(alpha-numeric)`, "consistent
+  with the rules for the RtpStreamId/RepairedRtpStreamId SDES from RFC 8852 section 3"; the
+  published grammar also took `-` and `_`, of any length. `rtci-sdp`: `Rid::parse`,
+  `Simulcast::parse`, `Rid::new` and `depend=` use the corrected grammar; new `RidIdGrammar`
+  (`Corrected`, the default, and `Published`) with `Rid::parse_with` / `Simulcast::parse_with`.
+  Engine: a received `a=rid` line whose rid-id has `-` or `_` or more than 255 characters is
+  discarded (RFC 8851 6.2.2 step 1), and a description whose `a=simulcast` names one is refused
+  (RFC 9429 5.8), where 0.2 took both. Upgrade: a peer that writes such rids needs
+  `SettingEngineBuilder::with_published_rid_id_grammar(true)` (in no profile: libwebrtc takes
+  only 1 to 16 alphanumerics and Firefox only alphanumerics). Rids set through the API were
+  checked to 1 to 255 alphanumerics already; addTransceiver now refuses the others with the
+  `TypeError` W3C webrtc-pc 5.1 asks for (it was `ErrRTPSenderRidInvalid` for `-`, `_` and length).
+- `rtci-crypto` depends on `hmac` 0.13 and `sha1` 0.11 (were 0.12 and 0.10), with `zeroize`.
+  They are used by the ring provider's HMAC-SHA1 only; the nested lock file of the
+  test-environment's layers peer follows.
+- New: `crypto::on_erased_stack(work)`.
+- **`set_configuration` with new STUN / TURN servers or a new ICE candidate policy after a local
+  description sets the 'needs-ice-restart' bit** (RFC 9429 section 4.1.18): `negotiationneeded`
+  fires and the next `create_offer` restarts ICE (W3C [[LocalIceCredentialsToReplace]], as
+  `restartIce`; libwebrtc does the same). Before, the new list waited for a restart the
+  application had to ask for (W3C's own text: "it should do an ICE restart"). Behaviour change
+  for every application that calls `set_configuration` with other servers on a negotiated
+  connection. jsep-85.
+- **Behaviour change (0.3.0): a `stuns:` ICE server URL whose host is an IP address is taken by the
+  configuration**
+  (`conf/w3c-4-stuns-url-with-ip-address-is-accepted-at-configuration`; audit rows
+  WEBRTC-4.4.1.5-24, RFC8489-8.1-1). The constructor and `set_configuration` threw `ErrHost`
+  for it, although W3C webrtc-pc "validate an ICE server URL" has no condition that refuses it.
+  RFC 8489 section 8.1 ("A 'stuns' URI containing an IP address MUST be rejected") is now met
+  where the URI would be used: the engine's server-reflexive gathering sends it nothing, reports
+  it once with an `icecandidateerror` of code 701 and no local address, and completes. The code
+  701 is our choice (W3C 4.8.3 names no code for a server the client rejects without asking it).
+  Not done: an `icecandidateerror` for a server the engine cannot reach. `turns:` with an IP
+  address is taken as before (RFC 5928 section 3 step 1). `rtci-ice` `Url::parse_url` keeps the
+  RFC 8489 rule; the peer connection reads its servers with `Url::parse_url_lenient`.
+- **The pull-request bench gate also fails a bench whose trees are separated**
+  (`conf/bench-2-gate-floor`; CI only, no engine change). The rule "slower in every round by more
+  than 20 % and by more than 25 ns" let `Interceptor/Pacer/write+poll` pass at ×1.07 to ×1.30 for
+  twelve rounds of train 36 (`conf/pacer-3-held-streams-purged`), because whether 25 ns was
+  reached depended on how fast the runner was; it failed once, on a fast runner, on the next
+  branch. `scripts/bench-compare.py` now also calls a bench slower when, over at least four
+  rounds of each tree, the head's fastest round is slower than the base's slowest by more than
+  5 % and 3 ns: the noise band is the base's own spread in the same job, whatever the runner's
+  speed. `scripts/bench-compare.sh` runs a bench that is separated after the usual two rounds
+  alone for four more alternating rounds (`BENCH_CONFIRM_ROUNDS`) before the verdict. The first
+  rule is unchanged.
+  Performance: bench-2
+
+### Added
+
+- **The default interceptor set can be given a start, a floor and a ceiling for its
+  congestion controller** (`conf/ccstart-1-start-bitrate-option`; RFC 8836 section 2,
+  requirement 4a, "history-based startup"). New `DefaultInterceptorOptions` fields
+  `congestion_start_bitrate`, `congestion_min_bitrate`, `congestion_max_bitrate` (bits per
+  second; defaults unchanged: `GCC_INITIAL_BITRATE` 300 kbit/s, `GCC_MIN_BITRATE` 100 kbit/s,
+  `GCC_MAX_BITRATE` 100 Mbit/s). Not breaking: the struct is `#[non_exhaustive]`. The start
+  seeds the controller of every transport (`Gcc::new(start, min, max)`; it was
+  `Gcc::default()`), the remote-limit interceptor and the pacer, so the first target
+  (`CongestionControlHandle::target_bitrate`), the pacer's first budget and the start-up
+  probes (three and six times the start) all follow it. Before, the only way to start higher
+  was `set_min_bitrate`, which also floored the whole call, or replacing the slots by hand.
+  `register_default_interceptors_with_options` refuses values that are not finite, a negative
+  floor, a start of zero or `min <= start <= max` broken, with `Error::InvalidBitrate`
+  (libwebrtc's `SetBitrate` checks the same). Neither RFC 8836 nor draft-ietf-rmcat-gcc-02
+  names a start value; libwebrtc's defaults are 30 kbit/s / 300 kbit/s / 2 Mbit/s
+  (`pc/peer_connection_factory.cc` at a222406d): the start is the same, the floor and ceiling
+  stay the engine's in every profile (docs/behaviour-profiles.md, class `Input`). Audit row
+  RFC8836-2-4a.
+- **`CongestionControlHandle::has_feedback()` and `feedback_reports()`**
+  (`conf/ccfeedback-1-feedback-seen`). Not breaking: new methods. Before the first feedback
+  `target_bitrate()` is the estimator's start value (300 kbit/s by default), and nothing on
+  the handle said so: `stats().delay_based_bitrate` and `loss_based_bitrate` are `Some` from
+  the start (both halves start at the start value). `has_feedback()` is `true` from the first
+  batch the estimator was given: per-packet congestion control feedback (transport-wide or RFC
+  8888) that reported packets this controller sent, or, while there is none, a receiver report
+  block's loss (draft-ietf-rmcat-gcc-02 section 7); `feedback_reports()` counts them (a path
+  change does not reset it). Verified and documented on `stats()`: with `Gcc`, `packet_loss`
+  is `None` until a batch or a receiver report's loss was folded in, `round_trip_time` until
+  one implied a round-trip time.
+- **`SettingEngineBuilder::with_answer_offered_formats_only`, on in the `Chrome` profile: an
+  answer lists only the formats the offer has** (`conf/jsep-88-answer-lists-offered-formats-only`;
+  RFC 9429 section 5.3.1, RFC 3264 section 6.1). By default an answer to a section without codec
+  preferences lists the offered formats this endpoint supports, in the offer's order, and then
+  every other media format registered for the kind (RFC 9429 5.3.1: "Any currently available
+  media formats that are not present in the current remote description MUST be added after all
+  existing formats"), and it receives on them (0.2.1). With the setting the answer is the
+  intersection, in the offer's order, each RTX / RED / FEC format only with the primary it
+  repairs, as libwebrtc answers (`pc/codec_vendor.cc::NegotiateCodecs` @ a222406d) and as the
+  same RFC 9429 5.3.1 rule list allows: "MAY include formats that are locally supported but not
+  present in the offer". Codec preferences that name a format the offer lacks add none either
+  with the setting. Asked for by a consumer running the web-platform-tests:
+  `webrtc/protocol/h265-level-id.https.html`, "Offer to send H265, answer to receive
+  level-id=30 results in level-id=30", which an engine answer with the added formats failed
+  ("expected 1 but got 14"). The default is unchanged (pinned answers unchanged). Engine
+  behaviour change NO by default; API addition only. Tests:
+  `tests/jsep_answer_offered_formats_only.rs` (both values, the profiles, the WPT scenario).
+- **`RTCRtpSender::rewritten_payload_type_rtp_packets()`** and
+  **`RTCRtpSender::rewritten_from_another_codec_rtp_packets()`**, with their connection sums
+  `RTCPeerConnection::rewritten_payload_type_rtp_packets()` and
+  `RTCPeerConnection::rewritten_from_another_codec_rtp_packets()`
+  (`conf/sender-1-rewritten-payload-type-counter`). `write_rtp` rewrites a payload type that is
+  not negotiated for the sender to the one negotiated for its encoding's codec, and only the
+  number: the payload is not touched (the engine has no encoder). The first counter counts every
+  packet sent with a rewritten payload type, the legitimate case included (the application kept
+  its own offer's number for a codec the answer numbered otherwise, RFC 3264 section 5.1); the
+  second the ones whose written number names a different format of the sender's kind, among the
+  registered and negotiated formats (VP8 written with its offered number after the answer
+  negotiated H.264 only): their bytes went out labelled as a codec they are not in (RFC 3264
+  section 7, the offerer "MUST send using a media format listed in the answer"). An application
+  whose encoder follows the sender's negotiated codec keeps the second at 0, and its tests can
+  assert it. Codecs are compared by MIME type; a number that names no format counts in the first
+  only; packets refused or dropped are not counted. Not W3C members: webrtc-stats has none. The
+  `write_rtp` and `get_parameters` rustdoc and the README say what the application must do after
+  applying an answer: re-read the sender's negotiated codec and encode that one. Test
+  `tests/rewritten_payload_type_counter_rtc2rtc.rs`. Engine behaviour change no (the rewrite is
+  unchanged); API addition only.
+- `rtci-interceptor`: `StreamsNotSending` (the local streams whose negotiated direction does
+  not send, written into the chain by the peer connection at each answer) and
+  `PacerInterceptor::not_sending_dropped` (`conf/pacer-3-held-streams-purged`).
+- **`SettingEngineBuilder::with_rejected_rids_kept_in_offers`: later offers keep the simulcast
+  streams a remote answer rejected** (`conf/jsep-93-rfc-form-rids-in-later-offers`; RFC 9429
+  section 5.2.2: "the "a=rid" lines MUST stay the same", "any "a=simulcast" line MUST stay the
+  same"). The default is unchanged and is the W3C webrtc-pc form ("remove the dictionaries that
+  correspond to the missing layers from transceiver.[[Sender]].[[SendEncodings]]"; createOffer
+  writes an a=rid line "for each encoding given in [[SendEncodings]]"): the next offer lists only
+  the streams the answer kept. With `true` the sender still sends only those (RFC 8853 section
+  5.3.3) and `get_parameters` lists only those, but each later offer writes the rejected
+  streams' a=rid lines as first offered and lists them in a=simulcast in their first place;
+  a rejected stream counts as paused, so it is written `~rid` only where the engine writes pause
+  marks (`with_rid_pause_marks`, or RFC 7728 pause negotiated). A later answer that accepts it
+  again gives the sender its encoding back, in its place, and it is sent (RFC 8853 section
+  5.3.4). Streams a local answer leaves out are not kept. Profile row
+  `jsep.rejected-rids-kept-in-offers`: `Rfc` off, `StrictRfc` on, `Chrome` on (libwebrtc's
+  `UpdateSimulcastLayerStatusInSender` / `DisableEncodingLayers` keep a rejected layer inactive
+  and re-offer it `~rid`). Audit rows RFC9429-5.2.2-15 / 5.2.2-16 `partial` -> `conflict`; open
+  MUST rows class C -> E. Engine behaviour change NO for the default profile, YES under the
+  `StrictRfc` and `Chrome` profiles (and the `chrome-defaults` feature): their later offers keep
+  the rejected streams; API addition only. Tests
+  `tests/jsep_rejected_rids.rs` (both values, an answer without simulcast, re-acceptance).
+- **`RTCPeerConnection::rotate_ice_servers(now, ice_servers)`** (fork convenience): new STUN /
+  TURN servers now (`set_configuration` + an ICE restart, W3C "set the configuration" and RFC
+  9429 section 4.1.18), for rotating TURN credentials on a long session without a new
+  connection: one offer / answer round; the DTLS association and the data channels stay; the
+  allocation in use relays until the restart has its pair and is then deleted
+  (`OnTurnAllocationReleased` names the local address now free). A host candidate the
+  application adds on a second UDP socket before applying the restart offer gives the new
+  allocation its own 5-tuple (RFC 8656 section 2.2) and no gap; with one socket the old one is
+  released first and `OnTurnAllocationReplacedInPlace { url, local_address }` says so. Tested
+  end to end against an in-memory server that checks REST username expiry on every request.
+  turn-7.
+- **`rtci_turn::rest::rest_username_expiry(username, separator)`**: when a TURN REST API
+  username (draft-uberti-behave-turn-rest-00, coturn `use-auth-secret`) expires; a pure helper
+  the engine never uses. turn-7.
+- **`OnTurnRequestRejected` for every finally refused TURN request** of the engine's links
+  (Allocate with any code, Refresh, CreatePermission, ChannelBind): the warning an application
+  gets when, say, a REST credential has expired. turn-7.
+- **`SettingEngineBuilder::with_turn_reallocation_delay(Duration)`**: how long after a release of
+  an engine TURN allocation over UDP has ended the engine waits before allocating on the same
+  5-tuple again. Zero by default (RFC 8656 section 8.2: the server deletes the allocation when it
+  answers). coturn answers a Refresh of LIFETIME 0 but keeps the allocation one second more
+  (`refresh_relay_connection` floors the lifetime at 1 s) and answers an Allocate meanwhile with
+  437; 2 s covers it. Observed live by a consumer (2026-11-27, production coturn, two
+  back-to-back restarts): an Allocate about 140 ms after a confirmed release got 437, one 3.0 s
+  later succeeded, both times. A behaviour-profile "application input" row. turn-9.
+- **Where a key-frame request came from** (`conf/kfr-1-key-frame-request-origin`; a fork
+  addition, webrtc-encoded-transform 6.4 `keyframerequest` has no origin). Not breaking: new
+  event variant (the enum is `#[non_exhaustive]`), new types. `OnKeyFrameRequest { sender, rid
+  }` is raised for a remote Picture Loss Indication or Full Intra Request and also for the
+  engine's own requests (a PLI with sender SSRC 0: the pacer's discard, the pacer's flush,
+  including the video streams that had nothing queued and so get no `OnPacerDiscard`, and the
+  NACK responder's give-up), and an application could not tell them apart.
+  `RTCPeerConnectionEvent::OnKeyFrameRequestOrigin(RTCKeyFrameRequestEvent { sender, rid, origin
+  })` now follows every `OnKeyFrameRequest`, with `RTCKeyFrameRequestOrigin::
+  RemotePictureLossIndication`, `RemoteFullIntraRequest` or `Local(LocalKeyFrameRequest)`
+  (`PacerDiscard`, `PacerFlush`, `RepairGivenUp`; `is_remote()`). The origin is carried from
+  where the request is made: the pacer and the NACK responder attach
+  `rtci_interceptor::LocalKeyFrameRequest` (`Attribute::Custom`) to the PLIs they put on the
+  read leg, and a request without it is the remote peer's, whatever its sender SSRC (an SSRC is
+  any 32-bit number, RFC 3550 section 8.1, so 0 is not proof of a local request). At a flush,
+  the requests of the streams whose media was discarded say `PacerFlush` too. SLI and RPSI are
+  still delivered as `RTCMessage::RtcpPacket` only and raise neither event. FORK.md row; audit
+  row ENCTRANS-6.4-1 note.
+  - **Planned for 0.3.0 (breaking):** the two events become one. A field cannot be added to
+    the struct variant `OnKeyFrameRequest { sender, rid }` within 0.2.x: a pattern that names
+    its fields without `..` (as `rtci-video`'s and this repository's tests do) or a literal
+    that builds it would stop compiling. 0.3.0 is to make it `OnKeyFrameRequest(
+    RTCKeyFrameRequestEvent)` (the struct is `#[non_exhaustive]`, so later fields are not
+    breaking) and drop `OnKeyFrameRequestOrigin`. Until then, read the origin from
+    `OnKeyFrameRequestOrigin` and ignore `OnKeyFrameRequest`, or keep using `OnKeyFrameRequest`
+    alone as before.
+- **Each spatial layer of an SVC picture is its own SFrame ciphertext** (RFC 9605 section
+  6.1.3: "the sender MUST encapsulate each layer in a different SFrame ciphertext";
+  `conf/sframe-2-svc-layer-per-ciphertext`; API additions only, nothing changes for an
+  application that declares no scalability mode). `RTCRtpSFrameEncryptor::set_scalability(codec,
+  mode)` declares the stream; with a mode of more than one spatial layer (VP9, AV1) `transform`
+  refuses an access unit that holds several layers (TypeError), `transform_access_unit` splits a
+  VP9 superframe or an AV1 temporal unit into its layers and encrypts each on its own
+  (`RTCSFrameLayer`), and `transform_layer_frame` encrypts one layer frame checked against its
+  Dependency Descriptor template. A receiver rebuilds the decoder's access unit from the layers it
+  was forwarded with `sframe_transform::join_layer_frames`. New in rtci-rtp:
+  `codec::vp9::split_superframe` / `join_superframe` (VP9 bitstream specification Annex B) and
+  `codec::av1::split_temporal_unit` (`Av1LayerData`) and `codec::av1::repeat_sequence_header_per_layer`
+  (for an AV1 "S" mode `transform_access_unit` puts a key picture's sequence header in front of
+  every layer, AV1 RTP section 6.1, so a forwarder can keep any one layer). Temporal layers need
+  no split: a temporal layer is a whole picture. Tests, rtc to rtc
+  (`tests/encoded_frame_metadata_rtc2rtc.rs::a_forwarder_drops_spatial_layer_1_of_sframe_encrypted_{vp9,av1}_{l2t1,l2t3}`):
+  a forwarder with no key drops spatial layer 1 by the Dependency Descriptor and the receiver
+  decrypts exactly the layer-0 access unit of every picture. RFC9605-6.1.3-1 `tested` (was
+  `missing`, open-must class D).
+- **Where a key-frame request came from** (`conf/kfr-1-key-frame-request-origin`; a fork
+  addition, webrtc-encoded-transform 6.4 `keyframerequest` has no origin). Not breaking: new
+  event variant (the enum is `#[non_exhaustive]`), new types. `OnKeyFrameRequest { sender, rid
+  }` is raised for a remote Picture Loss Indication or Full Intra Request and also for the
+  engine's own requests (a PLI with sender SSRC 0: the pacer's discard, the pacer's flush,
+  including the video streams that had nothing queued and so get no `OnPacerDiscard`, and the
+  NACK responder's give-up), and an application could not tell them apart.
+  `RTCPeerConnectionEvent::OnKeyFrameRequestOrigin(RTCKeyFrameRequestEvent { sender, rid, origin
+  })` now follows every `OnKeyFrameRequest`, with `RTCKeyFrameRequestOrigin::
+  RemotePictureLossIndication`, `RemoteFullIntraRequest` or `Local(LocalKeyFrameRequest)`
+  (`PacerDiscard`, `PacerFlush`, `RepairGivenUp`; `is_remote()`). The origin is carried from
+  where the request is made: the pacer and the NACK responder attach
+  `rtci_interceptor::LocalKeyFrameRequest` (`Attribute::Custom`) to the PLIs they put on the
+  read leg, and a request without it is the remote peer's, whatever its sender SSRC (an SSRC is
+  any 32-bit number, RFC 3550 section 8.1, so 0 is not proof of a local request). At a flush,
+  the requests of the streams whose media was discarded say `PacerFlush` too. SLI and RPSI are
+  still delivered as `RTCMessage::RtcpPacket` only and raise neither event. FORK.md row; audit
+  row ENCTRANS-6.4-1 note.
+  - **Planned for 0.3.0 (breaking):** the two events become one. A field cannot be added to
+    the struct variant `OnKeyFrameRequest { sender, rid }` within 0.2.x: a pattern that names
+    its fields without `..` (as `rtci-video`'s and this repository's tests do) or a literal
+    that builds it would stop compiling. 0.3.0 is to make it `OnKeyFrameRequest(
+    RTCKeyFrameRequestEvent)` (the struct is `#[non_exhaustive]`, so later fields are not
+    breaking) and drop `OnKeyFrameRequestOrigin`. Until then, read the origin from
+    `OnKeyFrameRequestOrigin` and ignore `OnKeyFrameRequest`, or keep using `OnKeyFrameRequest`
+    alone as before.
+
+### Fixed
+
+- **`rtci_mdns::MulticastSocket::with_interface` sends by that interface**
+  (`conf/ci-3-mdns-tests-do-not-depend-on-host-multicast`; RFC 6762 section 14). The socket
+  joined the group on the interface given but sent by the system's route for 224.0.0.251. On
+  Windows that route comes from the destination cache, and a process that sent to the group
+  from 127.0.0.1 leaves it on loopback after it has exited: every later datagram of such a
+  socket, on that host, left by loopback with source 127.0.0.1, and a peer that resolves a
+  `.local` name to the answer's source (or refuses an address record from another address)
+  got loopback or nothing (agent-test run 46049306566). It now sets `IP_MULTICAST_IF` to the
+  interface it joined on. **Limit:** `MulticastSocket::new()` without an interface was
+  unchanged and still sent by the system's route, so on such a Windows host it still sent
+  from 127.0.0.1 and failed silently; lifted on Windows by `conf/mdns-4-windows-poisoned-route-and-loopback-default`
+  (Behaviour changes: it now sends by the default route's interface there). Test
+  `rtci-mdns/tests/multicast_interface.rs`, run on a Windows host put in that state by
+  `scripts/windows-poisoned-mdns-route.sh` (which also runs the interop and driver mDNS tests
+  there and deletes the entry again from an EXIT trap): a new step of `cargo.yml`'s platform
+  job, on GitHub-hosted Windows only, since it changes host state and needs an administrator
+  shell. Without the fix the test fails on such a host (agent-test run 46051047569: the
+  datagram never reached a receiver joined on the network interface); with it, "sent by
+  10.1.0.100, received from 10.1.0.100" and the four interop tests pass (run 46051053795).
+- **ICE: consent lost after completion fails the transport as the PAC timer expires, not 30 s
+  later** (`conf/ice-35-driver-consent-failure-time`, after
+  `conf/ice-32-failed-needs-end-of-candidates`; RFC 8445 section 8.1.2: once a pair is
+  nominated "the ICE agent MUST remove all candidate pairs for the same component from the
+  checklist"; 8.1.1: "the agent MUST NOT nominate another pair for same component of the data
+  stream within the ICE session. Doing so requires an ICE restart"; W3C webrtc-pc 5.6.4
+  "completed": "If consent checks [RFC7675] subsequently fail on all successful candidate
+  pairs, the state transitions to failed"). The nomination left the pairs it had not checked
+  (a TCP pair, say) Frozen or Waiting in the list; when consent on the selected pair expired
+  inside the PAC timer, ice-32's "checking if there are candidate pairs remaining to be
+  checked" counted them, so the agent went back to "checking", checked them, and failed only
+  by a second checking timeout: 60 s after the path went dark instead of at the PAC timer's
+  expiry (39.5 s after the checks began), on both sides of the stream driver's
+  `virtual_time.rs::consent_expiry_after_30_seconds_elapses_on_virtual_time_and_the_driver_reports_the_failure`
+  (trace: agent-test run 46063540403). The pairs still to be checked when a pair is nominated
+  are now taken out of the checklist as section 8.1.2 says: their state is Failed, as for a
+  pair the application removes, so that nothing that reads pair states can take them for
+  pairs still to come. No ordinary check is started on them for the rest of the ICE session,
+  they are not left to check when consent is lost (the agent is "disconnected" and then
+  "failed" as the PAC timer expires), they are not checks in progress for the checking timeout,
+  and they count as failed for the checklist's failure. That last part matters to a pair formed
+  after consent was lost before the peer's end-of-candidates: its failed check now ends in
+  "disconnected" by the checking timeout (30 s after the new checks), and in "failed" at the
+  end-of-candidates; a first form of this fix (a flag only the check scheduler and the consent
+  path read) left the agent "checking" there for good. They stay listed (their statistics say
+  `failed`: a behaviour change for `getStats`, which showed them `waiting` or `frozen`), a
+  request from the peer on one is still answered and triggers a check (section 8.1.2, third
+  bullet; 7.3.1.4 for a Failed pair), pairs formed later are checked as before, and an ICE
+  restart replaces them all. Tests `agent_checklist_test.rs::consent_lost_after_completion_does_not_check_the_pairs_the_nomination_retired`
+  and `agent_checklist_test.rs::a_pair_formed_after_consent_loss_fails_and_the_retired_pairs_do_not_hold_the_failure`
+  (both roles); `test_controlling_agent_nominates_once_and_the_checklist_completes` now
+  expects the pairs left unchecked Failed (nothing sent to them after the nomination, as
+  before). Audit: RFC8445-8.1.2-1 (note).
+- **A lite agent with no pair is not failed by its empty checklist**
+  (`conf/ice-34-lite-agents-and-failed-after-end-of-candidates`; RFC 8445 section 6.2: "Lite
+  implementations skip most of the steps in Section 6 except for verifying the peer's ICE
+  support and determining its role"). A lite description carries no `a=ice-options:trickle`, so
+  since ice-32 a lite peer's description is itself the indication that no candidate is to come;
+  with its own gathering complete, a lite agent with no pair yet then failed the (empty)
+  checklist at its first look, although its pair was still to come: the TCP candidate a lite
+  peer trickles once its listener is bound (two lite agents over TCP,
+  `two_lite_agents_connect_over_tcp_from_an_active_candidate_in_the_offer`, red on train 36
+  round 10, run 46038516696), or a full peer's check (RFC 8838 Appendix B). The checklist rule
+  (section 6.1.2.1) is a full agent's and is no longer applied to a lite agent; its checking
+  timeout still fails it, with the indications that no candidate is to come.
+- **A remote answer that names a rid the offer did not offer is applied, not refused**
+  (`conf/jsep-87-reanswer-altering-rids`; RFC 8851 section 6.4 step 1: "If no matching line
+  can be located in the offer, the "a=rid" line is ignored"). Once a sender had sent simulcast,
+  the W3C rid-renegotiation check (webrtc-pc 4.4.1.6, "If the description attempted to
+  renegotiate RIDs ... InvalidAccessError") also refused a remote answer whose
+  `a=simulcast:recv` named a rid outside the sender's encodings: after an answer of
+  `recv 1;2` to an offer of `send 0;1;2`, a reanswer of `recv 0;2` to the re-offer of
+  `send 1;2` failed with InvalidAccessError (WPT `webrtc/simulcast/rid-manipulation.html`,
+  "Remote reanswer altering rids does not throw an exception"). The check now applies to
+  remote offers only; in an answer the unoffered rid is ignored and the sender keeps the
+  answered rids it offered (here 2; W3C "remove the dictionaries that correspond to the missing
+  layers"). Test `jsep_simulcast.rs::a_reanswer_naming_a_rid_outside_the_offer_ignores_it`;
+  audit rows WEBRTC-4.4.1.4-10 and RFC8851-6.4-1 (stay `tested`, the violation recorded in
+  their notes).
+- **A transceiver a remote offer to receive simulcast creates sends the offered streams**
+  (`conf/jsep-86-simulcast-answer-for-multiple-send-encodings`; W3C webrtc-pc "set the
+  RTCSessionDescription": "If no suitable transceiver was found ... Create an RTCRtpSender,
+  sender, from the media description using proposedSendEncodings"). The sender of such a
+  transceiver, and of a found one that had no encodings yet, was left without encodings, so
+  after `set_direction(Sendonly)` the answer sent one stream with no `a=rid` and no
+  `a=simulcast` (WPT `webrtc/protocol/simulcast-answer.html`, "createAnswer() with multiple
+  send encodings should create simulcast answer"). Such a sender now takes one encoding per
+  offered rid, as a sender with one rid-less encoding already did, and the answer writes
+  `a=rid:<rid> send` for each and `a=simulcast:send foo;bar;baz` (RFC 8853 section 5.3.2). Tests
+  `jsep_simulcast.rs::a_transceiver_a_simulcast_offer_creates_sends_the_offered_streams`,
+  `an_offered_pause_mark_leaves_the_proposed_encoding_active`,
+  `encodings_made_inactive_leave_the_next_offer_alone`; audit row WEBRTC-4.4.1.4-55
+  (stays `tested`, the violation recorded in its note).
+- **A track added or replaced in after a remote offer to receive simulcast keeps the offered
+  streams** (`conf/jsep-89-track-added-keeps-proposed-encodings`; W3C webrtc-pc `addTrack`,
+  reusing a sender: "Set sender.[[SenderTrack]] to track", nothing else of the sender;
+  `replaceTrack` likewise sets only [[SenderTrack]]). `add_track` or `replace_track` on the
+  sender of a transceiver that such an offer created or promoted, before the answer, replaced
+  the proposed encodings with the track's one, so the answer sent one stream without `a=rid` or
+  `a=simulcast`. The proposed encodings now stay; the first takes the track's SSRCs and every
+  one its codec, as when the track was added before the offer. A track that carries rid
+  encodings of its own (the engine's way to give simulcast layers) is still sent with them.
+  Behaviour change on rollback: the sender of a transceiver the offer created keeps the
+  proposed encodings when that offer is rolled back after `add_track` (W3C "create an
+  RTCRtpSender": [[LastStableRidlessSendEncodings]] "initialized to null"; the rollback restores
+  it only when it is not null). WPT `webrtc/simulcast/negotiation-encodings.https.html`
+  ("sRD(simulcast offer), addTrack, then rollback brings us back to having a single encoding",
+  written for w3c/webrtc-pc#2764, fixed by PR #2797) expects one rid-less encoding there, which
+  the merged text does not give that sender; Chrome 158 and Safari 27.2 fail the subtest with
+  `["foo", "bar"]` (the text's form), Firefox 161 passes (wpt.fyi). 0.2.1 passed it only because
+  `add_track` dropped the proposed encodings. New setting
+  `SettingEngineBuilder::with_rollback_resets_offer_created_senders(true)` gives the WPT form
+  (the track's one encoding); off in every profile, as Chrome. Tests
+  `jsep_simulcast.rs::a_track_added_after_a_simulcast_offer_keeps_the_proposed_encodings`,
+  `a_track_replaced_in_after_a_simulcast_offer_keeps_the_proposed_encodings`,
+  `a_rollback_keeps_the_proposed_encodings_of_a_transceiver_the_offer_created`,
+  `a_rollback_can_return_an_offer_created_sender_to_one_encoding`; audit rows
+  WEBRTC-5.1-8, WEBRTC-5.2-34 (violations recorded, stay `tested`), WEBRTC-4.4.1.4-75.
+- **A payload type number keeps the format it was first given for the whole session**
+  (`conf/jsep-90-answer-added-format-keeps-payload-type-meaning`; RFC 3264 section 8.3.2: "the
+  mapping from a particular dynamic payload type number to a particular codec within that media
+  stream MUST NOT change for the duration of a session"; RFC 9143 section 9.1.1; W3C webrtc-pc
+  `setCodecPreferences`: a removed codec's "payload type is not to be reused in future offers or
+  answers"). MUST violation present in 0.2.0 and 0.2.1: a format this endpoint's answer added
+  beyond the offer (RFC 9429 5.3.1), and a format its later offer numbered afresh, took its
+  registered number whenever the current offer did not use it, also when an earlier description
+  of the session had given that number another format (offer 1 with H.264 on 98, offer 2
+  without it: the answer to offer 2 listed VP9 on 98; the same for a format never accepted).
+  The offer side broke the rule for a format the engine never accepted (an offer that gave 98
+  to an unknown format, then the engine's own offer listed VP9 on 98). The engine now remembers
+  every dynamic number each applied description (local or remote, bundle-only sections
+  included, rejected ones not) gave a codec, connection-wide, and gives none of them to another
+  codec (same encoding name, clock rate and channels, and for H.264 / H.265 / VP9 / AV1 the
+  same configuration; other parameters may change): such a format takes a number it had
+  before, or one no description used. Engine behaviour change YES (renegotiated answers and
+  offers may number added formats otherwise); API unchanged; first answers and initial offers
+  unchanged (pinned answers and offers unchanged). Tests `tests/jsep_payload_type_meaning.rs`.
+- **The offerer sends with the answer's most preferred format it can send, also one its codec
+  preferences left out of the offer** (`conf/jsep-91-offerer-sends-answers-preferred-format`;
+  RFC 9429 section 5.11, in steps that "MUST be performed": "choose the media format to send as
+  the most preferred media format from the remote description that is also locally supported";
+  RFC 3264 section 7: the offerer "SHOULD use the first media format listed in the answer";
+  W3C webrtc-pc "set a session description": [[SendCodecs]] are "the codecs that description
+  negotiates for sending and which the user agent is currently capable of sending"). Present
+  since 0.1.0: with codec preferences set, the formats of a remote answer were matched against
+  those preferences only, so the sender never used a format the answer led with or added beyond
+  the offer. Consumer-reported WPT failure: `webrtc/protocol/additional-codecs.html`, "Listing an
+  additional codec in the answer causes it to be sent" (VP8 offered, the answer leads with H.264
+  on 63; the engine sent VP8 whenever a dynamic number was free for the answer to add VP8 on: with the default codecs none is, which hid it; failing-first run 45990202513 with a minimal codec set). The receive side and later offers keep the preferences. Engine
+  behaviour change YES: after an answer, `RTCRtpSender::get_parameters().codecs` lists every
+  answered format this endpoint can send, and a codec-less encoding is sent with the answer's
+  first. Tests `tests/offerer_sends_answers_preferred_format.rs`,
+  `tests/additional_codec_sent_rtc2rtc.rs` (on the wire);
+  `tests/jsep_answer_unoffered_formats.rs` updated (an answer-added format is now among the
+  offerer's send codecs, the answer's first is the one sent); the unit test
+  `test_rtp_sender_replace_track_invalid_codec_change` now applies an answer in the browsers'
+  form (offered formats only), since a format an `rtci` answer adds is negotiated for sending.
+- **Media the pacer held for a stream that stops sending no longer leaves after the direction
+  takes effect** (`conf/pacer-3-held-streams-purged`; RFC 8866 sections 6.7.1 and 6.7.4: "No
+  media is sent over an inactive media stream"; RFC 3264 section 5.1; W3C webrtc-pc 4.4.1.6;
+  reported from code reading by a consumer, deno_webrtc, behind the WPT flake "unmuted when
+  setting direction to sendrecv after inactive"). The sender refused what the application
+  wrote once the answer made the stream `recvonly` or `inactive`, but the pacer had no notion
+  of it: the packets it had queued (and retransmissions, FEC and probe padding of the stream's
+  RTX) left over the next second, and the NACK responder still answered NACKs for the stream
+  and padded probes on its RTX. At each answer the peer connection now names those streams
+  (media, RTX and FEC SSRCs) to the chain: the pacer drops what it holds of them at that
+  instant (no key-frame request, no `PacerDiscard`) and every later packet of them; the NACK
+  responder forgets what it sent of them (nothing from before is sent again once they send
+  again), answers no NACK for them and pads no probe on them. RTCP goes on. Engine behaviour
+  change only for a stream whose direction stops it sending. Tests
+  `tests/direction_change_drops_queued_media_rtc2rtc.rs::queued_media_of_a_stream_that_stops_sending_does_not_leave`
+  (the default interceptors, the pacer among them), `rtci-interceptor/tests/streams_not_sending.rs`.
+- **ICE waits for the peer's checks before failing a checklist: the PAC timer of RFC 8863**
+  (`conf/ice-29-pac-timer`; RFC 8863 sections 4 and 5, updating RFC 8445 section 7.2.5.4 and
+  RFC 8838 section 8; reported from code reading by a consumer, deno_webrtc). A full agent
+  whose checklist was empty (the peer signalled no candidate, or none it could use) or whose
+  pairs had all failed at once failed the moment both sides had signalled end-of-candidates,
+  although the peer, which has our candidates, could still check us and form a peer-reflexive
+  pair (RFC 8445 section 7.3.1.3); the check then reached a failed agent. RFC 8863: "While the
+  timer is still running, the ICE agent MUST NOT update a checklist state from Running to
+  Failed, even if there are no pairs left in the checklist to check", and the session is not
+  failed either. The timer starts with the checks and lasts the transaction timeout (the
+  RECOMMENDED length: `Rc` requests and `Rm` RTOs, 39.5 s with the defaults; 8 s with one
+  request). **Behaviour change**: a session that never finds a pair fails at 39.5 s instead of
+  at once (nothing usable) or at 30 s (the checking timeout); a lite agent is unchanged. No API
+  change. Tests `agent_checklist_test.rs::an_empty_checklist_after_end_of_candidates_waits_for_the_peers_check_and_connects`,
+  `an_empty_checklist_that_no_check_fills_fails_when_the_pac_timer_expires`; the ice-27 tests
+  now expect the failures at the timer (`an_active_tcp_candidate_with_nothing_of_ours_to_dial_fails_the_empty_checklist_with_the_pac_timer`,
+  renamed from `..._at_once`).
+- **ICE consent is kept per 5-tuple, not per remote candidate** (`conf/ice-27-consent-per-5-tuple`;
+  RFC 7675 section 1, "Consent to send applies to a single 5-tuple", and section 5.1, "if a
+  valid STUN binding response has not been received from the remote peer's transport address
+  in 30 seconds, the endpoint MUST cease transmission on that 5-tuple"). The time of the last
+  consent response was kept on the remote candidate, so with two local candidates L1 and L2 and
+  one remote R, a response on (L2, R) (a check cancelled at the nomination and answered late,
+  or one the peer's requests trigger) renewed the consent of the selected (L1, R) although
+  nothing was answered on that 5-tuple, and a dead (L1, R) path was not detected. Each pair
+  now records its own last consent (`CandidatePair::last_consent`); the selected pair's expiry,
+  its Disconnected timer, the first consent check after a selection, the controlling agent's
+  nominating path and the path kept across an ICE restart read the pairs of the same 5-tuple
+  (same local base and remote candidate) only. `Candidate::last_consent` still reports the last
+  response from that remote candidate on any pair. Tests:
+  `rtci-ice/src/agent/agent_consent_delay_test.rs::test_a_late_response_on_another_pair_to_the_same_remote_does_not_renew_consent`,
+  `test_the_response_that_validated_another_pair_is_the_selected_pairs_consent` (a controlled
+  agent selects a valid pair with a peer-reflexive local candidate; the one response is on the
+  checked pair, the same 5-tuple).
+- **`get_capabilities(kind).header_extensions` lists the registered header extensions after a
+  negotiation too** (`conf/w3c-3-capabilities-list-registered-header-extensions`; W3C webrtc-pc
+  5.2 / 5.3: "the list of implemented header extensions for sending" / "for receiving", "the
+  most optimistic view"). From 0.1.0 a negotiation narrowed the list to the extensions the
+  answer accepted (an answer with MID alone left MID alone). Now the registered extensions of
+  the kind that the direction allows, once per URI, in registration order (before: by id).
+  Descriptions are not affected: later offers keep each extension's id (RFC 8285 section 6).
+  Test `tests/rtp_object_model.rs::get_capabilities_lists_the_registered_header_extensions_after_a_negotiation`.
+- **`RTCRtpSender::get_capabilities` / `RTCRtpReceiver::get_capabilities` list the implemented
+  formats after a negotiation too** (`conf/jsep-95-answers-list-offered-formats-by-default`; W3C
+  webrtc-pc 5.2 / 5.3: "the list of implemented send codecs", "the most optimistic view of the
+  codecs the user agent supports"). From 0.1.0 they returned the negotiated list once a kind was
+  negotiated, so a format left out of the last answer could no longer be found to put in codec
+  preferences; answers that added every registered format (up to 0.2.x) mostly hid it, and the
+  offered-only default made it visible
+  (`tests/early_media_rtc2rtc.rs::a_format_a_later_offer_adds_is_received_as_that_format_before_the_answer`
+  found no VP9). Test
+  `tests/rtp_object_model.rs::get_capabilities_is_the_same_after_a_negotiation_that_narrowed_the_formats`.
+- **`icecandidateerror` for the servers the engine gathers from itself** (W3C webrtc-pc 4.8.3):
+  a TURN Allocate refused with a code, a TURN or STUN server no address of which answered (701,
+  once per URL), a STUN error response. Nothing was raised before. turn-7.
+- `Error::dom_exception_name` names the errors it returned `None` for, as webrtc-pc does (audit
+  row WEBRTC-4.5.1-1 `partial` -> `tested`): `InvalidModificationError` for
+  `ErrModifyingCertificates`, `ErrModifyingBundlePolicy`, `ErrModifyingRTCPMuxPolicy`,
+  `ErrModifyingICECandidatePoolSize` (set the configuration) and `ErrSDPDoesNotMatchOffer` /
+  `ErrSDPDoesNotMatchAnswer` (setLocalDescription); `InvalidAccessError` for
+  `ErrCertificateExpired` and `ErrNoTurnCredentials`; `SyntaxError` for `ErrNoIceServerUrls`,
+  `ErrSchemeType`, `ErrInvalidUrl`, `ErrStunQuery`, `ErrInvalidQuery`, `ErrProtoType`;
+  `InvalidStateError` for `ErrNoRemoteDescription`; `OperationError` for
+  `ErrIceCandidateMediaSectionNotFound` and `ErrIceCandidateUsernameFragmentMismatch`
+  (addIceCandidate). Test `tests/jsep_w3c_errors.rs::every_refusal_of_the_configuration_and_the_candidates_has_its_w3c_name`.
+- **W3C "validate an ICE server URL": a TURN username or credential that is not an RFC 8265
+  OpaqueString is refused** (`conf/w3c-1-must-rows-sweep4`; webrtc-pc 4.4.1.5, "fail to conform
+  to [RFC8489] section 14.3 and [RFC8265] section 4.1 ... throw an InvalidAccessError"; audit
+  row WEBRTC-4.4.1.5-23). In 0.2.0 the credential was checked for control characters only, so
+  one with a default-ignorable code point (U+00AD SOFT HYPHEN, say) was taken and failed later,
+  when the TURN key was derived; the username was checked for its length only. Both now go
+  through `stun::opaque::opaque_string`: `set_configuration` and the constructor refuse them with
+  `Error::InvalidAccessError`. A host or port of an ICE server url that does not parse is now
+  `Error::ErrInvalidUrl` (W3C SyntaxError, "hostAndPortURL is failure") instead of `Error::Url`.
+- **Behaviour change (0.3.0): `RTCRtpSender::replace_track` refuses a track the sender cannot
+  send within its negotiated envelope** (`conf/w3c-2-replace-track-envelope`; webrtc-pc
+  replaceTrack, "determine if withTrack can be sent immediately by the sender without violating
+  the sender's already-negotiated envelope, and if it cannot ... InvalidModificationError"; audit
+  row WEBRTC-5.2-33 `missing` -> `tested`). While the transceiver is sending (currentDirection
+  sendrecv or sendonly), a track any of whose codings names a codec that matches none of the
+  sender's negotiated codecs by mime type, clock rate and channel count fails with
+  `Error::InvalidModificationError`, and the sender keeps its track. In 0.2.0 such a track was
+  taken and its packets were relabelled with a negotiated codec's payload type (a VP9 stream
+  sent as VP8). A track whose codings name no codec, and any replacement before negotiation, are
+  taken as before. Tests `rtp_sender_test.rs::test_rtp_sender_replace_track_invalid_codec_change`
+  (it asserted the relabelling before), `test_rtp_sender_replace_track_with_another_channel_count_is_refused`,
+  `test_rtp_sender_replace_track_before_negotiation_takes_any_codec`.
+- **`rtci` builds without a built-in crypto provider** (`conf/crypto-9-rtci-builds-without-a-built-in-provider`).
+  docs/crypto-provider-migration.md lists `--no-default-features` as "no built-in provider;
+  supply your own", but the crate did not compile that way: `RTCCertificate::from_key_pair`
+  takes an `rcgen::KeyPair`, which exists only with an rcgen crypto backend (turned on only by
+  `crypto-ring` / `crypto-aws-lc-rs`). It is now compiled only with a built-in provider (it
+  imported the key through the built-in default anyway); the default build is unchanged.
+  Without a provider, certificates come from the application's provider (`generate`,
+  `generate_certificate`, `generate_from_signing_key`, `from_pkcs8`, `from_signing_key`).
+  `tests/no_builtin_crypto_provider.rs`, which had run 0 tests in every job (and no longer
+  compiled: `build()` takes the time since), now runs in the job "rtci-crypto (no built-in,
+  custom provider)"; its row in docs/test-exclusions.md is gone. The other provider crates
+  (rtci-crypto, -dtls, -ice, -srtp, -stun, -turn, -sframe) already built their library without
+  defaults.
+- `rtci-interceptor` (`conf/pacer-4-write-path-not-slower`): the pacer's write path no longer
+  pays for `StreamsNotSending`. The code that drops the held packets of a stream that stops
+  sending ran once per applied answer but was inlined into `handle_write`, which doubled that
+  function (536 → 1144 bytes of stack frame on x86-64) and made `Interceptor/Pacer/write+poll`
+  1.07 to 1.30 times slower than master on the pull-request bench job from the round it joined
+  the train; it is out of line and cold now, and the notice's SSRCs are no longer copied. The
+  search for the notice moved from `handle_write` into `enqueue`, which reports whether it
+  applied one: a borrow of the packet before it moved into `enqueue` made the compiled code copy
+  every packet written (224 bytes on x86-64). No change of behaviour.
+  Performance: pacer-4
+- **A completed DTLS 1.2 association answers the peer's repeated last flight for 240 s, not
+  seven times** (`conf/dtls-32-final-flight-answered-for-2-msl`; RFC 6347 section 4.2.4: "for at
+  least twice the default MSL defined for [TCP], when in the FINISHED state, the node that
+  transmits the last flight [...] MUST respond to a retransmit of the peer's last flight with a
+  retransmit of the last flight"). An authenticated repeat of the peer's Finished was answered
+  at most `DEFAULT_MAXIMUM_RETRANSMIT_NUMBER` (7) times and then never, however soon it came,
+  so a peer whose eighth retransmission came within the four minutes could be left without the
+  flight it needed. Each repeat is now answered, once, for 240 s after the handshake, and none
+  after (the same 240 s DTLS 1.3 keeps its handshake keys for, RFC 9147 section 5.8.1, whose
+  server answers each repeat with an ACK, now shown by a test). The bound against
+  amplification stays one answer per datagram carrying an authenticated repeat, which the
+  replay window admits once; plaintext handshake records draw none. Audit rows
+  RFC6347-4.2.4-5 `partial` -> `tested`, RFC9147-5.8.1-2 `untested` -> `tested`. Test
+  `endpoint.rs::authenticated_finished_repeats_are_answered_for_twice_the_msl` (it replaces
+  `authenticated_finished_repeats_still_obey_the_retry_budget`, which asserted the cut-off) and
+  `reliability_test.rs::the_clients_last_flight_is_acknowledged_for_twice_the_msl`. Behaviour
+  change, not breaking.
+
+### Known limits
+
+- **What RFC 7714 section 13.1 is not shown to hold for** (docs/key-erasure.md; the audit row
+  stays `partial`):
+  - **The AWS-LC provider's packet path** (`crypto-aws-lc-rs`, not the default): AWS-LC
+    computes each HMAC on a copy of the keyed context in a stack frame of its own and its
+    AES-GCM leaves a GHASH table entry in one, so every protected or unprotected packet leaves
+    the SRTP / SRTCP HMAC-SHA1 states (AES-CM and NULL profiles) or a form of the GCM key in
+    dead stack frames: 78 key forms over the profiles, in unoptimised and optimised builds.
+    The engine does not overwrite the stack after every packet. Building and tearing down
+    leave nothing with it. The limit as a test:
+    `known_limit_with_aws_lc_the_packet_path_leaves_keys_in_dead_stack_frames` (ignored).
+  - **Unoptimised builds**: the compiler stores every intermediate value of the AES and SHA-1
+    routines in a stack slot, round keys and hash states included, whatever the source does.
+    The packet path is measured, not asserted, in an unoptimised build, and what it leaves
+    depends on the compiler: the round keys of the AES-CTR key a packet uses, over the ten
+    profiles with and without a key derivation rate, x86-64 Linux: rustc 1.89 (the workspace's
+    `rust-version`) 72 key forms (the header-extension key), rustc 1.99.1 84 (the SRTP
+    encryption key with AES-CM too), rustc 1.100 none, nor on AArch64 macOS (runs 45983045311,
+    45983054507). In an optimised build it leaves none with any of the three compilers.
+    Building and tearing down are asserted in every build.
+  - **CPU registers, and what saves them**: a provider's AES leaves round keys in vector
+    registers when it returns, and anything that later stores the registers on a stack puts
+    them there: a signal frame, or the lazy set-up of a thread-local on Apple systems (seen
+    once: an AES-GCM round key of the ring provider, when a thread-local was first used right
+    after a packet). The engine's own packet path uses no thread-local; an application's code
+    and signal handlers are its own.
+  - **Windows, and architectures other than x86-64 and AArch64**: the same code runs, and the
+    heap searches run on Windows, but the stack measurement needs a thread on a stack of the
+    test's own (`pthread_attr_setstack`), so nothing is measured there.
+  - **Deeper than the overwrite**: `on_erased_stack` overwrites 32 KiB (optimised build) or
+    128 KiB (unoptimised). The built-in providers use about 3 KiB to build a context in an
+    optimised build and up to 47 KiB in an unoptimised one; a build profile with opt-level 0
+    and `debug-assertions = false` gets the optimised depth; a provider supplied by the
+    application that goes deeper leaves what lies below.
+- **What the DTLS work is not shown to hold for** (docs/key-erasure.md):
+  - **The record path**: ring's ChaCha20-Poly1305 copies the key to the stack for every record
+    (8 to 10 key forms over the scenarios, optimised); AWS-LC leaves a GHASH table entry of the
+    AES-GCM key and the HMAC-SHA1 states of the AES-CBC MAC key per record (43 to 51 forms,
+    optimised; the limit as a test:
+    `known_limit_with_aws_lc_the_dtls_record_path_leaves_keys_in_dead_stack_frames`, ignored).
+    The engine does not overwrite the stack after every record.
+  - **AES-CCM with rustc older than 1.99.1, optimised**: AES-CCM is RustCrypto's AES in
+    rtci-crypto with either provider; with rustc 1.89 its record path left one to three round
+    keys of a DTLS 1.3 AES-CCM key, 16.4 to 16.7 KB deep (the number follows the layout), none
+    with 1.99.1 and 1.100. Asserted from
+    1.99.1 on; for older compilers `RTCI_KEY_RESIDUE_CCM_KNOWN_LIMIT=1` (set by
+    `scripts/key-residue-report.sh` and the CI job) prints it instead.
+  - **Unoptimised builds whose profile turns `debug_assertions` off for rtci-crypto** while `aes`
+    stays at opt-level 0: the record-work overwrite (Security) is not compiled, and RustCrypto's
+    AES leaves round keys in stack temporaries (up to 145 DTLS forms with rustc 1.89 and 1.99.1).
+  - **IVs**: a DTLS 1.3 record's nonce is its IV at sequence number 0, and the nonce is built
+    from a copy of the whole IV; counted and printed, not asserted, as an AEAD does not need a
+    secret nonce.
+  - **Windows**: the stack measurement needs `pthread_attr_setstack`; the heap quarantine tests
+    run there, and they are a detector, not a proof: whether a key left in a dead frame reaches
+    a freed block depends on the layout (docs/key-erasure.md, the worked example).
+
+### Documentation
+
+- README's status figures are checked (`conf/docs-7-readme-counts-are-checked`):
+  `scripts/audit-count.py --check` (cargo.yml's gate job) now fails when README.md's status
+  table (MUST / SHOULD / MAY rows), its "N MUST rows are open (...)" sentence or its "audited
+  ... against N specifications" differs from what the audit gives, naming the line and both
+  figures (train 36 round 16 shipped a README with 11 open MUST rows against the audit's 6).
+  The patterns are those the train integrator's README updater writes. The check found one
+  stale figure: 111 specifications, the audit has 113 (corrected). Self-test
+  `scripts/test_audit_count.py` (the tree agrees; one changed figure fails, named).
+- README names every default that departs from a MUST by the owner's decision, three since
+  jsep-94 removed the RFC 9429 5.11 feedback item and jsep-95 added RFC 9429 5.3.1 (answers list
+  only the offered formats): RFC 6184 7.2.2, RFC 9429 5.3.1 and RFC 8083 3, each with the setting
+  that gives the RFC form (`conf/docs-6-readme-names-every-default-that-departs-from-a-must`).
+  `docs/behaviour-profiles.md` lists the same three. `scripts/behaviour-profiles.py --check` now
+  derives them from docs/conformance.md's table, checks that `StrictRfc` selects each RFC form,
+  and fails when README's sentence misses one or its count words ("Three", "sets all three").
+- **Draft-work register** (`docs/conformance/draft-work.md`, `conf/audit-8-draft-work-register`):
+  for each `conflict` row, standing departure and recorded ambiguity, the clauses in conflict,
+  what the maintainers' current draft work says (W3C webrtc-pc candidate corrections, PRs and
+  issues; IETF errata, bis drafts and trackers) with its date, and whether the engine's default
+  matches. Two defaults did not and change on their own branches (`conf/jsep-96`: a later
+  remote offer with new rids is answered, Candidate Correction 37; `conf/jsep-97`: an RTP
+  timeout no longer mutes a remote track, Candidate Correction 57). `audit/RULES.md` gains the
+  rule ("Contradictions": resolved from current draft work, cited with its number and date) and
+  `docs/releasing.md` a check of the register before each release.
+- **Releasing: what the 0.2.1 publish ran into** (`docs/releasing.md`): `cargo generate-lockfile`
+  is an explicit step after the dry run (the dry run left no `Cargo.lock` on the current
+  toolchain); a release script must not test first-parent membership with `rev-list | grep -q`
+  under `pipefail` (SIGPIPE refused master's tip); and a patch release's generated page is
+  corrected by hand, since git-cliff files `!`-marked behaviour-change commits under "Breaking
+  changes".
+- Tests for two simulcast MUST rows the sixth audit sweep found untested
+  (`conf/jsep-93-must-rows-batch8`), each checked by a runtime-gated mutation
+  (`mut/must8b-gated`): RFC8851-6.3-5, an offered `a=rid` line whose `pt=` formats the answer
+  all discards is dropped from the answer and its `a=simulcast` ("the answerer MUST discard the
+  entire 'a=rid' line"), on the receiving and the sending side
+  (`a_rid_line_whose_formats_the_answer_discards_is_dropped`); RFC8853-5.2-1, an `a=simulcast`
+  received at the session level is ignored ("MUST ignore it if received at the session level"):
+  the offer is taken and no simulcast is negotiated (`a_session_level_simulcast_line_is_ignored`).
+  Both `untested` -> `tested`. No engine change. Open MUST rows 30 -> 28.
+- README and `rtci_turn::client::Relay::close`: "re-allocating on the same socket after a
+  release", for engine-run and application-run TURN: what RFC 8656 7.4 has a client do on 437
+  (another local address, three at most, then two minutes without the server; never the refused
+  5-tuple again), coturn's one-second hold after a confirmed release, and the remedies (wait
+  after `OnTurnAllocationReleased`, or another UDP socket) for a new peer connection on a
+  closed one's socket. turn-9.
+- webrtc-pc rows of audit sweep 4 (`conf/w3c-1-must-rows-sweep4`): tests for WEBRTC-4.4.1.4-7
+  (a local description of a type the signaling state does not take), 4.4.2-46 (the pranswer
+  branch of [[LastCreatedAnswer]]), 4.8.3-2 (the url of `icecandidateerror`), each `untested`
+  -> `tested`, mutation-checked. Tests for 5.5-3 (a DTLS transport fails once), 6.1.2-3 (a
+  received SCTP SHUTDOWN closes the transport) and 6.2.8-1 (a message on a closing channel is
+  discarded) pass, but the mutation of each clause's code survived, so those rows stay
+  `untested` (notes say why).
+  WEBRTC-5.6.4-2 / 5.6.4-9 stay `partial` and are listed under "Standing departures from a
+  MUST" in `docs/conformance.md`: ICE "failed" without the end-of-candidates indication, by the
+  timer that bounds checking (RFC 8863 section 5 permits it, W3C does not; Chrome does the
+  same). WEBRTC-5.2-33 `tested` -> `missing`: replaceTrack never refuses a track outside the
+  negotiated envelope, which webrtc-pc defines by examples the engine can see (a track whose
+  codec is not negotiated, an audio track of another channel count; fixed on `conf/w3c-2-replace-track-envelope`). Open MUST rows 57 -> 53.
+- `rtci-stream-driver`: `AddressFilter::include_loopback` quotes RFC 8445 section 5.1.1.1 as it
+  is, "Addresses from a loopback interface MUST NOT be included in the candidate addresses"
+  (it said SHOULD NOT), and says that turning it on departs from that rule
+  (`conf/ice-36-followups-frozen-pair-lite-trickle-loopback-doc`).
+
+### Testing
+
+- **The driver's loopback mDNS test shows as ignored on Windows, not as passed**
+  (`conf/mdns-4-windows-poisoned-route-and-loopback-default`). `examples/stream-driver/tests/mdns.rs`:
+  `drivers_on_loopback_resolve_each_other_on_the_loopback_interface` returned `Ok(())` at once on
+  Windows after printing "SKIPPED", so `cargo test` counted it as passed; it is now
+  `#[cfg_attr(windows, ignore = "...")]`, sets `mdns_on_loopback_on_windows`, and
+  `scripts/windows-poisoned-mdns-route.sh` runs it with `--ignored` on GitHub-hosted Windows
+  (then prints the route). Its dormant post-condition moved to the new default test (Breaking
+  changes). `scripts/check-test-inventory.py` now also lists a `#[cfg_attr(<condition>, ignore)]`
+  test as ignored (it saw only `#[ignore]` and `#[cfg(...)]`), with unit tests in
+  `scripts/test_check_test_inventory.py`; `docs/test-exclusions.md` has the new rows. The
+  remaining skips that count as passes are runtime probes (no multicast on the host), which an
+  attribute cannot express: listed in the branch's handoff note, unchanged.
+- test-env interop: the `reflect video <codec>` cells name a browser that sends on a payload
+  type its offer does not have (`conf/test-4-reflect-cells-name-an-off-offer-format`), as
+  "chrome profile: audio and video both ways" already did, and log the payload types received
+  and sent, the PLIs forwarded and what the browser says it sends. Train-36 round 10d's
+  `reflect video VP8` [webkit] failure (test-env 46081695534) was such a switch: WebKit's offer
+  had VP8 on 96 with RTX on 97, the answer added VP9 on 98 (the 0.2.x answer form), WebKit sent
+  1285 of its 1292 packets on 98, and Rust, which may send only the offer's formats (RFC 3264
+  section 6.1), reflected 7 VP8 packets and then only RTX probe padding (75 packets, no payload,
+  which WebKit counts as `retransmittedPacketsReceived` with 0 bytes). The offered-only answers
+  of 0.3.0 (jsep-95) leave the browser no such format to switch to.
+- **The real-multicast mDNS tests probe the host first** (`conf/ci-3-mdns-tests-do-not-depend-on-host-multicast`).
+  `examples/stream-driver/tests/mdns.rs` and the two QueryAndGather tests of
+  `tests/mdns_query_and_gather_interop.rs` resolve `.local` names over the host's mDNS group;
+  on a self-hosted Windows VM whose network did not loop multicast back (NAT address
+  10.0.2.15, master push run 45956791846: no mDNS datagram arrived on its interface nor on
+  loopback) all five failed, saying nothing about the engine. Each now first sends a probe to
+  224.0.0.251:5353 on its interface and waits up to two seconds for it on a socket of its own
+  joined there; if it does not come back the test is skipped with the reason printed, except on
+  the jobs that say multicast works there (`RTCI_EXPECT_HOST_MULTICAST`, which `cargo.yml` sets
+  to Linux everywhere, plus macOS and GitHub-hosted Windows in the platform job: the places
+  these tests run today), where a failing probe fails the test, so the skip cannot quietly
+  remove coverage. Each probe uses the sockets of the code under test: the driver's tests join
+  and send on the address's interface (`IP_MULTICAST_IF`), the interop tests use a
+  `MulticastSocket::new()` as their rtc peer does (the system's route for the group, which
+  `cargo.yml` points at loopback on GitHub's macOS image). On Windows the interop tests take
+  their address from the default route, not from the system's answer for the group: mDNS sent
+  on loopback (the driver's loopback test) leaves the group's destination-cache entry on
+  loopback after its process exits and from then on makes Windows answer 127.0.0.1 for the
+  group to every process, which made every interop test bind loopback and time out when the
+  driver's tests had run first (agent-test run 46045692164); the driver's loopback real-socket
+  test does not run on Windows for the same reason (a long-lived runner would carry the entry
+  into the next job).
+  **Stream driver:** that Windows behaviour is documented (`peer` module, `PeerDriverConfig::on`,
+  `AddressFilter::include_loopback`): a socket joined on loopback that sends to the group
+  leaves the group's destination-cache entry on loopback (source 127.0.0.1) after the process,
+  and every process then gets 127.0.0.1 for 224.0.0.251, until the entry is deleted
+  (`netsh interface ipv4 delete destinationcache interface=<loopback index>
+  address=224.0.0.251`, as administrator: the entry and the delete measured on Windows 11
+  and on GitHub's Windows image; IPv6 ff02::fb not measured). The driver changes no host routing
+  state itself; it logs one warning per process when it joins the IPv4 mDNS group on loopback
+  on Windows (new dependency: `log`). No behaviour change otherwise. The shared mDNS budget of two drivers (draft
+  section 7.1) moves to virtual time
+  (`mdns_virtual_time.rs::two_drivers_send_their_mdns_within_one_shared_budget_on_virtual_time`),
+  where it does not depend on multicast at all; the real-socket file keeps the two smoke tests
+  (egress interface, loopback). No engine change.
+- **The test environment relays the end of candidates**
+  (`conf/ice-34-lite-agents-and-failed-after-end-of-candidates`; `tests/testenv/mod.rs`
+  `negotiate` / `negotiate_with` now end each peer's gathering and hand each the other's
+  end-of-candidates, as applications do since ice-32). `nat_matrix_without_turn` expects
+  `failed` on NATs with no path, which W3C webrtc-pc 5.6.4 gives only with that indication
+  (`portrestricted_symmetric` and `symmetric_symmetric` stayed `disconnected` on train 36 round
+  10, run 46038516659). New `negotiate_without_end_of_candidates` and two tests pin both sides on
+  real NATs: without the indication the agents stay `disconnected`; with
+  `with_ice_failed_without_end_of_candidates(true)` they fail.
+- **A measurement of key residue in stack frames that does not depend on the C library**
+  (`rtci-srtp/tests/key_residue.rs`, `owned_stack/`, `process_scan/`;
+  `scripts/key-residue-report.sh`; CI job `key_residue`). Each step of a session (building the
+  contexts, packets, re-keying, tearing down) runs on a worker thread whose stack the test
+  maps itself, fills with a known byte and reads while the worker waits, so what a step left
+  is read byte for byte; every key the session derives is looked for in every form an
+  implementation holds or computes on the way (AES round keys of both schedules, GHASH key and
+  table entry, HMAC padded keys and states, header-extension keys, each key derivation epoch,
+  the master key and salt). On Linux the whole process is searched too, with nothing left out
+  but the search's own buffer and unreadable pages counted. A control leaves a key on a stack,
+  in the heap, in a freed block and in static data and must find each, and must not find an
+  erased one. The answer is the same in the test-environment image (glibc 2.39) and on
+  GitHub's runners (glibc 2.43): identical inventories, digest for digest, with one compiler.
+  - `with_ring_key_handling_leaves_no_key_in_dead_stack_frames`: every step, asserted in an
+    optimised build; building and tearing down asserted in every build. The CI job
+    `key_residue` runs it unoptimised and optimised, on x86-64 Linux with the workspace's
+    `rust-version` and with stable, and on AArch64 macOS with stable; the ordinary test jobs
+    and the test environment (rustc 1.99.1) run it unoptimised.
+  - `with_aws_lc_building_and_tearing_down_leave_no_key_in_dead_stack_frames`.
+  - `rtci-crypto/tests/hmac_sha1_vectors.rs`: RFC 2202 test cases 1 to 7 with every provider,
+    one keyed object used again and again and with the message split at every position.
+- **Why the search it replaces gave two answers** (`rtci-srtp/tests/key_erasure_process_memory.rs`,
+  removed; its `known_limit_*` tests with it). It searched the stack of an ordinary thread
+  after the thread had ended, through `/proc/self/maps`. Shown by
+  `investigate_how_the_c_library_treats_thread_stacks` (ignored; prints what it finds): glibc
+  gives an ended thread's stack back to the kernel except for a few pages (4 of 256 marks left,
+  506 of 512 pages zero, glibc 2.39 and 2.43 alike), which is why only part of the residue was
+  ever seen; and with glibc 2.43 a thread's guard is no mapping of its own, so the worker's
+  stack and the searching thread's are one mapping, which the search left out whole because it
+  held the searcher's own stack, and whose pieces holding a guard page it could not read and
+  dropped. Hence residue in 20 of 20 runs in the test-environment image (glibc 2.39) and in 0
+  of 40 on GitHub's runners (Ubuntu 26.04, glibc 2.43; 0.2.0's notes called both "noble").
+  The one unexplained finding of that search, a master key in "another mapping", was the
+  search's own data: it kept each key inverted, and two of its tests used master keys that
+  were each other's complement.
+- 0.2.0's documentation cited "RFC 3711 section 9.3" for key erasure. RFC 3711 has no such
+  clause (section 9.3 is "Confidentiality of the RTP Payload"; section 3.2.1 has the master
+  key "kept secret"). The clause is RFC 7714 section 13.1, which has two items: a secret
+  master salt, and all keys. Corrected in docs/key-erasure.md and the sources' comments.
+- RFC 6544 section 6.1 / RFC 8445 section 8.2: two lite agents that select different pairs (the
+  answerer a UDP one, the offerer its active TCP candidate to the answerer's passive one): the
+  answerer closes nothing while the updated offer is awaited, then keeps the connection the
+  offerer opened in parallel and carries the data on it, without an ICE restart
+  (`two_lite_agents_close_nothing_while_the_updated_offer_is_awaited`; ice-30's untested arm in
+  RFC6544-6.1-2's note).
+- **Five DTLS MUST rows are tested** (`conf/dtls-33-must-rows-batch8`; tests and audit only, no
+  engine change; each checked by a mutation, `mut/must8a-gated`). RFC 5746 3.6: a DTLS 1.2
+  server ignores unknown extensions in a ClientHello and answers with its full flight
+  (`conn_conformance_test.rs::unknown_extensions_in_a_client_hello_are_ignored`). RFC 9147
+  section 4: records of two DTLS 1.3 associations of one endpoint never share a datagram
+  (`rfc9147_rows_test.rs::records_of_two_associations_never_share_a_datagram`); section 5: the
+  server echoes no legacy_session_id in its ServerHello or HelloRetryRequest
+  (`rfc8446_conformance_test.rs::the_server_echoes_no_legacy_session_id`); section 5.5: the
+  fragments of a handshake message tile it without overlap
+  (`rfc9147_rows_test.rs::the_fragments_of_a_handshake_message_tile_it_without_overlap`).
+  W3C webrtc-pc 5.5: a failed DTLS transport fails once, whatever reaches it after
+  (`tests/dtls_failed_state.rs::a_failed_dtls_transport_fails_once`, the test of conf/w3c-1,
+  now with a mutation that removes every layer of "if already failed, abort"). RFC5746-3.6-5,
+  RFC9147-4-9, RFC9147-5-1, RFC9147-5.5-1 and WEBRTC-5.5-3 `tested` (were `untested`,
+  open-must class B).
+- **Two SCTP MUST rows are tested** (`conf/sctp-27-must-rows-batch8`; tests and audit only,
+  no engine change; each checked by a mutation, `mut/must8a-gated`). RFC 6525 5.2.7 H1: a
+  Re-configuration Response whose number has no running timer changes nothing (the
+  outstanding request stays outstanding and timed, the stream keeps its sequence numbers,
+  nothing is reported:
+  `rtci-sctp stream_reset_test.rs::a_response_for_no_outstanding_request_changes_nothing`).
+  W3C webrtc-pc 6.1.2: a received SHUTDOWN makes the RTCSctpTransport closed
+  (`handler/sctp.rs::a_received_shutdown_closes_the_sctp_transport`, the test of conf/w3c-1,
+  whose mutation missed the `ended` arm of `SctpTransport::state` that holds the behaviour).
+  RFC6525-5.2.7-1 and WEBRTC-6.1.2-3 `tested` (were `untested`, open-must class B). The
+  conf/w3c-1 test for W3C 6.2.8 (`data_channel_receive_not_open_rtc2rtc.rs`) is carried along,
+  but WEBRTC-6.2.8-1 stays `untested`: the test passes with both of the handler's discard
+  checks lifted, so its message never reaches them.
+- **W3C webrtc-pc 6.2.8 is tested: a message read while a channel is closing reaches no
+  application message** (`conf/sctp-28-data-on-a-channel-that-is-not-open`, on conf/sctp-27;
+  `tests/data_channel_receive_while_closing_rtc2rtc.rs::a_message_read_after_close_is_called_is_discarded`;
+  test and audit only, no engine change; mutation checked). `close()` makes the channel
+  "closing" and queues the stream reset behind what was sent, so a datagram read before the
+  next flush carries user data for a closing channel on a stream that still reads; it is
+  discarded while its sibling's message is delivered. The only state that is not "open" in
+  which user data can reach the channel (see the test's notes). WEBRTC-6.2.8-1 `tested`.
+- **Two RTP MUST rows are tested** (`conf/rtp-10-must-rows-batch8`; tests and audit only, no
+  engine change; each checked by a mutation, `mut/must8a-gated`). RFC 5576 section 9: a sender
+  is prepared for receivers that ignore its source descriptions: with two video sections of the
+  same payload types, one encoding with RTX and two simulcast layers with RTX, every SSRC
+  described, a receiver handed the offer without any `a=ssrc` / `a=ssrc-group` line still binds
+  every stream to its section and layer and repairs each over its RTX stream, by the MID, RID
+  and RRID the sender writes
+  (`tests/source_descriptions_ignored_rtc2rtc.rs::streams_and_their_repairs_are_bound_when_the_source_descriptions_are_ignored`).
+  RFC 8834 section 4.1, ignore unknown RTP header extensions: the same clause as section 10,
+  fixed in 0.2.1, now cited with its tests. RFC5576-9-1 and RFC8834-4.1-24 `tested` (were
+  `untested`, open-must class B).
+- **The RTCP-share tests are seeded** (`conf/rtcp-4-rtcp-share-test-is-seeded`;
+  `tests/rtcp_rate_trace_rtc2rtc.rs`). Both peers draw their random numbers from a seeded
+  provider (`DefaultInterceptorOptions::rtcp_random` and the setting engine's crypto provider:
+  RFC 3550 section 6.3.1's report-interval randomisation, the dither of early feedback, ICE,
+  DTLS, SCTP), with their clocks and NTP times anchored at the run's start. The measured share
+  was different in every run and landed once above the unchanged 5% bound of
+  `the_performance_profile_keeps_low_rate_rtcp_inside_five_percent` (train 36 round 10b, macOS:
+  0.0516); every share is now printed in full (`RTCP-SHARE ...`). The test, renamed
+  `the_performance_profile_keeps_low_rate_rtcp_inside_five_percent_on_average`, asserts what
+  RFC 3550 6.2 / 6.3.1 promise, an average: the mean share over 16 fixed seed pairs of the 15 s
+  call is at most 5%, and each of 4 seed pairs of a 30 s call is (measured over 200 seed pairs:
+  15 s call mean 0.0474, max 0.0516, 1% of draws above 5%; 30 s call max 0.0489; the 10 s window
+  holds one to three regular reports at 24 kbit/s). New ignored measurement
+  `rtcp_share_over_seed_pairs`.
+- **The unreliable-channel netem test counts the channel's own retransmissions**
+  (`conf/sctp-29-unreliable-channel-test-counts-its-own-retransmissions`). New
+  `AssociationStats::get_num_partially_reliable_retransmissions` (rtci-sctp, additive): of the
+  retransmissions, the DATA chunks of messages with a lifetime or a retransmission limit (RFC
+  3758, RFC 7496). `testenv_impairment::unreliable_channel_loses_without_retransmitting` asserts
+  it is zero for the association's whole life (`maxRetransmits` 0, RFC 8831 section 6.6) instead
+  of comparing all retransmissions at the first message and at the end, which failed when the
+  reliable DCEP DATA_CHANNEL_OPEN (RFC 8832 section 5) went again after the first message (its
+  SACK lost while the peer's DATA_CHANNEL_ACK opened the channel; run 46050142067). Unit test
+  `a_reliable_message_sent_again_is_not_counted_as_a_partially_reliable_retransmission`.
+- `tests/turn_reallocate_after_release.rs` (5 tests) with a coturn-like `release_linger` in
+  `tests/common/turn_server.rs` (a released allocation kept for a second, an Allocate on its
+  5-tuple answered 437 before authentication): a one-socket restart whose release is lost once
+  allocates only after the release is answered (no 437); against coturn without the delay the
+  restart meets one 437, `OnTurnRequestRejected` is raised, no Allocate is retried for 130 s,
+  and a restart after the two minutes allocates; with a 2 s delay no 437; a new peer connection
+  on a just-released socket meets the 437 (no retry), and allocates after the hold or from a
+  second socket. turn-9.
+- **One SFrame ciphertext per layer: temporal drops, the descriptor-to-layer match, and the
+  counter-test** (RFC 9605 sections 6.1.3 and 4.2; `conf/sframe-4-one-ciphertext-per-layer`, on
+  `conf/sframe-2-svc-layer-per-ciphertext`; no API change). New rtc-to-rtc tests in
+  `tests/encoded_frame_metadata_rtc2rtc.rs`:
+  `a_forwarder_drops_temporal_layers_of_sframe_encrypted_{vp9,av1}_l2t3` (a keyless forwarder
+  drops T2, or T1 and T2, for a receiver of either spatial layer; every forwarded ciphertext
+  decrypts, to exactly the layer frames of that decode target) and
+  `one_ciphertext_over_{a_vp9_superframe,an_av1_temporal_unit}_does_not_survive_a_layer_drop`
+  (the access unit as one ciphertext, split between the two layers' descriptor frames, fails
+  authentication once layer 1 is dropped). The spatial forwarder tests now also check that each
+  forwarded frame decrypts to the layer its Dependency Descriptor names, and that the layer
+  ciphertexts carry the sender's key id and consecutive counters. Unit tests: without a spatial
+  mode (none declared, VP8 / H.264 / VP9 temporal modes) or per packet, `transform` and
+  `transform_access_unit` give byte for byte the frame encrypted as it is; VP8 and H.264 take
+  temporal modes only. `RTCRtpSFrameEncryptor::transform` no longer copies each frame to look for
+  layers when no spatial mode is declared (output unchanged). The `sframe_transform` module docs
+  now say how an application hands layer frames.
+- rtci-ice: `a_pair_still_frozen_at_the_nomination_is_taken_out_of_the_checklist` (both roles;
+  RFC 8445 section 8.1.2), the agent-level test with a pair still Frozen at the nomination
+  (two remote candidates of one foundation, the first still being checked): Frozen just
+  before, Failed after, `failed` in its stats, never checked
+  (`conf/ice-36-followups-frozen-pair-lite-trickle-loopback-doc`). Before, only the stream
+  driver's `virtual_time` test caught a retirement that skipped Frozen pairs.
+- **Test files gated by a crate-level `#![cfg(feature …)]` are accounted for**
+  (`conf/video-2-cfg-gated-tests-are-accounted-for`). Compiled without its feature such a file
+  builds and runs 0 tests, which passes. `scripts/check-test-inventory.py`'s `feature-gated`
+  finding now covers them (the cfg evaluated against each `cargo test` of `cargo.yml`, matrix
+  values expanded). Of the eleven such files, ten run with their features in at least one job
+  (counted in train-36 run 46129791197: e.g. `cross_provider` 4 tests in "rtci-crypto (ring +
+  aws-lc-rs)", `mdns_budget` 1 in the default test job's runtime step).
+  `tests/no_builtin_crypto_provider.rs` ran 0 tests in all eight jobs that build it, and cannot
+  run: `rtci` does not compile without a built-in provider (`cargo check -p rtci
+  --no-default-features`: `rcgen::KeyPair` at `src/peer_connection/certificate/mod.rs:553` needs
+  rcgen's `crypto` feature), although docs/crypto-provider-migration.md lists that build (fixed
+  by `conf/crypto-9-rtci-builds-without-a-built-in-provider`, under Fixed).
+- **rtci-video's feature-gated tests run in CI** (`conf/video-1-send-tests-run-and-pass`).
+  Cargo skips a test target whose `required-features` are off without a word, and no job turned
+  on `vp8`, `av1`, `isolation`, `libvpx`, `dav1d` or `openh264`: `send_rtc2rtc`, `codecs`,
+  `isolated`, `libvpx`, `dav1d` and `openh264` had not run in any CI job since the crate
+  landed. A new `cargo.yml` job (`video_codecs`, our Linux pool first; `video_codecs_fork` for a
+  fork's pull request) installs libvpx and libdav1d, downloads Cisco's OpenH264 binary and runs
+  `cargo test -p rtci-video --all-features`, and builds the interop peer's `pipeline` scenario.
+  `scripts/check-test-inventory.py` now fails on a `[[test]]` with `required-features` that no
+  `cargo test` of `cargo.yml` runs whole (kind `feature-gated` in `docs/test-exclusions.md`).
+  Run by hand, two tests of `send_rtc2rtc` failed on v0.2.1 and on train 36 (agent-test runs
+  46137495578, 46137469211, 46136031324): they asserted the pacer's behaviour before
+  `conf/flush-1r-backlog-flush-at-collapse` (train 32), which made the default pacer flush its
+  backlog at a capacity collapse instead of pausing the source. Not an engine regression: the
+  tests were stale. `video_keeps_playing_through_a_capacity_cap_that_comes_and_goes` (the
+  default chain) now asserts what the engine's own default-chain test asserts of a flush (a
+  discard within a second of the drop, none before it, a key frame within 150 ms, no pause)
+  and a picture no older than 2 s (measured 0.92 to 0.94 s, against 10.2 to 11.7 s with the
+  backlog kept); `a_pacer_pause_stops_the_encoder_and_the_video_resumes_within_a_second` asks
+  for `PacerBacklog::Keep`, the setting that pauses, and keeps its assertions.
+  `scripts/dev/run-at-commits.sh` runs one command at several commits (one verdict line each)
+  to find which commit changed a test's outcome in one CI run.
+- **The DTLS key residue measurement** (`rtci-dtls/tests/key_residue.rs`, `residue_forms/`;
+  `scripts/key-residue-report.sh dtls`; CI job `key_residue`). Each step of a DTLS association
+  (configurations, connect, every one-way delivery of the handshake, the DTLS-SRTP export,
+  application records, DTLS 1.3 key updates, close_notify, teardown, and the resumed
+  association of ticket resumption) runs on a worker whose stack the test owns (the SRTP
+  measurement's `owned_stack`); DTLS 1.2 with AES-GCM, AES-CCM, ChaCha20-Poly1305, AES-CBC and a
+  PSK suite, DTLS 1.3 with AES-GCM, AES-CCM and ChaCha20-Poly1305, ticket resumption in both,
+  ring and AWS-LC. The secrets come from a recording provider and the PRF / HKDF outputs
+  recomputed from them, in every form (AES round keys of both schedules, GHASH key forms, HMAC
+  padded keys and SHA-1 / SHA-256 states); the needles are checked against what the association
+  used, and a control's planted key must be found. Forms are classed as secrets of key
+  derivation, record keys, or IVs, and asserted as docs/key-erasure.md says.
+  - `with_ring_dtls_key_handling_leaves_no_key_in_dead_stack_frames`,
+    `with_aws_lc_dtls_key_handling_leaves_no_key_in_dead_stack_frames`.
+
 ## [0.2.1] - 2026-11-27
 
 A patch release of the 0.2 line, compatible with 0.2.0 (no public item removed or changed;

@@ -98,11 +98,15 @@ impl KeySource {
         let retained = self.retained.as_ref().ok_or_else(|| {
             Error::Other("SRTP session keys cannot be derived again: no master key retained".into())
         })?;
-        derive(
-            retained.provider.crypto(),
-            retained.master_key.as_ref(),
-            retained.master_salt.as_ref(),
-        )
+        // As when the cipher is built (`new_cipher`): the stack the derivation ran on is
+        // overwritten afterwards. The keys it returns hold their key material in the heap.
+        crypto::on_erased_stack(|| {
+            derive(
+                retained.provider.crypto(),
+                retained.master_key.as_ref(),
+                retained.master_salt.as_ref(),
+            )
+        })
     }
 }
 

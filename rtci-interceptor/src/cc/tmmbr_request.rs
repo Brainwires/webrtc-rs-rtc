@@ -120,6 +120,9 @@ pub(crate) struct TmmbrRequester {
     negotiated_maximum: Option<u64>,
     /// Whether the transport runs over IPv6, from the last packet's address.
     ipv6: bool,
+    /// Whether every entry [`poll_request`](Self::poll_request) last returned repeats an
+    /// unacknowledged one (section 4.2.1.3: regular RTCP timing for those).
+    repeats_only: bool,
 }
 
 impl TmmbrRequester {
@@ -231,6 +234,7 @@ impl TmmbrRequester {
     pub(crate) fn poll_request(&mut self, now: Instant, own_ssrc: u32) -> Vec<TmmbEntry> {
         let ssrcs: Vec<u32> = self.remotes.keys().copied().collect();
         let mut entries = Vec::new();
+        let mut first_transmission = false;
         for media_ssrc in ssrcs {
             let Some(ours) = self.tuple(media_ssrc, own_ssrc) else {
                 continue;
@@ -245,6 +249,7 @@ impl TmmbrRequester {
                 .unacknowledged
                 .is_some_and(|(_, at)| now.saturating_duration_since(at) >= TMMBR_REPEAT_INTERVAL);
             if remote.owed || repeat {
+                first_transmission |= remote.owed;
                 remote.owed = false;
                 remote.unacknowledged = Some((ours, now));
                 // In a TMMBR an entry names the media sender asked.
@@ -255,7 +260,14 @@ impl TmmbrRequester {
             }
         }
         entries.sort_by_key(|entry| entry.ssrc);
+        self.repeats_only = !entries.is_empty() && !first_transmission;
         entries
+    }
+
+    /// Whether the entries [`poll_request`](Self::poll_request) last returned are all
+    /// repetitions, which RFC 5104 section 4.2.1.3 sends in regular RTCP mode.
+    pub(crate) fn repeats_only(&self) -> bool {
+        self.repeats_only
     }
 
     /// When the next repetition is due.
@@ -331,6 +343,7 @@ mod tests {
                 overhead: 40
             }]
         );
+        assert!(!r.repeats_only(), "the first transmission");
         assert!(
             r.poll_request(now + Duration::from_millis(500), OWN)
                 .is_empty()
@@ -342,6 +355,10 @@ mod tests {
         }
         let again = r.poll_request(now + TMMBR_REPEAT_INTERVAL, OWN);
         assert_eq!(again.len(), 1, "repeated without a TMMBN");
+        assert!(
+            r.repeats_only(),
+            "a repetition (section 4.2.1.3: regular RTCP mode)"
+        );
         assert!(again[0].overhead > 40, "{again:?}");
         r.on_tmmbn(
             SENDER,

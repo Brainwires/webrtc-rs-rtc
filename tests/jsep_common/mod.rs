@@ -44,6 +44,23 @@ pub fn default_peer() -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
         .build(Instant::now())?)
 }
 
+/// A peer with the default codecs whose answers also list the formats the offer lacks
+/// (`SettingEngineBuilder::with_answer_offered_formats_only(false)`; the default before 0.3.0,
+/// the `StrictRfc` profile's form: RFC 9429 section 5.3.1 "MUST be added after all existing
+/// formats").
+pub fn peer_adding_formats() -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
+    let mut media_engine = MediaEngine::default();
+    media_engine.register_default_codecs()?;
+    Ok(RTCPeerConnectionBuilder::new()
+        .with_media_engine(media_engine)
+        .with_setting_engine(
+            rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder::new()
+                .with_answer_offered_formats_only(false)
+                .build(),
+        )
+        .build(Instant::now())?)
+}
+
 pub fn vp8() -> RTCRtpCodec {
     RTCRtpCodec {
         mime_type: MIME_TYPE_VP8.to_owned(),

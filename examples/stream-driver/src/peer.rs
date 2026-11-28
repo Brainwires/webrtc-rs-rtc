@@ -40,6 +40,31 @@
 //! on the IPv6 group (and on the IPv4 group of the same interface where the driver has an IPv4
 //! address there), and a query once on each interface.
 //!
+//! On Windows, a process that joins the IPv4 mDNS group on the loopback interface (a driver
+//! given 127.0.0.1) and sends to the group there leaves a stale route for the group behind
+//! it: the system's destination cache holds 224.0.0.251 with source 127.0.0.1 on the
+//! "Loopback Pseudo-Interface" after the process has exited (`netsh interface ipv4 show
+//! destinationcache address=224.0.0.251`), and from then on any process that asks which
+//! address reaches the group (a UDP socket connected to it) gets 127.0.0.1. Measured on
+//! Windows 11 and on GitHub's Windows image; the joins table entry for the group on the
+//! loopback interface that the join also leaves (`show joins`, references 0) is not what moves
+//! the answer. A later join, send and leave on the network interface does not clear the
+//! entry; deleting it does, at once: `netsh interface ipv4 delete destinationcache
+//! interface=<the loopback interface's index> address=224.0.0.251`, from an administrator
+//! prompt (measured on Windows 11 and on GitHub's Windows image). The same may hold for IPv6's
+//! ff02::fb; that was not measured. So on Windows the driver, by default, takes no part in
+//! IPv4 mDNS on loopback: it does not join 224.0.0.251 on the loopback interface and sends
+//! nothing to the group from a loopback address (the messages about a loopback address's name
+//! are dropped, counted in [`PeerDriver::unsent_datagrams`]); a driver whose only IPv4
+//! addresses are loopback binds no IPv4 mDNS socket and tells the connection that its IPv4
+//! names cannot be published ([`PeerDriver::mdns_available`] is `false`). Loopback candidates
+//! are for local use only (RFC 8445 section 5.1.1.1: "Addresses from a loopback interface MUST
+//! NOT be included in the candidate addresses"), and RFC 6762 asks no mDNS on loopback.
+//! [`PeerDriverConfig::mdns_on_loopback_on_windows`] turns it back on, as on other systems;
+//! the driver then logs a warning when it makes such a join, and an application or test host
+//! that does so cleans the entry as above when it is done. The driver changes no host routing
+//! state itself.
+//!
 //! Where mDNS cannot be sent (a socket that cannot be bound, or a system that refuses every
 //! send to the group: no multicast route, or a Mac application without the Local Network
 //! permission) the driver tells the application with
@@ -73,7 +98,9 @@
 //! loop {
 //!     driver.step(Duration::from_millis(20)).await?;
 //!     while let Some(event) = driver.poll_event() {
-//!         // signal OnIceCandidateEvent candidates to the peer, answer negotiation-needed, ...
+//!         // signal OnIceCandidateEvent candidates to the peer (the end-of-candidates one
+//!         // too: without it the peer's transport is "disconnected", never "failed", when
+//!         // the path is lost), answer negotiation-needed, ...
 //!     }
 //!     while let Some(read) = driver.pc_mut().poll_read() { /* media, data channels */ }
 //! }
@@ -142,10 +169,21 @@ pub struct PeerDriverConfig {
     /// can publish no name (`RTCPeerConnection::set_multicast_dns_publishing`), as when the
     /// host refuses the sockets.
     pub mdns_sockets: bool,
+    /// On Windows, whether the driver takes part in IPv4 mDNS on loopback addresses of
+    /// [`addresses`](Self::addresses): joins 224.0.0.251 on the loopback interface and sends the
+    /// messages about a loopback address's name there. `false` by default: on Windows mDNS sent
+    /// on loopback leaves the group's destination-cache route on loopback for every process of
+    /// the host after this one has exited (see the [module documentation](self)), so loopback
+    /// addresses get no mDNS and their `.local` names are not published. `true` does what other
+    /// systems always do, with one warning per process. Ignored on other systems.
+    pub mdns_on_loopback_on_windows: bool,
 }
 
 impl PeerDriverConfig {
-    /// Host candidates on `addresses`, any free port.
+    /// Host candidates on `addresses`, any free port. With a loopback address and mDNS on
+    /// Windows, see the module documentation: mDNS sent on loopback leaves a stale
+    /// destination-cache route for the group after the process, so by default the driver sends
+    /// none there ([`mdns_on_loopback_on_windows`](Self::mdns_on_loopback_on_windows)).
     pub fn on(addresses: Vec<IpAddr>) -> Self {
         Self {
             addresses,
@@ -154,7 +192,14 @@ impl PeerDriverConfig {
             retired_socket_linger: Duration::from_secs(5),
             mdns_rate_limit: None,
             mdns_sockets: true,
+            mdns_on_loopback_on_windows: false,
         }
+    }
+
+    /// Whether this configuration keeps IPv4 mDNS off loopback addresses on this system: on
+    /// Windows unless [`mdns_on_loopback_on_windows`](Self::mdns_on_loopback_on_windows).
+    fn skips_loopback_mdns_v4(&self) -> bool {
+        cfg!(windows) && !self.mdns_on_loopback_on_windows
     }
 
     /// The budget this configuration's mDNS takes from: the one named, or the process's.
@@ -246,11 +291,15 @@ struct MdnsFamily {
     /// Not tried again before.
     retry_at: Option<Instant>,
     backoff: Duration,
+    /// Never bound: every configured address of the family is a loopback one the driver keeps
+    /// mDNS off ([`PeerDriverConfig::mdns_on_loopback_on_windows`]).
+    off: bool,
 }
 
 impl MdnsFamily {
     fn new(links: Vec<IpAddr>) -> Self {
         Self {
+            off: false,
             socket: None,
             links,
             failures: 0,
@@ -280,6 +329,9 @@ struct MdnsSockets {
     /// For an IPv6 address, the configured IPv4 address of the same interface: an IPv6
     /// record's messages also leave on the IPv4 group of its own interface.
     companions: Vec<(IpAddr, IpAddr)>,
+    /// IPv4 mDNS is kept off loopback addresses: a message about one is sent nowhere
+    /// ([`PeerDriverConfig::mdns_on_loopback_on_windows`]).
+    skips_loopback_v4: bool,
 }
 
 impl MdnsSockets {
@@ -290,6 +342,8 @@ impl MdnsSockets {
     /// on the IPv4 group; an IPv6 record's from its address on the IPv6 group, and from the
     /// IPv4 address of its interface on the IPv4 group where the driver has one (resolvers
     /// that listen on one family); a query once from each interface, on each family's group.
+    /// A multicast message about an IPv4 loopback address goes nowhere when
+    /// [`skips_loopback_v4`](Self::skips_loopback_v4).
     fn routes(&self, from: IpAddr, to: SocketAddr) -> Vec<(SocketAddr, Option<IpAddr>)> {
         let group_v4 = SocketAddr::new(MDNS_MULTICAST_IPV4.into(), MDNS_PORT);
         let group_v6 = SocketAddr::new(MDNS_MULTICAST_IPV6.into(), MDNS_PORT);
@@ -297,6 +351,10 @@ impl MdnsSockets {
             // A unicast reply to an asker (RFC 6762 sections 5.5, 6.7).
             let source = (!from.is_unspecified() && from.is_ipv4() == to.is_ipv4()).then_some(from);
             return vec![(to, source)];
+        }
+        if self.skips_loopback_v4 && from.is_loopback() && from.is_ipv4() {
+            // Not on the group from loopback (Windows: the destination-cache route it leaves).
+            return vec![];
         }
         if from.is_unspecified() {
             let routes: Vec<_> = (self.v4.links.iter().map(|ip| (group_v4, Some(*ip))))
@@ -331,6 +389,27 @@ fn one_per_interface(addresses: &[IpAddr], ipv4: bool) -> Vec<IpAddr> {
         .filter(|ip| ip.is_ipv4() == ipv4 && !ip.is_unspecified())
         .filter(|ip| seen.insert(runtime::interface_name(*ip).unwrap_or_else(|| ip.to_string())))
         .collect()
+}
+
+/// The addresses whose interfaces get mDNS: `addresses` without the IPv4 loopback ones when
+/// `skips_loopback_v4` ([`PeerDriverConfig::mdns_on_loopback_on_windows`]).
+fn mdns_addresses(addresses: &[IpAddr], skips_loopback_v4: bool) -> Vec<IpAddr> {
+    addresses
+        .iter()
+        .copied()
+        .filter(|ip| !(skips_loopback_v4 && ip.is_ipv4() && ip.is_loopback()))
+        .collect()
+}
+
+/// Says once per process that IPv4 mDNS is kept off loopback on Windows.
+fn note_loopback_mdns_skipped() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::info!(
+            "no IPv4 mDNS on loopback on Windows: it would leave the group's destination-cache \
+             route on loopback for the whole host (PeerDriverConfig::mdns_on_loopback_on_windows)"
+        );
+    });
 }
 
 /// One UDP socket of the connection, with the reader that hands its datagrams to the driver.
@@ -556,8 +635,13 @@ impl PeerDriver {
 
     /// The next event of the connection. The driver has already done what is its to do
     /// (gathering on `OnLocalCandidatesNeeded` and when a transport begins gathering, closing
-    /// the previous sockets on a new selected pair); the application signals the candidates
-    /// of `OnIceCandidateEvent` to the peer and handles the rest.
+    /// the previous sockets on a new selected pair, ending each generation's gathering with
+    /// its end-of-candidates); the application signals the candidates of
+    /// `OnIceCandidateEvent` to the peer, the end-of-candidates candidate included (W3C
+    /// webrtc-pc 5.6.4: the peer's transport is "failed" only once it has it, "disconnected"
+    /// until then), and handles the rest. The driver tears nothing down on "failed" or
+    /// "disconnected": an application that does not relay the end-of-candidates candidate, or
+    /// whose peer never sends its own, needs a timer of its own to restart or close.
     pub fn poll_event(&mut self) -> Option<RTCPeerConnectionEvent> {
         self.events.pop_front()
     }
@@ -890,10 +974,17 @@ impl PeerDriver {
     /// asked for, on the link of its address). A bind that fails is reported
     /// ([`PeerDriverEvent::MdnsUnavailable`]) and tried again later.
     fn ensure_mdns(&mut self, now: Instant, force: bool) {
+        let skips_loopback_v4 = self.config.skips_loopback_mdns_v4();
+        let addresses = mdns_addresses(&self.config.addresses, skips_loopback_v4);
         if self.mdns_sockets.is_none() {
-            let addresses = &self.config.addresses;
-            let v4 = MdnsFamily::new(one_per_interface(addresses, true));
-            let v6 = MdnsFamily::new(one_per_interface(addresses, false));
+            let mut v4 = MdnsFamily::new(one_per_interface(&addresses, true));
+            if addresses.len() < self.config.addresses.len() {
+                note_loopback_mdns_skipped();
+                // Only loopback IPv4 addresses: no IPv4 socket at all (one with no interface
+                // would join and send on the system's default one).
+                v4.off = !addresses.iter().any(IpAddr::is_ipv4);
+            }
+            let v6 = MdnsFamily::new(one_per_interface(&addresses, false));
             let companions = v6
                 .links
                 .iter()
@@ -906,7 +997,12 @@ impl PeerDriver {
                     Some((*ip6, *ip4))
                 })
                 .collect();
-            self.mdns_sockets = Some(MdnsSockets { v4, v6, companions });
+            self.mdns_sockets = Some(MdnsSockets {
+                v4,
+                v6,
+                companions,
+                skips_loopback_v4,
+            });
         }
         if !self.config.mdns_sockets {
             return;
@@ -916,13 +1012,16 @@ impl PeerDriver {
                 return;
             };
             let family = if ipv6 { &sockets.v6 } else { &sockets.v4 };
-            if family.socket.is_some() || !(force || family.retry_at.is_none_or(|at| now >= at)) {
+            if family.off
+                || family.socket.is_some()
+                || !(force || family.retry_at.is_none_or(|at| now >= at))
+            {
                 continue;
             }
             let config = if ipv6 {
-                mdns_v6(self.config.addresses.clone())
+                mdns_v6(addresses.clone())
             } else {
-                mdns_v4(self.config.addresses.clone())
+                mdns_v4(addresses.clone())
             };
             let bound = self
                 .runtime
@@ -1396,5 +1495,67 @@ async fn read_loop(
             // end of it.
             Err(_) => runtime::yield_now().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const NIC: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+    const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    fn sockets(addresses: &[IpAddr], skips_loopback_v4: bool) -> MdnsSockets {
+        let addresses = mdns_addresses(addresses, skips_loopback_v4);
+        MdnsSockets {
+            v4: MdnsFamily::new(one_per_interface(&addresses, true)),
+            v6: MdnsFamily::new(one_per_interface(&addresses, false)),
+            companions: vec![],
+            skips_loopback_v4,
+        }
+    }
+
+    // The 0.3.0 default on Windows: IPv4 loopback addresses get no mDNS interface; the others,
+    // IPv6 loopback included (not measured to leave a route), keep theirs. With the setting (and
+    // on other systems) nothing is taken out.
+    #[test]
+    fn ipv4_loopback_addresses_get_no_mdns_interface_when_skipped() {
+        let all = [NIC, LO, IpAddr::V6(Ipv6Addr::LOCALHOST)];
+        assert_eq!(
+            mdns_addresses(&all, true),
+            vec![NIC, IpAddr::V6(Ipv6Addr::LOCALHOST)]
+        );
+        assert_eq!(mdns_addresses(&all, false), all.to_vec());
+    }
+
+    // A message about the loopback address's name is sent nowhere on the group when skipped, and
+    // on the loopback interface otherwise; a query leaves on the other interfaces only.
+    #[test]
+    fn a_loopback_record_leaves_on_no_group_when_skipped() {
+        let group = SocketAddr::new(MDNS_MULTICAST_IPV4.into(), MDNS_PORT);
+        let skipped = sockets(&[NIC, LO], true);
+        assert!(skipped.routes(LO, group).is_empty());
+        assert_eq!(skipped.routes(NIC, group), vec![(group, Some(NIC))]);
+        assert_eq!(
+            skipped.routes(Ipv4Addr::UNSPECIFIED.into(), group),
+            vec![(group, Some(NIC))],
+            "the query leaves on the network interface only"
+        );
+        let asked = sockets(&[NIC, LO], false);
+        assert_eq!(asked.routes(LO, group), vec![(group, Some(LO))]);
+    }
+
+    // The default decides on Windows only; the setting turns it off there.
+    #[test]
+    fn loopback_mdns_is_skipped_by_default_on_windows_only() {
+        let config = PeerDriverConfig::on(vec![LO]);
+        assert!(!config.mdns_on_loopback_on_windows, "the default");
+        assert_eq!(config.skips_loopback_mdns_v4(), cfg!(windows));
+        let asked = PeerDriverConfig {
+            mdns_on_loopback_on_windows: true,
+            ..config
+        };
+        assert!(!asked.skips_loopback_mdns_v4());
     }
 }

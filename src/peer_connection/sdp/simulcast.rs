@@ -4,7 +4,7 @@
 
 use super::{SDP_ATTRIBUTE_RID, SDP_ATTRIBUTE_SIMULCAST};
 use crate::rtp_transceiver::rtp_sender::rtp_coding_parameters::RTCRtpRidRestrictions;
-use sdp::attribute::{Rid, RidDirection, Simulcast, SimulcastId, TypedAttribute};
+use sdp::attribute::{Rid, RidDirection, RidIdGrammar, Simulcast, SimulcastId};
 use sdp::description::media::MediaDescription;
 use std::collections::{HashMap, HashSet};
 
@@ -291,7 +291,11 @@ fn admitted_by_imageattr(
     })
 }
 
-pub(crate) fn section_rids(media: &MediaDescription) -> SectionRids {
+///
+/// Rid-ids are read with `rid_ids` (`SettingEngine::rid_id_grammar`): RFC 8851 section 10
+/// as corrected by erratum 7132 by default, where a line whose rid-id has `-`, `_` or more
+/// than 255 characters is a syntax error of step 1.
+pub(crate) fn section_rids(media: &MediaDescription, rid_ids: RidIdGrammar) -> SectionRids {
     let listed: HashSet<u8> = media
         .media_name
         .formats
@@ -311,7 +315,7 @@ pub(crate) fn section_rids(media: &MediaDescription) -> SectionRids {
                 section.declared.insert(id.to_owned());
             }
             // Step 1.
-            match Rid::parse(value) {
+            match Rid::parse_with(value, rid_ids) {
                 Ok(rid) => parsed.push(rid),
                 Err(err) => log::warn!("a=rid:{value} is discarded: {err}"),
             }
@@ -390,7 +394,7 @@ pub(crate) fn section_rids(media: &MediaDescription) -> SectionRids {
     }
 
     let simulcast = match (section.simulcast_lines, simulcast_value) {
-        (1, Some(value)) => match Simulcast::parse(value) {
+        (1, Some(value)) => match Simulcast::parse_with(value, rid_ids) {
             Ok(simulcast) => Some(simulcast),
             Err(err) => {
                 log::warn!("a=simulcast:{value} is ignored: {err}");
@@ -453,22 +457,25 @@ pub(crate) fn section_rids(media: &MediaDescription) -> SectionRids {
 }
 
 /// The usable rids of `media`: see [`section_rids`].
-pub(crate) fn get_rids(media: &MediaDescription) -> Vec<SimulcastRid> {
-    section_rids(media).rids
+pub(crate) fn get_rids(media: &MediaDescription, rid_ids: RidIdGrammar) -> Vec<SimulcastRid> {
+    section_rids(media, rid_ids).rids
 }
 
 /// RFC 9429 section 5.8: "if any line is not well formed ... the entire session description
 /// MUST be rejected". The error of the first `a=simulcast` line of `media` that is not: one
 /// that does not parse, or names a rid-id twice (RFC 8853 section 5.2: "a single rid-id MUST
 /// NOT occur more than once per 'a=simulcast' line"), or a direction twice.
-pub(crate) fn malformed_simulcast_line(media: &MediaDescription) -> Option<String> {
+pub(crate) fn malformed_simulcast_line(
+    media: &MediaDescription,
+    rid_ids: RidIdGrammar,
+) -> Option<String> {
     media
         .attributes
         .iter()
         .filter(|attr| attr.key == SDP_ATTRIBUTE_SIMULCAST)
         .find_map(|attr| {
             let value = attr.value.as_deref().unwrap_or_default();
-            Simulcast::parse(value)
+            Simulcast::parse_with(value, rid_ids)
                 .err()
                 .map(|err| format!("a=simulcast:{value}: {err}"))
         })
@@ -514,8 +521,11 @@ pub(crate) fn without_repeated_rids(value: &str) -> Option<String> {
 /// RFC 9429 section 5.8.3: "All rid-ids referenced in an 'a=simulcast' line MUST exist as
 /// 'a=rid' lines", or the description is refused. The first rid-id of `media` that has
 /// none.
-pub(crate) fn simulcast_rid_without_line(media: &MediaDescription) -> Option<String> {
-    let section = section_rids(media);
+pub(crate) fn simulcast_rid_without_line(
+    media: &MediaDescription,
+    rid_ids: RidIdGrammar,
+) -> Option<String> {
+    let section = section_rids(media, rid_ids);
     section
         .referenced
         .into_iter()
@@ -608,6 +618,17 @@ pub(crate) fn answered_rid_is_valid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdp::attribute::TypedAttribute;
+
+    /// [`super::section_rids`] with the default (corrected) rid-id grammar.
+    fn section_rids(media: &MediaDescription) -> SectionRids {
+        super::section_rids(media, RidIdGrammar::Corrected)
+    }
+
+    /// [`super::simulcast_rid_without_line`] with the default (corrected) rid-id grammar.
+    fn simulcast_rid_without_line(media: &MediaDescription) -> Option<String> {
+        super::simulcast_rid_without_line(media, RidIdGrammar::Corrected)
+    }
 
     fn video(formats: &[&str], lines: &[(&str, &str)]) -> MediaDescription {
         let mut media = MediaDescription::default();

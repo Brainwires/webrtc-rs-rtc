@@ -215,9 +215,23 @@ async fn main() -> Result<()> {
 
     let mut buf = vec![0; 2000];
 
+    // The browser page sends only its description, never the end of its candidates, so the
+    // transport cannot become "failed" (W3C webrtc-pc 5.6.4: "failed" needs the indication that
+    // there are no more remote candidates): a lost path stays "disconnected". This
+    // application gives up on its own after 30 s of it.
+    let mut disconnected_since: Option<Instant> = None;
+
     'EventLoop: loop {
         // Process peer connection if it exists
         if let Some(pc) = peer_connection.as_mut() {
+            if disconnected_since
+                .is_some_and(|since| since.elapsed() >= std::time::Duration::from_secs(30))
+            {
+                disconnected_since = None;
+                println!(
+                    "ICE disconnected for 30 s: treating the connection as failed (restart ICE from the page)"
+                );
+            }
             // Poll writes
             while let Some(msg) = pc.poll_write() {
                 if let Some(sock) = socket.as_ref()
@@ -232,6 +246,11 @@ async fn main() -> Result<()> {
                 match event {
                     RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state) => {
                         println!("ICE Connection State has changed: {}", state);
+                        if state == RTCIceConnectionState::Disconnected {
+                            disconnected_since.get_or_insert_with(Instant::now);
+                        } else {
+                            disconnected_since = None;
+                        }
                         if state == RTCIceConnectionState::Failed {
                             println!("ICE Connection failed");
                         }

@@ -667,7 +667,12 @@ pub fn std_multicast(config: &MulticastConfig) -> io::Result<std::net::UdpSocket
             };
             socket.bind(&SocketAddr::new(local.into(), config.port).into())?;
             join_each(&interfaces, |interface| match interface {
-                Some(IpAddr::V4(interface)) => socket.join_multicast_v4(&group, &interface),
+                Some(IpAddr::V4(interface)) => {
+                    if cfg!(windows) && interface.is_loopback() {
+                        warn_loopback_join_on_windows(group);
+                    }
+                    socket.join_multicast_v4(&group, &interface)
+                }
                 _ => socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED),
             })?;
         }
@@ -690,6 +695,21 @@ pub fn std_multicast(config: &MulticastConfig) -> io::Result<std::net::UdpSocket
         }
     }
     Ok(socket.into())
+}
+
+/// On Windows a socket joined on the loopback interface that sends to the group leaves the
+/// group's destination-cache entry on loopback after the process has exited, and the system
+/// then answers 127.0.0.1 for the group to every process that asks which address reaches it,
+/// until the entry is deleted (`peer` module documentation). Said once per process.
+fn warn_loopback_join_on_windows(group: Ipv4Addr) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::warn!(
+            "joining {group} on the loopback interface: on Windows mDNS sent there leaves the \
+             group's destination-cache route on loopback after this process, for other \
+             processes too (netsh interface ipv4 delete destinationcache, as administrator)"
+        );
+    });
 }
 
 /// Joins once per interface (`None`: the default one, when there is no interface): an error

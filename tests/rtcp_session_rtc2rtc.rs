@@ -212,6 +212,8 @@ struct Peer {
     source_changes: Vec<&'static str>,
     /// The SSRCs `OnSsrcCollision` named.
     collisions: Vec<u32>,
+    /// The SSRCs `OnRemoteCnameMismatch` named (RFC 5576 section 6.1).
+    cname_mismatches: Vec<u32>,
     /// How many times negotiation was asked for.
     negotiation_needed: usize,
     /// `OnSsrcCollision` and `OnNegotiationNeededEvent`, in the order they came.
@@ -387,6 +389,7 @@ impl Peer {
             rtcp_leaders: Vec::new(),
             source_changes: Vec::new(),
             collisions: Vec::new(),
+            cname_mismatches: Vec::new(),
             negotiation_needed: 0,
             log: Vec::new(),
         })
@@ -439,6 +442,8 @@ struct World {
     lost_copies: usize,
     /// Drop every sender RTP packet with one of these SSRCs (an RTX stream).
     blocked_ssrcs: Vec<u32>,
+    /// Drop every RTCP datagram of the sender while set.
+    hold_sender_rtcp: bool,
 }
 
 impl World {
@@ -465,6 +470,9 @@ impl World {
                 break;
             }
             for (i, from, to, data) in in_flight {
+                if i == 0 && self.hold_sender_rtcp && wire_rtcp(&data) {
+                    continue;
+                }
                 if i == 0
                     && let Some((ssrc, seq)) = wire_rtp(&data)
                 {
@@ -525,6 +533,9 @@ impl World {
                     RTCPeerConnectionEvent::OnSsrcCollision(ssrc) => {
                         peer.collisions.push(ssrc);
                         peer.log.push("collision");
+                    }
+                    RTCPeerConnectionEvent::OnRemoteCnameMismatch(ssrc) => {
+                        peer.cname_mismatches.push(ssrc);
                     }
                     RTCPeerConnectionEvent::OnNegotiationNeededEvent => {
                         peer.negotiation_needed += 1;
@@ -599,6 +610,18 @@ impl World {
         peers: [Peer; 2],
         receive_bandwidth: Option<u64>,
     ) -> Result<(Self, RTCRtpSenderId)> {
+        Self::connected_peers_edited(peers, receive_bandwidth, str::to_owned, false)
+    }
+
+    /// [`connected_peers_with`](Self::connected_peers_with), the offer `edit`ed on its way to
+    /// the answerer (the offerer sets the one it made), and the sender's RTCP held from the
+    /// start when `hold_sender_rtcp`.
+    fn connected_peers_edited(
+        peers: [Peer; 2],
+        receive_bandwidth: Option<u64>,
+        edit: fn(&str) -> String,
+        hold_sender_rtcp: bool,
+    ) -> Result<(Self, RTCRtpSenderId)> {
         let mut world = World {
             peers,
             now: Instant::now(),
@@ -608,6 +631,7 @@ impl World {
             lose_for_good: None,
             lost_copies: 0,
             blocked_ssrcs: Vec::new(),
+            hold_sender_rtcp,
         };
         let transceiver = world.peers[0].pc.add_transceiver_from_kind(
             RtpCodecKind::Video,
@@ -633,7 +657,10 @@ impl World {
         world.peers[0]
             .pc
             .set_local_description(now, offer.clone())?;
-        world.peers[1].pc.set_remote_description(now, offer)?;
+        world.peers[1].pc.set_remote_description(
+            now,
+            rtci::peer_connection::sdp::RTCSessionDescription::offer(edit(&offer.sdp))?,
+        )?;
         let receiving: Vec<_> = world.peers[1].pc.get_transceivers().collect();
         for id in receiving {
             world.peers[1]
@@ -1076,6 +1103,7 @@ fn shared_ssrc_world(signal: fn(&str) -> String) -> Result<(World, Vec<RTCRtpSen
         lose_for_good: None,
         lost_copies: 0,
         blocked_ssrcs: Vec::new(),
+        hold_sender_rtcp: false,
     };
     let mut senders = vec![];
     for peer in world.peers.iter_mut() {
@@ -1269,6 +1297,245 @@ fn a_description_that_names_a_local_ssrc_moves_the_sender_at_once() -> Result<()
     );
     world.pump()?;
     assert_eq!(world.peers[1].collisions, vec![SHARED]);
+    Ok(())
+}
+
+/// The CNAME the sender of the RFC 5576 section 6.1 tests is created with: what its RTCP SDES
+/// names for each of its SSRCs.
+const SENT_CNAME: &str = "sent-cname";
+
+/// RFC 5576 section 6.1: the offerer, created with [`SENT_CNAME`], sends video; its offer
+/// reaches the answerer with each `a=ssrc:<ssrc> cname:` saying `declared` instead. The
+/// sender's RTCP is held from the start when `hold_sender_rtcp`.
+fn declared_cname_world(
+    edit: fn(&str) -> String,
+    hold_sender_rtcp: bool,
+) -> Result<(World, RTCRtpSenderId)> {
+    World::connected_peers_edited(
+        [
+            Peer::with_cname("10.0.0.1:5000", SENT_CNAME)?,
+            Peer::new("10.0.0.2:5000", false)?,
+        ],
+        None,
+        edit,
+        hold_sender_rtcp,
+    )
+}
+
+/// The offer as an answerer receives it when the description was written for another source:
+/// every `cname` source attribute names `declared-elsewhere`.
+fn declared_elsewhere(sdp: &str) -> String {
+    sdp.replace(
+        &format!(" cname:{SENT_CNAME}\r\n"),
+        " cname:declared-elsewhere\r\n",
+    )
+}
+
+impl World {
+    /// Runs until the answerer has heard [`SENT_CNAME`] for `ssrc` in an RTCP SDES, and 100
+    /// ms more.
+    fn run_until_cname_heard(&mut self, ssrc: u32) -> Result<()> {
+        let deadline = self.now + Duration::from_secs(10);
+        while self.peers[1].pc.remote_rtcp_cname(ssrc) != Some(SENT_CNAME) {
+            if self.now >= deadline {
+                bail!("no SDES CNAME for ssrc {ssrc} within 10 s");
+            }
+            let until = self.now + Duration::from_millis(100);
+            self.run_until(until)?;
+        }
+        let until = self.now + Duration::from_millis(100);
+        self.run_until(until)
+    }
+}
+
+/// The (SSRC, RTX SSRC) of each coding of the answerer's receiving track.
+fn received_codings(world: &mut World) -> Vec<(Option<u32>, Option<u32>)> {
+    let pc = &mut world.peers[1].pc;
+    let id = pc.get_receivers().next().expect("a receiver");
+    let receiver = pc.rtp_receiver(id).expect("the receiver");
+    receiver
+        .track()
+        .codings()
+        .iter()
+        .map(|coding| {
+            let coding = &coding.rtp_coding_parameters;
+            (coding.ssrc, coding.rtx.as_ref().map(|rtx| rtx.ssrc))
+        })
+        .collect()
+}
+
+/// The offerer offers again, its offer `edit`ed on the way as the first one was, and the
+/// answerer answers.
+fn offer_again(world: &mut World, edit: fn(&str) -> String) -> Result<()> {
+    let now = world.now;
+    let offer = world.peers[0].pc.create_offer(None)?;
+    world.peers[0]
+        .pc
+        .set_local_description(now, offer.clone())?;
+    world.peers[1].pc.set_remote_description(
+        now,
+        rtci::peer_connection::sdp::RTCSessionDescription::offer(edit(&offer.sdp))?,
+    )?;
+    let answer = world.peers[1].pc.create_answer(None)?;
+    world.peers[1]
+        .pc
+        .set_local_description(now, answer.clone())?;
+    world.peers[0].pc.set_remote_description(now, answer)?;
+    world.pump()
+}
+
+/// RFC 5576 section 6.1: "If a session participant receives an RTCP SDES packet associating
+/// this SSRC with a different CNAME, it SHOULD assume there has been an SSRC collision and
+/// that the description of the source that was carried in the SDP description is not
+/// applicable to the actual source being received"; section 5: packets of a source the
+/// description does not describe "SHOULD be handled in the same manner as packets from
+/// additional sources would be handled had the endpoint not received any a=ssrc: attributes".
+/// The description declares the sender's SSRCs with another CNAME than its SDES names, and
+/// the SDES (the sender reports from its media SSRC before it sends, RFC 8108 6.1) comes
+/// before any media. The application is told, once per SSRC (the media SSRC, then the RTX
+/// SSRC once it has sent); the declared stream is taken off the receiver, and the media that
+/// follows opens the same track as a stream of an SSRC no description names: without the
+/// declaration's `a=ssrc-group:FID` pairing, its retransmission associated by its `apt`
+/// (RFC 4588 5.3), nothing lost. No local SSRC moves and nothing asks for negotiation (not an
+/// RFC 3550 8.2 collision with this endpoint). An offer that declares the SSRC with the same
+/// CNAME again is not applied to the stream again.
+#[test]
+fn an_sdes_cname_other_than_the_declared_one_leaves_the_ssrc_undeclared() -> Result<()> {
+    let (mut world, sender) = declared_cname_world(declared_elsewhere, false)?;
+    let (ssrc, rtx_ssrc, _) = world.sender_stream(sender);
+    let rtx_ssrc = rtx_ssrc.expect("RTX is negotiated");
+    let negotiation_needed = world.peers.each_ref().map(|peer| peer.negotiation_needed);
+
+    world.run_until_cname_heard(ssrc)?;
+    assert_eq!(world.peers[1].cname_mismatches, vec![ssrc]);
+    assert_eq!(
+        received_codings(&mut world),
+        vec![],
+        "the declared stream is taken off the receiver"
+    );
+
+    world.drop_once = Some((ssrc, FIRST_SEQ + 20));
+    world.send_media(sender, FIRST_SEQ, 50)?;
+    let until = world.now + Duration::from_secs(2);
+    world.run_until(until)?;
+    for seq in FIRST_SEQ..FIRST_SEQ + 50 {
+        assert!(
+            world.peers[1].read_rtp.contains(&(ssrc, seq)),
+            "packet {seq} is received (the lost one by retransmission)"
+        );
+    }
+    assert_eq!(world.peers[1].opened.len(), 1, "one track, opened once");
+    assert_eq!((world.peers[1].closed, world.peers[1].muted), (0, 0));
+    assert_eq!(
+        received_codings(&mut world),
+        vec![(Some(ssrc), None)],
+        "the track's coding is the one an SSRC no description names gets: no declared RTX SSRC"
+    );
+    let mut mismatches = world.peers[1].cname_mismatches.clone();
+    mismatches.sort_unstable();
+    let mut both = vec![ssrc, rtx_ssrc];
+    both.sort_unstable();
+    assert_eq!(mismatches, both, "the RTX SSRC's SDES contradicts it too");
+
+    assert_eq!(
+        world.sender_stream(sender).0,
+        ssrc,
+        "the sender keeps its SSRC"
+    );
+    assert!(world.peers.iter().all(|peer| peer.collisions.is_empty()));
+    assert_eq!(
+        world.peers.each_ref().map(|peer| peer.negotiation_needed),
+        negotiation_needed
+    );
+
+    // The same description again: the declaration stays not applicable.
+    offer_again(&mut world, declared_elsewhere)?;
+    world.send_media(sender, FIRST_SEQ + 50, 20)?;
+    assert!(world.peers[1].read_rtp.contains(&(ssrc, FIRST_SEQ + 69)));
+    assert_eq!(world.peers[1].opened.len(), 1, "still the one track");
+    assert_eq!(received_codings(&mut world), vec![(Some(ssrc), None)]);
+    assert_eq!(
+        world.peers[1].cname_mismatches.len(),
+        2,
+        "told once per SSRC"
+    );
+    Ok(())
+}
+
+/// RFC 5576 section 6.1, the stream already flowing: the sender's RTCP is held until its
+/// media has opened the track by the declared SSRC (with the declared RTX pairing), then the
+/// SDES contradicting the declaration arrives (for the media SSRC, and its RTX SSRC when the
+/// sender describes that too). The application is told; the stream is not
+/// unbound, re-routed or ended: it keeps its track and its coding, and the media that follows
+/// is received as before.
+#[test]
+fn a_flowing_stream_whose_sdes_contradicts_its_declared_cname_keeps_flowing() -> Result<()> {
+    let (mut world, sender) = declared_cname_world(declared_elsewhere, true)?;
+    let (ssrc, rtx_ssrc, _) = world.sender_stream(sender);
+    world.send_media(sender, FIRST_SEQ, 30)?;
+    assert_eq!(world.peers[1].opened.len(), 1);
+    assert_eq!(received_codings(&mut world), vec![(Some(ssrc), rtx_ssrc)]);
+    assert!(world.peers[1].cname_mismatches.is_empty());
+
+    world.hold_sender_rtcp = false;
+    world.run_until_cname_heard(ssrc)?;
+    // The sender's first compound packet after the media describes its RTX SSRC as well
+    // (declared too, with the same contradicted CNAME): each is reported once.
+    let mismatches = world.peers[1].cname_mismatches.clone();
+    let declared = [Some(ssrc), rtx_ssrc];
+    assert!(mismatches.contains(&ssrc), "{mismatches:?}");
+    assert!(
+        mismatches.len() <= 2
+            && (mismatches.len() < 2 || mismatches[0] != mismatches[1])
+            && mismatches
+                .iter()
+                .all(|reported| declared.contains(&Some(*reported))),
+        "only the declared SSRCs, once each: {mismatches:?}"
+    );
+
+    world.send_media(sender, FIRST_SEQ + 30, 30)?;
+    for seq in FIRST_SEQ..FIRST_SEQ + 60 {
+        assert!(
+            world.peers[1].read_rtp.contains(&(ssrc, seq)),
+            "packet {seq} is received"
+        );
+    }
+    assert_eq!(world.peers[1].opened.len(), 1, "the same track");
+    assert_eq!((world.peers[1].closed, world.peers[1].muted), (0, 0));
+    assert_eq!(received_codings(&mut world), vec![(Some(ssrc), rtx_ssrc)]);
+    assert!(world.peers.iter().all(|peer| peer.collisions.is_empty()));
+    assert_eq!(world.sender_stream(sender).0, ssrc);
+    Ok(())
+}
+
+/// RFC 5576 section 6.1, the CNAME the description declares being the one the SDES names
+/// (as the engine writes it, `a_connection_created_with_an_existing_connections_cname_uses_it`):
+/// nothing changes. The declared stream and its RTX pairing stay on the receiver before and
+/// after the media, a lost packet comes back over the declared RTX flow, and nothing is
+/// reported.
+#[test]
+fn an_sdes_cname_that_matches_the_declared_one_changes_nothing() -> Result<()> {
+    let (mut world, sender) = declared_cname_world(str::to_owned, false)?;
+    let (ssrc, rtx_ssrc, _) = world.sender_stream(sender);
+    assert!(rtx_ssrc.is_some(), "RTX is negotiated");
+
+    world.run_until_cname_heard(ssrc)?;
+    assert_eq!(received_codings(&mut world), vec![(Some(ssrc), rtx_ssrc)]);
+
+    world.drop_once = Some((ssrc, FIRST_SEQ + 20));
+    world.send_media(sender, FIRST_SEQ, 50)?;
+    let until = world.now + Duration::from_secs(2);
+    world.run_until(until)?;
+    for seq in FIRST_SEQ..FIRST_SEQ + 50 {
+        assert!(
+            world.peers[1].read_rtp.contains(&(ssrc, seq)),
+            "packet {seq} is received"
+        );
+    }
+    assert_eq!(world.peers[1].opened.len(), 1);
+    assert_eq!(received_codings(&mut world), vec![(Some(ssrc), rtx_ssrc)]);
+    assert!(world.peers[1].cname_mismatches.is_empty());
+    assert!(world.peers.iter().all(|peer| peer.collisions.is_empty()));
     Ok(())
 }
 

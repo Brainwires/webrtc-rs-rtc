@@ -92,15 +92,124 @@ fn rtc_bind_ip() -> std::net::IpAddr {
 
 /// The address of the interface multicast to the mDNS group leaves by: the one a UDP socket
 /// connected to the group sends from. `None` if there is none (or it is loopback).
+///
+/// On Windows the default route's address instead (a socket connected to a documentation
+/// address sends nothing): there the system's answer for the group comes from its destination
+/// cache, and a process that joined the group on loopback and sent to it there leaves the
+/// group's entry on loopback after it has exited (`netsh interface ipv4 show destinationcache
+/// address=224.0.0.251`: source 127.0.0.1), so after the stream driver's loopback test a fresh
+/// process got 127.0.0.1 for the group, bound loopback, and could not reach the upstream peer's
+/// LAN candidates: every test of this file timed out (agent-test run 46045692164). The default
+/// route stayed the LAN address throughout.
 fn mdns_egress_ip() -> Option<std::net::IpAddr> {
+    let target: std::net::SocketAddr = if cfg!(windows) {
+        std::net::SocketAddr::from(([192, 0, 2, 1], 9))
+    } else {
+        std::net::SocketAddr::from((rtci::mdns::MDNS_MULTICAST_IPV4, MDNS_PORT))
+    };
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|socket| {
-            socket.connect((rtci::mdns::MDNS_MULTICAST_IPV4, MDNS_PORT))?;
+            socket.connect(target)?;
             socket.local_addr()
         })
         .ok()
         .map(|addr| addr.ip())
         .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+}
+
+/// Whether the host delivers a datagram this process sends to the mDNS group (224.0.0.251:5353)
+/// back to it, through a socket made the way these tests make the rtc peer's mDNS socket
+/// (`MulticastSocket::new()`: joined on the default interface, sending by the system's route for
+/// the group, which `cargo.yml` points at loopback on GitHub-hosted macOS), within two seconds.
+/// The QueryAndGather tests resolve each peer's `.local` name over the host's mDNS group: a host
+/// that does not loop multicast back (seen on a self-hosted Windows VM, NAT address 10.0.2.15:
+/// no mDNS datagram arrived) fails them whatever the engine does. The probe is a DNS response
+/// with no records and a random ID (other responders ignore it), sent up to ten times 200 ms
+/// apart; it asks the host one question before the test, which runs once.
+fn host_loops_multicast() -> bool {
+    use std::net::SocketAddr;
+    let probe = || -> std::io::Result<bool> {
+        let group = SocketAddr::from((rtci::mdns::MDNS_MULTICAST_IPV4, MDNS_PORT));
+        let socket: std::net::UdpSocket = MulticastSocket::new().into_std()?;
+        socket.set_nonblocking(false)?;
+        socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+        let nonce = std::process::id()
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or_default();
+        let [id0, id1, ..] = nonce.to_be_bytes();
+        let message = [id0, id1, 0x84, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut buf = [0u8; 1500];
+        for _ in 0..10 {
+            socket.send_to(&message, group)?;
+            let until = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < until {
+                match socket.recv_from(&mut buf) {
+                    Ok((n, _)) if buf[..n] == message => return Ok(true),
+                    Ok(_) => continue,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(false)
+    };
+    probe().unwrap_or_else(|e| {
+        log::warn!("multicast probe: {e}");
+        false
+    })
+}
+
+/// Whether this job says the host delivers multicast to itself: `RTCI_EXPECT_HOST_MULTICAST`, a
+/// comma-separated list of operating system names (`std::env::consts::OS`: `linux`, `macos`,
+/// `windows`), which `cargo.yml` sets on the jobs where these tests run today (Linux, macOS
+/// with its multicast route over loopback, GitHub-hosted Windows). There a failing probe fails
+/// the test instead of skipping it, so the skip cannot quietly remove coverage; elsewhere
+/// (a self-hosted VM that does not loop multicast, an `agent-test` run without the variable) it
+/// skips with the reason printed.
+fn host_multicast_expected() -> bool {
+    std::env::var("RTCI_EXPECT_HOST_MULTICAST")
+        .is_ok_and(|v| v.split(',').any(|os| os.trim() == std::env::consts::OS))
+}
+
+/// [`host_loops_multicast`], or the test is skipped with the reason printed; where
+/// [`host_multicast_expected`], a host that does not deliver fails the test.
+fn multicast_or_skip(test: &str) -> bool {
+    if host_loops_multicast() {
+        return true;
+    }
+    if host_multicast_expected() {
+        panic!(
+            "{test}: this host does not deliver multicast to itself, and the job says it does \
+             (RTCI_EXPECT_HOST_MULTICAST): the mDNS interop tests must run here"
+        );
+    }
+    println!(
+        "SKIPPED {test}: the host does not loop multicast to the mDNS group back to this process"
+    );
+    false
+}
+
+/// The rtc peer's mDNS socket. On Windows it is given the default route's interface
+/// ([`mdns_egress_ip`]), so that it joins and sends there (`IP_MULTICAST_IF`) whatever the
+/// system's route for the group says: a host whose destination cache holds that route on
+/// loopback (left by any process that sent to the group from 127.0.0.1) otherwise sends every
+/// answer with source 127.0.0.1, and the upstream peer resolves the name to loopback
+/// (agent-test run 46049306566). Elsewhere the system's route, as before (`cargo.yml` points it
+/// at loopback on GitHub's macOS image).
+fn rtc_mdns_socket() -> MulticastSocket {
+    match (cfg!(windows), mdns_egress_ip()) {
+        (true, Some(std::net::IpAddr::V4(ip))) => MulticastSocket::new().with_interface(ip),
+        _ => MulticastSocket::new(),
+    }
 }
 
 /// Helper function to create a webrtc peer connection with QueryAndGather mDNS mode
@@ -449,7 +558,7 @@ async fn test_mdns_query_only_webrtc_offerer_rtc_answerer() -> Result<()> {
     // Create RTC peer (answerer) with QueryOnly mode
     let pc_socket = UdpSocket::bind((rtc_bind_ip(), 0)).await?;
     let local_addr = pc_socket.local_addr()?;
-    let mdns_socket = UdpSocket::from_std(MulticastSocket::new().into_std()?)?;
+    let mdns_socket = UdpSocket::from_std(rtc_mdns_socket().into_std()?)?;
     log::info!("RTC peer bound to {}", local_addr);
 
     let mut rtc_pc = create_rtc_peer_with_mdns(local_addr, MulticastDnsMode::QueryOnly, true)?;
@@ -550,6 +659,9 @@ async fn test_mdns_query_only_webrtc_offerer_rtc_answerer() -> Result<()> {
 #[tokio::test]
 async fn test_mdns_query_and_gather_webrtc_offerer_rtc_answerer() -> Result<()> {
     let _one_test_on_the_group = MDNS_GROUP_IN_USE.lock().await;
+    if !multicast_or_skip("test_mdns_query_and_gather_webrtc_offerer_rtc_answerer") {
+        return Ok(());
+    }
     common::install_crypto_provider();
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -610,7 +722,7 @@ async fn test_mdns_query_and_gather_webrtc_offerer_rtc_answerer() -> Result<()> 
     // Create RTC peer with QueryAndGather mode
     let pc_socket = UdpSocket::bind((rtc_bind_ip(), 0)).await?;
     let local_addr = pc_socket.local_addr()?;
-    let mdns_socket = UdpSocket::from_std(MulticastSocket::new().into_std()?)?;
+    let mdns_socket = UdpSocket::from_std(rtc_mdns_socket().into_std()?)?;
 
     let mut rtc_pc = create_rtc_peer_with_mdns(local_addr, MulticastDnsMode::QueryAndGather, true)?;
     log::info!(
@@ -718,7 +830,7 @@ async fn test_mdns_query_only_rtc_offerer_webrtc_answerer() -> Result<()> {
     // Create RTC peer (offerer) with QueryOnly mode
     let pc_socket = UdpSocket::bind((rtc_bind_ip(), 0)).await?;
     let local_addr = pc_socket.local_addr()?;
-    let mdns_socket = UdpSocket::from_std(MulticastSocket::new().into_std()?)?;
+    let mdns_socket = UdpSocket::from_std(rtc_mdns_socket().into_std()?)?;
 
     let mut rtc_pc = create_rtc_peer_with_mdns(local_addr, MulticastDnsMode::QueryOnly, false)?;
     log::info!("Created RTC peer (offerer) with QueryOnly mDNS mode");
@@ -882,6 +994,9 @@ async fn test_mdns_query_only_rtc_offerer_webrtc_answerer() -> Result<()> {
 #[tokio::test]
 async fn test_mdns_query_and_gather_rtc_offerer_webrtc_answerer() -> Result<()> {
     let _one_test_on_the_group = MDNS_GROUP_IN_USE.lock().await;
+    if !multicast_or_skip("test_mdns_query_and_gather_rtc_offerer_webrtc_answerer") {
+        return Ok(());
+    }
     common::install_crypto_provider();
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
@@ -894,7 +1009,7 @@ async fn test_mdns_query_and_gather_rtc_offerer_webrtc_answerer() -> Result<()> 
     // Create RTC peer (offerer) with QueryAndGather mode
     let pc_socket = UdpSocket::bind((rtc_bind_ip(), 0)).await?;
     let local_addr = pc_socket.local_addr()?;
-    let mdns_socket = UdpSocket::from_std(MulticastSocket::new().into_std()?)?;
+    let mdns_socket = UdpSocket::from_std(rtc_mdns_socket().into_std()?)?;
 
     let mut rtc_pc =
         create_rtc_peer_with_mdns(local_addr, MulticastDnsMode::QueryAndGather, false)?;

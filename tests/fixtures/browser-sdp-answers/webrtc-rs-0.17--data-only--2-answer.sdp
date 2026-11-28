@@ -3,7 +3,6 @@ o=- <session-id> <session-version> IN IP4 0.0.0.0
 s=-
 t=0 0
 a=msid-semantic:WMS *
-a=ice-options:trickle ice2
 a=ice-pacing:50
 a=extmap-allow-mixed
 a=group:BUNDLE 0

@@ -190,6 +190,65 @@ fn the_clients_last_flight_is_sent_again_until_it_is_acknowledged() -> Result<()
     Ok(())
 }
 
+/// RFC 9147 section 5.8.1: "for at least twice the default MSL defined for [RFC0793], when in
+/// the FINISHED state, the server MUST respond to retransmission of the client's final flight
+/// with a retransmit of its ACK." The server's ACK of the Finished is lost; the client sends
+/// its Finished again 10, 60, 120, 180 and 235 s after the server completed, and each is
+/// acknowledged at once, with one ACK. Sent again 270 s after, it is not.
+#[test]
+fn the_clients_last_flight_is_acknowledged_for_twice_the_msl() -> Result<()> {
+    let mut pair = no_cookies()?;
+    pair.round();
+    let finished = take(&mut pair.client);
+    pair.deliver_to_server(finished);
+    assert!(pair.server_complete);
+    let completed = pair.now;
+    let lost_ack = take(&mut pair.server);
+    assert_eq!(lost_ack.len(), 1);
+    for (after, answered) in [
+        (10, true),
+        (60, true),
+        (120, true),
+        (180, true),
+        (235, true),
+        (270, false),
+    ] {
+        pair.now = completed + Duration::from_secs(after);
+        let now = pair.now;
+        let _ = pair.server.handle_timeout(client_addr(), now);
+        assert!(
+            take(&mut pair.server).is_empty(),
+            "{after} s: nothing unasked"
+        );
+        pair.client.handle_timeout(server_addr(), now)?;
+        let again = take(&mut pair.client);
+        assert_eq!(
+            again.len(),
+            1,
+            "{after} s: the client sends its Finished again"
+        );
+        assert_eq!(
+            record_first_bytes(&again[0]),
+            [0x2e],
+            "{after} s: in epoch 2"
+        );
+        pair.deliver_to_server(again);
+        let ack = take(&mut pair.server);
+        if answered {
+            assert_eq!(ack.len(), 1, "{after} s: acknowledged");
+            assert_eq!(
+                record_first_bytes(&ack[0]).len(),
+                1,
+                "{after} s: one ACK record"
+            );
+        } else {
+            assert!(ack.is_empty(), "{after} s: no longer read");
+        }
+    }
+    assert_eq!(pair.server_sends(b"still up"), vec![b"still up".to_vec()]);
+    Ok(())
+}
+
 /// RFC 9147 section 5.8.1: application data that overtakes the client's Finished is held, not
 /// delivered and not lost.
 #[test]

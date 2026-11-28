@@ -442,6 +442,52 @@ fn a_t3_expiry_is_counted_with_what_it_abandoned_or_sent_again() -> Result<()> {
     Ok(())
 }
 
+/// `AssociationStats::get_num_partially_reliable_retransmissions` tells the retransmissions of
+/// a channel with `maxRetransmits` 0 (RFC 8831 6.6, RFC 7496) from those of a reliable message
+/// sent beside it: the DCEP DATA_CHANNEL_OPEN, sent reliably whatever the channel's
+/// reliability (RFC 8832 5), whose acknowledgement can be lost after the channel's own messages
+/// have started. One T3-rtx expiry with both outstanding sends the OPEN again (a retransmission)
+/// and abandons the unreliable message (RFC 3758 3.5 A2): one retransmission in all, none of
+/// partially reliable DATA. (tests/testenv_impairment.rs
+/// `unreliable_channel_loses_without_retransmitting` counted every retransmission from the first
+/// message and failed when the OPEN's went again after it, run 46050142067.)
+#[test]
+fn a_reliable_message_sent_again_is_not_counted_as_a_partially_reliable_retransmission()
+-> Result<()> {
+    let mut a = timed_test_association();
+    let now = Instant::now();
+    a.open_stream(0, PayloadProtocolIdentifier::Dcep)?
+        .write_sctp(
+            now,
+            &Bytes::from_static(b"open"),
+            PayloadProtocolIdentifier::Dcep,
+        )?;
+    {
+        let mut s = a.open_stream(1, PPI)?;
+        s.set_reliability_params(true, ReliabilityType::Rexmit, 0)?;
+        s.write_sctp(now, &Bytes::from_static(b"user"), PPI)?;
+    }
+    let sent = transmitted_data(&a.gather_outbound(now).0);
+    assert_eq!(2, sent.len(), "the OPEN and the user message");
+    let at = a.timers.get(Timer::T3RTX).unwrap();
+    a.handle_timeout(at);
+    let again = transmitted_data(&a.gather_outbound(at).0);
+    assert_eq!(
+        vec![0],
+        again
+            .iter()
+            .map(|c| c.stream_identifier)
+            .collect::<Vec<_>>(),
+        "only the reliable message goes again"
+    );
+
+    let mut stats = a.stats();
+    assert_eq!(1, stats.get_num_retransmissions());
+    assert_eq!(0, stats.get_num_partially_reliable_retransmissions());
+    assert_eq!(1, stats.get_num_abandoned_messages());
+    Ok(())
+}
+
 /// A loss that three miss indications reveal (RFC 9260 7.2.4) in a message whose retransmission
 /// budget is spent is abandoned there and skipped with FORWARD TSN (RFC 3758 3.5 A2, C3), and
 /// counted as such, not as a Fast Retransmit or a T3-rtx expiry.

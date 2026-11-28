@@ -68,6 +68,45 @@ impl KeyFrameRequestInterceptor {
     }
 }
 
+/// Why an interceptor of this crate asked the application for a key frame itself: the
+/// Picture Loss Indication it puts on the read leg (sender SSRC 0, marked
+/// [`Attribute::DeliverToApplication`]) carries this as [`Attribute::Custom`], so whoever
+/// reads it can tell it from a request the remote peer sent. Read it with
+/// [`AttributedPacket::custom`](crate::AttributedPacket::custom); a PLI or FIR without it came
+/// from the network.
+///
+/// The origin rides with the packet from where it is made, rather than being guessed from the
+/// sender SSRC: an SSRC is a random 32-bit number (RFC 3550 section 8.1), 0 included, so a
+/// remote peer may send a PLI with sender SSRC 0, and that one is still the peer's. The peer connection reads it into
+/// `RTCPeerConnectionEvent::OnKeyFrameRequestOrigin`.
+///
+/// ```
+/// use rtci_interceptor::{Attribute, AttributedPacket, LocalKeyFrameRequest, Packet};
+/// use std::sync::Arc;
+///
+/// let notice = AttributedPacket::new(Packet::Rtcp(vec![]))
+///     .with(Attribute::Custom(Arc::new(LocalKeyFrameRequest::PacerDiscard)));
+/// assert_eq!(
+///     Some(&LocalKeyFrameRequest::PacerDiscard),
+///     notice.custom::<LocalKeyFrameRequest>()
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LocalKeyFrameRequest {
+    /// The pacer discarded a frame of the stream (`PacerDiscard`, outside a flush): the
+    /// receiver will miss it, and the next picture it can decode is a key frame.
+    PacerDiscard,
+    /// The pacer gave its queue up at a collapse of the target (`PacerFlush`): for every
+    /// video stream, whether it had media queued (then a `PacerDiscard` came first) or not
+    /// (its repairs were dropped all the same).
+    PacerFlush,
+    /// The NACK responder gave the repair of the stream up (a request for a packet too old
+    /// to be useful, or a repair backlog after a fall of the target): what was sent before is
+    /// no longer repaired.
+    RepairGivenUp,
+}
+
 /// Whether a compound RTCP packet carries a request only the encoder can answer: a PLI or a
 /// FIR, and also an SLI or an RPSI (RFC 4585 sections 6.3.2, 6.3.3; RFC 8834 sections 5.1.3,
 /// 5.1.4: a sender "SHOULD" try to repair the slice, and act on a reference picture

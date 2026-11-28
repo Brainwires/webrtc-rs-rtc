@@ -39,6 +39,32 @@ impl fmt::Display for RidDirection {
     }
 }
 
+/// The `rid-id` grammar a line is read with.
+///
+/// RFC 8851 section 10 as published has `rid-id = 1*(alpha-numeric / "-" / "_")`; erratum
+/// 7132 (Verified 2022-10-13) corrects it to `rid-id = 1*255(alpha-numeric)`, "consistent with
+/// the rules for the RtpStreamId/RepairedRtpStreamId SDES from RFC 8852 section 3". The
+/// corrected grammar is the default; [`Rid::parse`], [`Simulcast::parse`] and [`Rid::new`]
+/// use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RidIdGrammar {
+    /// `1*255(alpha-numeric)` (erratum 7132).
+    #[default]
+    Corrected,
+    /// `1*(alpha-numeric / "-" / "_")`, of any length: RFC 8851 as published.
+    Published,
+}
+
+impl RidIdGrammar {
+    /// Whether `id` is a rid-id in this grammar.
+    pub fn admits(self, id: &str) -> bool {
+        match self {
+            RidIdGrammar::Corrected => grammar::is_rid_id(id),
+            RidIdGrammar::Published => grammar::is_alnum_dash_underscore(id),
+        }
+    }
+}
+
 /// The restrictions whose value is `int-param-val = 1*DIGIT`.
 const RID_INTEGER_RESTRICTIONS: [&str; 6] = [
     "max-width",
@@ -54,7 +80,7 @@ const RID_INTEGER_RESTRICTIONS: [&str; 6] = [
 ///
 /// ```text
 /// rid-syntax        = %s"a=rid:" rid-id SP rid-dir [ rid-pt-param-list / rid-param-list ]
-/// rid-id            = 1*(alpha-numeric / "-" / "_")
+/// rid-id            = 1*255(alpha-numeric)        ; erratum 7132 (see RidIdGrammar)
 /// rid-pt-param-list = SP rid-fmt-list *(";" rid-param)
 /// rid-param-list    = SP rid-param *(";" rid-param)
 /// rid-fmt-list      = %s"pt=" fmt *( "," fmt )
@@ -66,7 +92,8 @@ const RID_INTEGER_RESTRICTIONS: [&str; 6] = [
 /// answerer discards an `a=rid` line with a restriction it does not understand).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rid {
-    /// The RTP stream identifier: letters, digits, `-` and `_`.
+    /// The RTP stream identifier: 1 to 255 letters and digits (`-` and `_` too, and any
+    /// length, when read with [`RidIdGrammar::Published`]).
     pub id: String,
     /// The direction the restrictions apply in.
     pub direction: RidDirection,
@@ -78,10 +105,19 @@ pub struct Rid {
 }
 
 impl Rid {
-    /// An `a=rid` line with no `pt=` and no restriction.
+    /// An `a=rid` line with no `pt=` and no restriction. `id` must be a rid-id of the
+    /// corrected grammar ([`RidIdGrammar::Corrected`]).
     pub fn new(id: impl Into<String>, direction: RidDirection) -> Result<Self> {
+        Self::new_in(id, direction, RidIdGrammar::Corrected)
+    }
+
+    fn new_in(
+        id: impl Into<String>,
+        direction: RidDirection,
+        rid_ids: RidIdGrammar,
+    ) -> Result<Self> {
         let id = id.into();
-        if !grammar::is_alnum_dash_underscore(&id) {
+        if !rid_ids.admits(&id) {
             return Err(syntax("rid-id", &id));
         }
         Ok(Rid {
@@ -165,7 +201,16 @@ fn is_param_val(value: &str) -> bool {
 impl TypedAttribute for Rid {
     const NAME: &'static str = "rid";
 
+    /// The line read with the corrected `rid-id` grammar ([`RidIdGrammar::Corrected`]).
     fn parse(value: &str) -> Result<Self> {
+        Rid::parse_with(value, RidIdGrammar::Corrected)
+    }
+}
+
+impl Rid {
+    /// The value of an `a=rid` line, its rid-ids (its own and `depend=`'s) read with
+    /// `rid_ids`.
+    pub fn parse_with(value: &str, rid_ids: RidIdGrammar) -> Result<Self> {
         let mut parts = value.splitn(3, ' ');
         let (Some(id), Some(direction)) = (parts.next(), parts.next()) else {
             return Err(syntax("a=rid", value));
@@ -173,7 +218,7 @@ impl TypedAttribute for Rid {
         let Some(direction) = RidDirection::parse(direction) else {
             return Err(syntax("a=rid direction", value));
         };
-        let mut rid = Rid::new(id, direction).map_err(|_| syntax("a=rid", value))?;
+        let mut rid = Rid::new_in(id, direction, rid_ids).map_err(|_| syntax("a=rid", value))?;
 
         let Some(params) = parts.next() else {
             return Ok(rid);
@@ -206,7 +251,7 @@ impl TypedAttribute for Rid {
                 (n, v) if RID_INTEGER_RESTRICTIONS.contains(&n) => v.is_none_or(grammar::is_digits),
                 ("max-bpp", v) => v.is_none_or(is_float_param),
                 // rid-depend-param = %s"depend=" rid-list
-                ("depend", Some(list)) => list.split(',').all(grammar::is_alnum_dash_underscore),
+                ("depend", Some(list)) => list.split(',').all(|id| rid_ids.admits(id)),
                 ("depend", None) => false,
                 (_, v) => v.is_none_or(is_param_val),
             };
@@ -303,7 +348,11 @@ impl Simulcast {
     }
 }
 
-fn parse_stream_list(value: &str, list: &str) -> Result<Vec<Vec<SimulcastId>>> {
+fn parse_stream_list(
+    value: &str,
+    list: &str,
+    rid_ids: RidIdGrammar,
+) -> Result<Vec<Vec<SimulcastId>>> {
     list.split(';')
         .map(|alternatives| {
             alternatives
@@ -313,7 +362,7 @@ fn parse_stream_list(value: &str, list: &str) -> Result<Vec<Vec<SimulcastId>>> {
                         Some(rid) => (rid, true),
                         None => (id, false),
                     };
-                    if !grammar::is_alnum_dash_underscore(rid) {
+                    if !rid_ids.admits(rid) {
                         return Err(syntax("a=simulcast", value));
                     }
                     Ok(SimulcastId {
@@ -329,14 +378,22 @@ fn parse_stream_list(value: &str, list: &str) -> Result<Vec<Vec<SimulcastId>>> {
 impl TypedAttribute for Simulcast {
     const NAME: &'static str = "simulcast";
 
+    /// The line read with the corrected `rid-id` grammar ([`RidIdGrammar::Corrected`]).
     fn parse(value: &str) -> Result<Self> {
+        Simulcast::parse_with(value, RidIdGrammar::Corrected)
+    }
+}
+
+impl Simulcast {
+    /// The value of an `a=simulcast` line, its rid-ids read with `rid_ids`.
+    pub fn parse_with(value: &str, rid_ids: RidIdGrammar) -> Result<Self> {
         let fields = grammar::fields("a=simulcast", value)?;
         if fields.len() != 2 && fields.len() != 4 {
             return Err(syntax("a=simulcast", value));
         }
         let mut simulcast = Simulcast::default();
         for (index, pair) in fields.chunks(2).enumerate() {
-            let list = parse_stream_list(value, pair[1])?;
+            let list = parse_stream_list(value, pair[1], rid_ids)?;
             let slot = match RidDirection::parse(pair[0]) {
                 Some(RidDirection::Send) => &mut simulcast.send,
                 Some(RidDirection::Recv) => {

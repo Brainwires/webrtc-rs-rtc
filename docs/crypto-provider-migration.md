@@ -95,6 +95,16 @@ fix available to the person hitting it.
 | `--features crypto-ring,crypto-aws-lc-rs` | both compiled; `default_provider()` returns ring |
 | `--no-default-features` | no built-in provider; supply your own |
 
+With no built-in provider, `RTCPeerConnectionBuilder::build` fails with "peer connection requires
+a crypto provider ... configure one with SettingEngineBuilder::with_crypto_provider" unless one
+is set, and certificates come from the provider you supply (`RTCCertificate::generate`,
+`generate_certificate`, `generate_from_signing_key`, `from_pkcs8`, `from_signing_key`; PEM with
+`pem`). `RTCCertificate::from_key_pair` exists only with a built-in provider: it takes an
+`rcgen::KeyPair`, which needs an rcgen crypto backend, and imports it through the built-in
+default. Until `conf/crypto-9-rtci-builds-without-a-built-in-provider` this build did not
+compile. CI builds it and runs `tests/no_builtin_crypto_provider.rs` (`cargo.yml`, job
+"rtci-crypto (no built-in, custom provider)").
+
 `default_provider()` prefers ring when both are enabled, matching the previous precedence.
 Enabling `crypto-aws-lc-rs` alongside the default never silently switches the default.
 

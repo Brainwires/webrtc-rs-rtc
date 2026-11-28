@@ -663,8 +663,18 @@ async fn run_peer_connection(
     let mut last_stream_time = Instant::now();
     // The duration of the packet sent last: the next one goes out when it has played.
     let mut last_packet_duration = Duration::from_millis(20);
+    // The browser page sends only its description, never the end of its candidates, so the
+    // transport cannot become "failed" (W3C webrtc-pc 5.6.4: "failed" needs the indication that
+    // there are no more remote candidates): a lost path stays "disconnected". This
+    // application gives up on its own after 30 s of it.
+    let mut disconnected_since: Option<Instant> = None;
 
     loop {
+        if disconnected_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(30)) {
+            println!("Connection disconnected for 30 s: giving up, exiting...");
+            peer_connection.close()?;
+            return Ok(());
+        }
         // Send outgoing messages
         while let Some(msg) = peer_connection.poll_write() {
             match socket.send_to(&msg.message, msg.transport.peer_addr).await {
@@ -688,6 +698,11 @@ async fn run_peer_connection(
             match event {
                 RTCPeerConnectionEvent::OnConnectionStateChangeEvent(state) => {
                     println!("Peer Connection State: {}", state);
+                    if state == RTCPeerConnectionState::Disconnected {
+                        disconnected_since.get_or_insert_with(Instant::now);
+                    } else {
+                        disconnected_since = None;
+                    }
                     if state == RTCPeerConnectionState::Connected {
                         connected = true;
 

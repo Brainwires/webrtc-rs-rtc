@@ -118,6 +118,17 @@ fn rtp(now: Instant, sequence_number: u16) -> TaggedPacket {
 
 /// TWCC feedback saying every packet from `base` arrived, one 64 ms reference tick apart.
 fn twcc_feedback(now: Instant, base: u16, count: u16) -> TaggedPacket {
+    twcc_feedback_at(now, base, count, 1, 0)
+}
+
+/// [`twcc_feedback`] with its reference time (64 ms ticks) and feedback packet count.
+fn twcc_feedback_at(
+    now: Instant,
+    base: u16,
+    count: u16,
+    reference_time: u32,
+    fb_pkt_count: u8,
+) -> TaggedPacket {
     use rtcp::transport_feedbacks::transport_layer_cc::{
         PacketStatusChunk, RecvDelta, RunLengthChunk, StatusChunkTypeTcc, SymbolTypeTcc,
         TransportLayerCc,
@@ -128,8 +139,8 @@ fn twcc_feedback(now: Instant, base: u16, count: u16) -> TaggedPacket {
         media_ssrc: SSRC,
         base_sequence_number: base,
         packet_status_count: count,
-        reference_time: 1,
-        fb_pkt_count: 0,
+        reference_time,
+        fb_pkt_count,
         packet_chunks: vec![PacketStatusChunk::RunLengthChunk(RunLengthChunk {
             type_tcc: StatusChunkTypeTcc::RunLengthChunk,
             packet_status_symbol: SymbolTypeTcc::PacketReceivedSmallDelta,
@@ -495,4 +506,130 @@ fn the_pacer_follows_the_estimate() {
         "half the rate should be twice the spacing: expected about {expected:?}, got \
          {spacing_after:?}"
     );
+}
+
+/// `CongestionControlHandle::has_feedback` tells whether the target comes from the path yet:
+/// `false` while `target_bitrate()` is the start value (and `stats()` already carries both
+/// halves of the estimate, so they cannot tell), `true` from the first feedback batch the
+/// estimator was given. A feedback packet that reports none of this controller's packets is
+/// no batch. With the default `Gcc`, `packet_loss` and `round_trip_time` are `None` before
+/// feedback, as the handle's documentation says.
+#[test]
+fn the_handle_says_whether_the_target_comes_from_feedback() {
+    use rtci_interceptor::{GCC_INITIAL_BITRATE, Gcc};
+
+    let epoch = Instant::now();
+    let (controller, handle) = CongestionControlBuilder::new(Gcc::default())
+        .with_bandwidth_probing(false)
+        .build_with_handle();
+    let mut chain = Registry::new()
+        .with(Slot::from(14_000), DeliverRtcp::new())
+        .with(Slot::CongestionControl, controller)
+        .with(Slot::TwccSender, TwccSenderBuilder::new().build())
+        .build();
+    chain.bind_local_stream(&stream());
+
+    assert!(!handle.has_feedback());
+    assert_eq!(0, handle.feedback_reports());
+    assert_eq!(
+        GCC_INITIAL_BITRATE,
+        handle.target_bitrate(),
+        "the start value"
+    );
+    let before = handle.stats();
+    assert!(before.delay_based_bitrate.is_some() && before.loss_based_bitrate.is_some());
+    assert_eq!(None, before.packet_loss);
+    assert_eq!(None, before.round_trip_time);
+
+    send_and_drain(&mut chain, epoch, 3);
+    assert!(!handle.has_feedback(), "sending is not feedback");
+
+    // Feedback about packets this controller never sent is not a batch.
+    chain
+        .handle_read(twcc_feedback(epoch + Duration::from_millis(100), 500, 3))
+        .expect("read");
+    while chain.poll_read().is_some() {}
+    assert!(
+        !handle.has_feedback(),
+        "feedback reporting none of its packets"
+    );
+
+    chain
+        .handle_read(twcc_feedback(epoch + Duration::from_millis(200), 0, 3))
+        .expect("read");
+    while chain.poll_read().is_some() {}
+    assert!(handle.has_feedback());
+    assert_eq!(1, handle.feedback_reports());
+    assert!(
+        handle.stats().packet_loss.is_some(),
+        "the batch was folded in"
+    );
+
+    // A second batch: three new packets (RTP 3 to 5, transport-wide 3 to 5), reported by the
+    // receiver's next feedback (count 1, a later reference time). (The first version of this
+    // test re-sent RTP 0 to 2 and repeated the first feedback's count and reference time, and
+    // that batch reported nothing, CI 45883163416.)
+    let second = epoch + Duration::from_millis(210);
+    for sequence_number in 3..6 {
+        chain
+            .handle_write(rtp(second, sequence_number))
+            .expect("write");
+    }
+    chain.handle_timeout(second).expect("timeout");
+    while chain.poll_write().is_some() {}
+    chain
+        .handle_read(twcc_feedback_at(
+            epoch + Duration::from_millis(300),
+            3,
+            3,
+            3,
+            1,
+        ))
+        .expect("read");
+    while chain.poll_read().is_some() {}
+    assert_eq!(2, handle.feedback_reports());
+}
+
+/// Without per-packet feedback the estimator runs on the loss of receiver reports
+/// (draft-ietf-rmcat-gcc-02 section 7): a receiver report block for a stream this controller
+/// sends is feedback too.
+#[test]
+fn a_receiver_reports_loss_counts_as_feedback_without_per_packet_feedback() {
+    use rtci_interceptor::Gcc;
+    use rtcp::receiver_report::ReceiverReport;
+    use rtcp::reception_report::ReceptionReport;
+
+    let epoch = Instant::now();
+    let (controller, handle) = CongestionControlBuilder::new(Gcc::default())
+        .with_bandwidth_probing(false)
+        .build_with_handle();
+    let mut chain = Registry::new()
+        .with(Slot::from(14_000), DeliverRtcp::new())
+        .with(Slot::CongestionControl, controller)
+        .with(Slot::TwccSender, TwccSenderBuilder::new().build())
+        .build();
+    chain.bind_local_stream(&stream());
+    send_and_drain(&mut chain, epoch, 3);
+    assert!(!handle.has_feedback());
+
+    let report = ReceiverReport {
+        ssrc: 0x1111,
+        reports: vec![ReceptionReport {
+            ssrc: SSRC,
+            fraction_lost: 0,
+            last_sequence_number: 2,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    chain
+        .handle_read(TaggedPacket {
+            now: epoch + Duration::from_millis(500),
+            transport: TransportContext::default(),
+            message: AttributedPacket::new(Packet::Rtcp(vec![Box::new(report)])),
+        })
+        .expect("read");
+    while chain.poll_read().is_some() {}
+    assert!(handle.has_feedback());
+    assert_eq!(1, handle.feedback_reports());
 }

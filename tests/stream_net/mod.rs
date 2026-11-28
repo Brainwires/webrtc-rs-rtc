@@ -148,6 +148,8 @@ pub struct Net {
     /// Every passive listener asked for on port 0 gets this port, as `rtci-stream-driver`'s
     /// shared passive port: the last one asked for is the listener accepts are reported on.
     pub shared_passive_port: Option<u16>,
+    /// Which trickled candidates of a peer reach the other one (all when `None`).
+    pub carry: Option<fn(usize, &RTCIceCandidateInit) -> bool>,
     pub rng: XorShift,
     pub listeners: BTreeMap<SocketAddr, (usize, ListenerId, bool)>,
     pub conns: Vec<Conn>,
@@ -178,6 +180,7 @@ impl Net {
             refused: vec![],
             refuse_plain_listeners: false,
             shared_passive_port: None,
+            carry: None,
             rng: XorShift(0x9e37_79b9_7f4a_7c15),
             listeners: BTreeMap::new(),
             conns: vec![],
@@ -434,6 +437,9 @@ impl Net {
         for i in 0..peers.len() {
             let out = std::mem::take(&mut peers[i].outbox);
             for c in out {
+                if self.carry.is_some_and(|carry| !carry(i, &c)) {
+                    continue;
+                }
                 let _ = peers[1 - i].pc.add_remote_candidate(c);
             }
         }

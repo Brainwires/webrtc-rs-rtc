@@ -151,6 +151,10 @@ impl DTLSConn {
                 && !self.is_handshake_completed()
             {
                 self.set_handshake_completed();
+                let started = *self.handshake_started.get_or_insert(now);
+                self.handshake_completed_after_ns =
+                    u64::try_from(now.saturating_duration_since(started).as_nanos())
+                        .unwrap_or(u64::MAX - 1);
                 debug!(
                     "[handshake:{}] is completed",
                     srv_cli_str(self.state.is_client),
@@ -420,6 +424,16 @@ impl DTLSConn {
         Ok(HandshakeState::Finished)
     }
 
+    /// When the handshake completed, if it has.
+    pub(crate) fn handshake_completed_at(&self) -> Option<Instant> {
+        if self.handshake_completed_after_ns == u64::MAX {
+            return None;
+        }
+        self.handshake_started.map(|started| {
+            started + std::time::Duration::from_nanos(self.handshake_completed_after_ns)
+        })
+    }
+
     pub(crate) fn handshake_timeout(&mut self, now: Instant) -> Result<()> {
         self.state.clock = Some(now);
         let next_handshake_state = if self.current_handshake_state == HandshakeState::Waiting {
@@ -457,26 +471,34 @@ impl DTLSConn {
                 Some(HandshakeState::Waiting)
             }
         } else if self.current_handshake_state == HandshakeState::Finished {
-            // RFC 6347 4.2.4: retransmit our last flight because the peer repeated its own, which
-            // means ours was lost. Count it against the same budget as any handshake
-            // retransmission, so a peer — or an attacker replaying unauthenticated epoch-0
-            // handshake records — cannot make a completed association regenerate its flight (a full
-            // Flight5 with certificate, for a client) without limit. Once the budget is spent, stop
-            // answering and stay Finished: the association is established, so exhausting
-            // retransmissions here must never take it to Errored the way the Waiting branch does —
-            // that would tear down a live connection.
-            self.current_retransmit_count += 1;
-            if self.current_retransmit_count > self.maximum_retransmit_number {
-                warn!(
-                    "[handshake:{}] {} last-flight retransmit budget spent ({} > {}), staying Finished",
+            // RFC 6347 4.2.4: "for at least twice the default MSL defined for [TCP], when in
+            // the FINISHED state, the node that transmits the last flight [...] MUST respond to
+            // a retransmit of the peer's last flight with a retransmit of the last flight". So
+            // every repeat within FINAL_FLIGHT_ANSWER_PERIOD (240 s) of completing is answered,
+            // however many there are, and none after it: the association is established, so
+            // this never takes it to Errored the way the Waiting branch does.
+            //
+            // The bound against amplification is one answer per repeat, never more: the caller
+            // comes here only for a datagram that carried an authenticated (epoch 1) handshake
+            // record of the peer (`received_handshake_in_last_datagram`), and the replay window
+            // drops a copy of one already read, so every answer is to a record only the peer
+            // could have made, fresh. Plaintext (epoch 0) handshake records are never answered.
+            // The RFC asks for "at least" 240 s and sets no end; ending there is what DTLS 1.3
+            // does when it lets go of its handshake keys (RFC 9147 5.8.1).
+            let elapsed = self
+                .handshake_completed_at()
+                .map(|at| now.saturating_duration_since(at));
+            if elapsed.is_some_and(|elapsed| elapsed <= FINAL_FLIGHT_ANSWER_PERIOD) {
+                Some(HandshakeState::Sending)
+            } else {
+                debug!(
+                    "[handshake:{}] {} peer repeated its last flight {:?} after the handshake, past {:?}: not answered",
                     srv_cli_str(self.state.is_client),
                     self.current_flight,
-                    self.current_retransmit_count,
-                    self.maximum_retransmit_number,
+                    elapsed,
+                    FINAL_FLIGHT_ANSWER_PERIOD,
                 );
                 None
-            } else {
-                Some(HandshakeState::Sending)
             }
         } else {
             None

@@ -521,6 +521,16 @@ impl RTCRtpSender<'_> {
     /// including codecs, encodings, and header extensions. Calls until the next
     /// [`set_parameters`](Self::set_parameters) return the same parameters, with the same
     /// transaction id.
+    ///
+    /// `rtp_parameters.codecs` are the codecs negotiated for sending, with the payload types
+    /// of the remote description (W3C `[[SendCodecs]]`); its first media codec is the one an
+    /// encoding that names no codec is sent with. A remote description changes them, so after
+    /// applying an answer the application reads them again and encodes that codec with that
+    /// payload type: [`write_rtp`](Self::write_rtp) rewrites a payload type that is not
+    /// negotiated to the negotiated one but never changes the payload, so bytes of another
+    /// codec would go out labelled as this one
+    /// ([`rewritten_from_another_codec_rtp_packets`](Self::rewritten_from_another_codec_rtp_packets)
+    /// counts them).
     pub fn get_parameters(&mut self) -> &RTCRtpSendParameters {
         let transceiver = &mut self.peer_connection.rtp_transceivers[self.id.0];
         let negotiated = transceiver.current_direction();
@@ -715,10 +725,67 @@ impl RTCRtpSender<'_> {
     /// ([`ssrcs`](Self::ssrcs)). Otherwise
     /// returns an error if no matching encoding is found, the codec is unsupported (neither the
     /// packet's payload type nor its encoding's codec is negotiated on this sender leg), or
-    /// internal handle_write returns error. A packet whose payload type is not negotiated is
-    /// rewritten to its encoding's negotiated payload type.
+    /// internal handle_write returns error.
+    ///
+    /// # Payload type
+    ///
+    /// A packet whose payload type names a codec negotiated for this sender (its
+    /// [`get_parameters`](Self::get_parameters)`().rtp_parameters.codecs`, the remote
+    /// description's numbers, RFC 3264 sections 5.1 and 6.1) is sent with it. A packet whose
+    /// payload type is not negotiated is rewritten to the payload type negotiated for its
+    /// encoding's codec (the encoding's `codec`, or the first media codec of the parameters
+    /// when it names none). **Only the number changes, never the payload**: the engine does
+    /// not encode or transcode. A comfort noise or telephone event payload type that is not
+    /// negotiated is dropped instead, and a packet is refused with
+    /// [`Error::ErrRTPTransceiverCodecUnsupported`] when no codec is negotiated for its encoding.
+    ///
+    /// So after applying an answer (or an offer, when answering), the application re-reads the
+    /// sender's negotiated codec, the first media codec of
+    /// [`get_parameters`](Self::get_parameters)`().rtp_parameters.codecs`, and encodes that
+    /// codec with that payload type. An encoder that keeps producing a codec the answer did
+    /// not negotiate (one chosen from `setCodecPreferences` or the local offer) has its packets
+    /// sent labelled as the negotiated codec, which the receiver cannot decode (RFC 3264
+    /// section 7: the offerer "MUST send using a media format listed in the answer"). Each
+    /// rewrite is counted: [`rewritten_payload_type_rtp_packets`](Self::rewritten_payload_type_rtp_packets)
+    /// (every rewrite, the same codec renumbered included) and
+    /// [`rewritten_from_another_codec_rtp_packets`](Self::rewritten_from_another_codec_rtp_packets)
+    /// (the written number names a different format: the dangerous case). An application can
+    /// assert the second stays 0. A written number that the negotiation gave to a different
+    /// codec is not rewritten, and not counted: it is sent as that codec.
     pub fn write_rtp(&mut self, now: Instant, packet: rtp::Packet) -> Result<()> {
         self.write_rtp_inner(now, packet, true)
+    }
+
+    /// How many RTP packets [`write_rtp`](Self::write_rtp) (and the `write_rtp_with_*`
+    /// methods) accepted with a payload type that is not negotiated for this sender, and sent
+    /// with the payload type of their encoding's negotiated codec instead: every rewrite. It
+    /// counts the legitimate one too, a packet written with the number this endpoint's own
+    /// offer (or registration) gave the same codec, when the answer numbered it otherwise;
+    /// [`rewritten_from_another_codec_rtp_packets`](Self::rewritten_from_another_codec_rtp_packets)
+    /// counts the ones whose number names a different codec. A packet refused or dropped
+    /// (inactive encoding, `maxBitrate`, `maxFramerate`, a comfort noise or telephone event
+    /// format that is not negotiated) is not counted. The sum over the connection's senders is
+    /// [`RTCPeerConnection::rewritten_payload_type_rtp_packets`]. Not a W3C attribute:
+    /// webrtc-stats has no member for it; a fork addition.
+    pub fn rewritten_payload_type_rtp_packets(&self) -> u64 {
+        self.sender().rewritten_payload_type_rtp_packets()
+    }
+
+    /// Of the packets counted in
+    /// [`rewritten_payload_type_rtp_packets`](Self::rewritten_payload_type_rtp_packets), the
+    /// ones whose written payload type names a format other than the codec they were sent as:
+    /// among the formats of the sender's kind that the media engine registered or that a
+    /// description negotiated, the number names one or more and none has the MIME type of the
+    /// codec the packet went out as (VP8 written with its offered number after the answer
+    /// negotiated H.264 only, or a repair format's number the answer did not keep). Their bytes
+    /// were sent labelled as a codec they are not in; a correct application keeps this at 0.
+    /// The codecs are compared by MIME type only (an H.264 packet written with the number of
+    /// another H.264 format is counted as the same codec renumbered), and a number that names
+    /// no format at all is not counted here (nothing says what it carries). The sum over the
+    /// connection's senders is [`RTCPeerConnection::rewritten_from_another_codec_rtp_packets`].
+    /// Not a W3C attribute; a fork addition.
+    pub fn rewritten_from_another_codec_rtp_packets(&self) -> u64 {
+        self.sender().rewritten_from_another_codec_rtp_packets()
     }
 
     /// [`Self::write_rtp`] with the packet's absolute capture time (webrtc-extensions 8, the
@@ -1040,6 +1107,7 @@ impl RTCRtpSender<'_> {
             .collect();
         let mixed = sender.extmap_allow_mixed();
         let two_byte_stream = sender.is_two_byte_stream(packet.header.ssrc);
+        let kind = sender.kind();
         let parameters = sender.get_parameters(media_engine, &negotiated_header_extensions);
         let (codecs, encodings) = (&parameters.rtp_parameters.codecs, &parameters.encodings);
 
@@ -1066,7 +1134,12 @@ impl RTCRtpSender<'_> {
         // Prefer the packet's negotiated payload type when it identifies a codec. Otherwise
         // fall back to the encoding's codec and rewrite the payload type to the one negotiated
         // for it, as before upstream's 8080cef3 removed the fallback (Brainwires fork keeps it;
-        // the fork never narrows what an API accepts, see FORK.md).
+        // the fork never narrows what an API accepts, see FORK.md). Only the number changes,
+        // never the payload; each rewrite is counted (`rewritten_payload_type_rtp_packets`),
+        // and apart, one whose written number names another format
+        // (`rewritten_from_another_codec_rtp_packets`): its bytes go out labelled as a codec
+        // they are not in.
+        let mut rewritten: Option<bool> = None;
         if !codecs
             .iter()
             .any(|codec| codec.payload_type == packet.header.payload_type)
@@ -1106,6 +1179,12 @@ impl RTCRtpSender<'_> {
                 "rtp_sender {:?} rewriting RTP ssrc {} pt {} to the encoding's negotiated pt {}",
                 self.id, packet.header.ssrc, packet.header.payload_type, codec.payload_type
             );
+            rewritten = Some(names_another_format(
+                media_engine,
+                kind,
+                packet.header.payload_type,
+                &codec.rtp_codec.mime_type,
+            ));
             packet.header.payload_type = codec.payload_type;
         }
 
@@ -1214,7 +1293,12 @@ impl RTCRtpSender<'_> {
         self.peer_connection.handle_write(TaggedRTCMessage {
             now,
             message: RTCMessage::RtpPacket(track_id, packet),
-        })
+        })?;
+        if let Some(another_codec) = rewritten {
+            self.sender_mut()
+                .count_rewritten_payload_type(another_codec);
+        }
+        Ok(())
     }
 
     /// Writes RTCP packets to the network.
@@ -1257,6 +1341,30 @@ impl RTCRtpSender<'_> {
             message: RTCMessage::RtcpPacket(track_id, packets),
         })
     }
+}
+
+/// Whether `written`, a payload type `write_rtp` rewrites, names a format of `kind` other
+/// than `sent_as` (the MIME type of the codec the packet is sent as): it numbers, among the
+/// formats the engine registered or the negotiated ones (this endpoint's and the remote
+/// descriptions' numbers), one or more formats and none of them has that MIME type. A number
+/// that names no format of `kind` is not counted as another codec (nothing says what it
+/// carries), and neither is one that names the same codec under another number (an
+/// application that kept its own offer's number after the answer renumbered the codec).
+fn names_another_format(
+    media_engine: &crate::peer_connection::configuration::media_engine::MediaEngine,
+    kind: RtpCodecKind,
+    written: u8,
+    sent_as: &str,
+) -> bool {
+    let negotiated = media_engine.get_codecs_by_kind(kind);
+    let mut named = media_engine
+        .registered_codecs_by_kind(kind)
+        .iter()
+        .chain(negotiated.iter())
+        .filter(|codec| codec.payload_type == written)
+        .peekable();
+    named.peek().is_some()
+        && !named.any(|codec| codec.rtp_codec.mime_type.eq_ignore_ascii_case(sent_as))
 }
 
 /// The RFC 6464 element of a linear level (0..1): `V` and the level in -dBov.

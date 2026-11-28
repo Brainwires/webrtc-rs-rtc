@@ -5,6 +5,11 @@ src/peer_connection/configuration/behaviour_profile.rs.
     python3 scripts/behaviour-profiles.py          # write the doc
     python3 scripts/behaviour-profiles.py --check  # fail when the doc is not what the code says
 
+Also checks that each standing departure from a MUST in docs/conformance.md (the rows other than
+an internal conflict of the RFC and an opt-in) has a governed behaviour that the StrictRfc profile
+turns to the RFC form, and that README's sentence "N defaults depart from a MUST by the owner's
+decision" names each of them with the right count words.
+
 Also checks, as the crate's `every_setting_is_governed_or_listed_as_left_alone` test does,
 that every setting of the setting engine, the media engine and the default interceptor options
 is either governed by the profiles or listed as left alone, and that both lists name only
@@ -19,6 +24,12 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "src/peer_connection/configuration"
 SOURCE = CONFIG / "behaviour_profile.rs"
 DOC = ROOT / "docs/behaviour-profiles.md"
+CONFORMANCE = ROOT / "docs/conformance.md"
+README = ROOT / "README.md"
+
+COUNT_WORDS = {1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five", 6: "Six"}
+SETS_WORDS = {1: "sets it", 2: "sets both", 3: "sets all three", 4: "sets all four",
+              5: "sets all five", 6: "sets all six"}
 
 STRING = r'"((?:[^"\\]|\\.)*)"'
 
@@ -106,6 +117,60 @@ def struct_fields(path, owner):
     return {f"{owner}::{name}" for name in re.findall(r"^\s*pub (\w+):", body, re.M)}
 
 
+def standing_departures(rows):
+    """The defaults that depart from a MUST by the owner's decision: the rows of
+    docs/conformance.md "Standing departures from a MUST" except the two of another kind (an
+    internal conflict of the RFC, an opt-in), each as (RFC number, section, governed row)."""
+    text = CONFORMANCE.read_text()
+    if "## Standing departures from a MUST" not in text:
+        raise SystemExit("behaviour-profiles: docs/conformance.md has no standing departures table")
+    section = text.split("## Standing departures from a MUST", 1)[1].split("\n## ", 1)[0]
+    out, errors = [], []
+    for line in section.splitlines():
+        if not line.startswith("| RFC "):
+            continue
+        clause = line.split(" | ")[0].lstrip("| ")
+        if "internal conflict" in clause or "an opt-in" in clause:
+            continue
+        m = re.match(r"RFC (\d+) section ([\d.]+)", clause)
+        if not m:
+            errors.append(f"conformance.md: a departure row without 'RFC <n> section <s>': {clause}")
+            continue
+        number, sec = m.group(1), m.group(2)
+        # Several departures may share a clause (RFC 9429 5.3.1: jsep-95 and jsep-98): the
+        # governed row is the one of that clause whose setting the departure names.
+        candidates = [r for r in rows if r["clause"].startswith(f"RFC {number} {sec}")]
+        row = next((r for r in candidates if r["setting"].rsplit("::", 1)[-1] in line),
+                   candidates[0] if candidates else None)
+        if row is None:
+            errors.append(f"conformance.md: RFC {number} section {sec} is a standing departure "
+                          "but no governed behaviour names that clause")
+        elif row["strict_rfc"] == row["rfc"]:
+            errors.append(f"{row['id']}: RFC {number} section {sec} is a standing departure, "
+                          "but the StrictRfc profile does not select its RFC form")
+        out.append((number, sec, row))
+    return out, errors
+
+
+def check_readme(departures):
+    """README's sentence on the defaults that depart from a MUST names each departure of
+    docs/conformance.md, with the right count words."""
+    text = " ".join(README.read_text().split())
+    m = re.search(r"(\w+) defaults? departs? from a MUST by the owner's decision(.*?)Known issues", text)
+    if not m:
+        return ["README.md: no sentence 'N defaults depart from a MUST by the owner's decision'"]
+    n, errors = len(departures), []
+    if m.group(1) != COUNT_WORDS.get(n):
+        errors.append(f"README.md: '{m.group(1)} defaults depart from a MUST', docs/conformance.md "
+                      f"lists {n} ({COUNT_WORDS.get(n)})")
+    if SETS_WORDS.get(n) and f"the `StrictRfc` profile {SETS_WORDS[n]}" not in m.group(2):
+        errors.append(f"README.md: the sentence should say 'the `StrictRfc` profile {SETS_WORDS.get(n)}'")
+    for number, sec, _ in departures:
+        if f"RFC {number} section {sec.split('.')[0]}" not in m.group(2):
+            errors.append(f"README.md: the departure from RFC {number} section {sec} is not named")
+    return errors
+
+
 def check_completeness(rows, not_governed):
     settings = declared(CONFIG / "setting_engine.rs", "SettingEngineBuilder", ["with_", "without_"])
     settings |= declared(CONFIG / "media_engine.rs", "MediaEngine", ["set_"])
@@ -171,7 +236,7 @@ CLASS_TITLES = {
 }
 
 
-def render(rows, not_governed, not_expressible):
+def render(rows, not_governed, not_expressible, departures):
     n = counts(rows)
     differs = sum(1 for row in rows if row["chrome"] != row["rfc"])
     strict = sum(1 for row in rows if row["strict_rfc"] != row["rfc"])
@@ -193,9 +258,9 @@ def render(rows, not_governed, not_expressible):
     w("- **`Rfc`**: the engine's defaults, unchanged. The RFCs' behaviour, and the interoperable")
     w("  form where a named browser or deployed peer cannot take the RFC's (the audit's `setting`")
     w("  verdict, `docs/conformance/audit/RULES.md`), except the standing departures from the RFC")
-    w("  text listed in `docs/conformance.md`, which the owner decided (`h264.literal-pdon`: this")
-    w("  default does not follow RFC 6184 section 7.2; `jsep.unoffered-feedback-refused`: nor RFC")
-    w("  9429 section 5.11; `cb.packet-size`: nor RFC 8083 section 3).")
+    w("  text listed in `docs/conformance.md`, which the owner decided (" + "; ".join(
+        f"`{row['id'] if row else '?'}`: " + ("this default does not follow" if i == 0 else "nor")
+        + f" RFC {number} section {sec}" for i, (number, sec, row) in enumerate(departures)) + ").")
     w("- **`Chrome`**: libwebrtc's choice wherever the engine and libwebrtc both do a thing and")
     w("  choose differently (a timer, an order, a form on the wire, a lenient or strict acceptance")
     w("  rule). It never turns off a capability the engine has and Chrome lacks: those are the same")
@@ -346,7 +411,9 @@ def render(rows, not_governed, not_expressible):
     w("  listed there as documented differences); rtc to rtc connections with data and media")
     w("  between profiles, and the `StrictRfc` refusals.")
     w("- `scripts/behaviour-profiles.py --check` (a Python gate of `cargo.yml`): this document is")
-    w("  what the code says.")
+    w("  what the code says, every standing departure from a MUST of `docs/conformance.md` has a")
+    w("  governed behaviour whose `StrictRfc` value differs from its `Rfc` one, and README's")
+    w("  sentence on those departures names each of them with the right count.")
     w("- The browser matrix runs the core scenarios with the Rust peer under `Chrome`")
     w("  (`examples/interop-peer`, `profile=chrome`).")
     w("")
@@ -361,11 +428,13 @@ def main():
         source, "NOT_EXPRESSIBLE", "NotExpressible", ["behaviour", "chrome", "needed"]
     )
     errors, scanned = check_completeness(rows, not_governed)
+    departures, departure_errors = standing_departures(rows)
+    errors += departure_errors + check_readme(departures)
     if errors:
         for error in errors:
             print(f"behaviour-profiles: {error}", file=sys.stderr)
         return 1
-    text = render(rows, not_governed, not_expressible)
+    text = render(rows, not_governed, not_expressible, departures)
     if "--check" in sys.argv[1:]:
         if not DOC.exists() or DOC.read_text() != text:
             print(

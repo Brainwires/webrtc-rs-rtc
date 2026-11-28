@@ -549,7 +549,19 @@ pub(crate) struct RetryKeys {
 }
 
 impl RetryCookie {
+    /// The cookie's HMAC-SHA-256 under `secret`, on a stack that is overwritten afterwards
+    /// (`crypto::on_erased_stack`): the HMAC leaves the keyed hash states of the secret in the
+    /// provider's frames (tests/key_residue.rs).
     fn mac(
+        provider: &dyn RTCCryptoProvider,
+        secret: &[u8],
+        remote: Option<SocketAddr>,
+        content: &[u8],
+    ) -> Result<[u8; COOKIE_MAC_LENGTH]> {
+        crypto::on_erased_stack(|| Self::keyed_mac(provider, secret, remote, content))
+    }
+
+    fn keyed_mac(
         provider: &dyn RTCCryptoProvider,
         secret: &[u8],
         remote: Option<SocketAddr>,

@@ -78,7 +78,7 @@ use std::time::Duration;
 use crate::peer_connection::configuration::interceptor_registry::DefaultInterceptorOptions;
 use crate::peer_connection::configuration::media_engine::MediaEngine;
 use crate::peer_connection::configuration::setting_engine::{
-    DtlsFlightInterval, SctpMaxMessageSize, SettingEngine, SettingEngineBuilder,
+    AnswerIceOptions, DtlsFlightInterval, SctpMaxMessageSize, SettingEngine, SettingEngineBuilder,
 };
 use dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 
@@ -419,6 +419,18 @@ governed_behaviours! {
         read: |s: &SettingEngine| s.ice.failed_nomination,
     },
     {
+        id: "ice.failed-without-end-of-candidates",
+        setting: "SettingEngineBuilder::with_ice_failed_without_end_of_candidates",
+        clause: "W3C webrtc-pc 5.6.4 RTCIceTransportState failed, RFC 8863 5 (MAY)",
+        rfc: false => "false",
+        chrome: true => "true",
+        strict_rfc: false => "false",
+        chrome_source: "libwebrtc p2p/base/p2p_transport_channel.cc::P2PTransportChannel::ComputeIceTransportState @ a222406d: kFailed when the channel had a connection and no connection is active any more (had_connection_ && !has_connection), whatever the gathering state and whether the remote candidates are complete; kDisconnected only for a channel that was writable and is not",
+        evidence: Source,
+        apply_setting: |b: SettingEngineBuilder, v| b.with_ice_failed_without_end_of_candidates(v),
+        read: |s: &SettingEngine| s.ice_failed_without_end_of_candidates,
+    },
+    {
         id: "ice.nomination-on-consent-checks",
         setting: "SettingEngineBuilder::with_ice_nomination_on_consent_checks",
         clause: "RFC 8445 7.1.2, RFC 7675 5.1",
@@ -615,11 +627,11 @@ governed_behaviours! {
     {
         id: "jsep.unoffered-feedback-refused",
         setting: "SettingEngineBuilder::with_unoffered_feedback_refused",
-        clause: "RFC 9429 5.11 (MUST; the default departs, docs/conformance.md)",
-        rfc: false => "false",
+        clause: "RFC 9429 5.11 (MUST), RFC 4585 4.2",
+        rfc: true => "true",
         chrome: false => "false",
         strict_rfc: true => "true",
-        chrome_source: "libwebrtc pc/sdp_offer_answer.cc @ a222406d: a remote answer is not checked for a=rtcp-fb lines the offer lacked (the only feedback check, lines 5957-6061, compares the congestion control feedback types and logs \"ignoring all\" on a mismatch); pc/codec_vendor.cc::IntersectCodecConfigurations (merged_config.codec.IntersectFeedbackParams, line 1118) intersects the send and receive feedback, and NegotiateCodecs (line 819) answers with the intersection",
+        chrome_source: "libwebrtc pc/sdp_offer_answer.cc @ a222406d: a remote answer is not checked for a=rtcp-fb lines the offer lacked, so it is applied: SdpOfferAnswerHandler::ValidateSessionDescription (line 4591) checks mids, crypto, cryptex, ICE credentials, bundled payload types and header extensions, SSRC groups, payload types and the m= lines, no feedback, and the only feedback check (lines 5957-6061) compares the congestion control feedback types and logs \"ignoring all\" on a mismatch; pc/codec_vendor.cc::IntersectCodecConfigurations (merged_config.codec.IntersectFeedbackParams, line 1118) intersects the send and receive feedback, and NegotiateCodecs (line 819) answers with the intersection, so a Chrome answer never carries such a line",
         evidence: Source,
         apply_setting: |b: SettingEngineBuilder, v| b.with_unoffered_feedback_refused(v),
         read: |s: &SettingEngine| s.unoffered_feedback_refused,
@@ -647,6 +659,30 @@ governed_behaviours! {
         evidence: Observed,
         apply_setting: |b: SettingEngineBuilder, v| b.with_bundle_only_sections_in_browser_form(v),
         read: |s: &SettingEngine| s.bundle_only_sections_in_browser_form,
+    },
+    {
+        id: "jsep.answer-offered-formats-only",
+        setting: "SettingEngineBuilder::with_answer_offered_formats_only",
+        clause: "RFC 9429 5.3.1 (\"MUST be added after all existing formats\"; \"MAY include formats that are locally supported but not present in the offer\"), RFC 3264 6.1 (MAY); default departs from the MUST sentence (docs/conformance.md)",
+        rfc: true => "true",
+        chrome: true => "true",
+        strict_rfc: false => "false",
+        chrome_source: "libwebrtc pc/codec_vendor.cc::NegotiateCodecs @ a222406d: an answer's codecs are the local codecs FindMatchingCodec finds in the offer, with the offer's payload types, sorted into the offer's order when the transceiver has no codec preferences (keep_offer_order); CodecVendor::GetNegotiatedCodecsForAnswer calls it with the local codecs filtered by the codec preferences, so no codec the offer lacks is answered",
+        evidence: Source,
+        apply_setting: |b: SettingEngineBuilder, v| b.with_answer_offered_formats_only(v),
+        read: |s: &SettingEngine| s.answer_offered_formats_only,
+    },
+    {
+        id: "jsep.answer-ice-options",
+        setting: "SettingEngineBuilder::with_answer_ice_options",
+        clause: "RFC 8840 4.1.3, RFC 8445 10, RFC 8839 4.3.2 (every answer `trickle ice2`) against RFC 9429 5.3.1 (\"only included if such an option was present in the offer\"; spec-issues row 28)",
+        rfc: AnswerIceOptions::AsOffered => "AsOffered",
+        chrome: AnswerIceOptions::TrickleAlways => "TrickleAlways",
+        strict_rfc: AnswerIceOptions::Always => "Always",
+        chrome_source: "libwebrtc p2p/base/transport_description_factory.cc::TransportDescriptionFactory::CreateAnswer @ a222406d: desc->AddOption(ICE_OPTION_TRICKLE) whatever the offer had; no ice2 anywhere in libwebrtc (the engine keeps its ice2 as offered: a profile never turns a capability off)",
+        evidence: Source,
+        apply_setting: |b: SettingEngineBuilder, v| b.with_answer_ice_options(v),
+        read: |s: &SettingEngine| s.answer_ice_options,
     },
     {
         id: "jsep.stopping-transceiver-rejected-in-answer",
@@ -695,6 +731,18 @@ governed_behaviours! {
         evidence: Source,
         apply_setting: |b: SettingEngineBuilder, v| b.with_w3c_simulcast_answer(v),
         read: |s: &SettingEngine| s.w3c_simulcast_answer,
+    },
+    {
+        id: "jsep.rejected-rids-kept-in-offers",
+        setting: "SettingEngineBuilder::with_rejected_rids_kept_in_offers",
+        clause: "RFC 9429 5.2.2 (W3C webrtc-pc 4.4.1.6, createOffer)",
+        rfc: false => "false",
+        chrome: true => "true",
+        strict_rfc: true => "true",
+        chrome_source: "libwebrtc pc/sdp_offer_answer.cc::UpdateSimulcastLayerStatusInSender @ a222406d (\"The simulcast envelope cannot be changed, only the status of the streams\"): a layer the answer leaves out goes to RtpSenderBase::DisableEncodingLayers (pc/rtp_sender.cc), which, once the sender has an SSRC, sets it active=false and lists it in disabled_rids_ (hidden from GetParameters only); GetMediaDescriptionOptionsForTransceiver builds the next offer from GetParametersInternalWithAllLayers, so it keeps the layer's a=rid line and lists it paused (~rid); a later answer that lists it sets it active again",
+        evidence: Source,
+        apply_setting: |b: SettingEngineBuilder, v| b.with_rejected_rids_kept_in_offers(v),
+        read: |s: &SettingEngine| s.rejected_rids_kept_in_offers,
     },
     {
         id: "sdp.rid-pause-marks",
@@ -968,7 +1016,7 @@ governed_behaviours! {
         chrome: false => "false",
         strict_rfc: false => "false",
         performance: true => "true",
-        performance_note: "RFC 3550 6.2: RTCP, feedback included, is 5% of the session bandwidth; the regular interval computed with what the congestion control feedback (sent and received, last 2 s) leaves is applied as a T_rr_interval (RFC 4585 3.5.3: suppression only), at most 5 s (RFC 4585 5). Measured with the next three rows, 30 s, a=rtcp-rsize: 24 kbit/s audio (38.5 kbit/s on the wire) RTCP 12.15% -> 4.49% of the media, without rsize 14.34% -> 6.06% (the minimal compound around each feedback packet is larger than the cadence counts); 100 kbit/s audio and video (203 kbit/s on the wire) 5.96% -> 2.75%. Cost: at 24 kbit/s one regular report every 5 s (report blocks 1.9/s -> 0.2/s, longest gap 657 ms -> 5.2 s); the circuit breaker's RTCP timeout (3 Td, Td at most 5 s) still holds. With RED on audio by default (RFC 2198, train 11) the 24 kbit/s call is 64.5 kbit/s on the wire: 7.46% -> 3.57%",
+        performance_note: "RFC 3550 6.2: RTCP, feedback included, is 5% of the session bandwidth; the regular interval computed with what the congestion control feedback (sent and received, last 2 s) leaves is applied as a T_rr_interval (RFC 4585 3.5.3: suppression only), at most 5 s (RFC 4585 5). Measured with the next three rows, 30 s, a=rtcp-rsize: 24 kbit/s audio (38.5 kbit/s on the wire) RTCP 12.15% -> 4.49% of the media, without rsize 14.34% -> 6.06% (the minimal compound around each feedback packet is larger than the cadence counts); 100 kbit/s audio and video (203 kbit/s on the wire) 5.96% -> 2.75%. Cost: at 24 kbit/s one regular report every 5 s (report blocks 1.9/s -> 0.2/s, longest gap 657 ms -> 5.2 s); the circuit breaker's RTCP timeout (3 Td, Td at most 5 s) still holds. With RED on audio by default (RFC 2198, train 11) the 24 kbit/s call is 64.5 kbit/s on the wire: 7.46% -> 3.57%. The 5% is an average (RFC 3550 6.3.1 randomises each interval over [0.5, 1.5] and divides by e - 3/2 so that the long-run mean is the budget): over 10 s at 24 kbit/s (one to three regular reports) 200 seed pairs gave mean 4.74%, max 5.16%, 1% of draws above 5%; over 25 s mean 4.71%, max 4.89%; over 55 s max 4.83% (tests/rtcp_rate_trace_rtc2rtc.rs rtcp_share_over_seed_pairs, run 46064872094). Checked as the mean of 16 seeded draws and per draw on 25 s (the_performance_profile_keeps_low_rate_rtcp_inside_five_percent_on_average)",
         chrome_source: "libwebrtc modules/remote_bitrate_estimator/transport_sequence_number_feedback_generator.cc::OnSendBandwidthEstimateChanged @ a222406d: transport feedback is sized to 5% of the send estimate on its own, and rtcp_sender.cc::RTCPSender::ComputeTimeUntilNextReport spaces the reports by their fixed interval whatever the feedback takes",
         evidence: Source,
         apply_interceptors: |o: &mut DefaultInterceptorOptions, v| o.rtcp_congestion_feedback_in_budget = v,
@@ -1359,6 +1407,11 @@ pub(crate) static NOT_GOVERNED: &[NotGoverned] = &[
         note: "webrtc-extensions 7 icecandidatepairnominate; off in every profile (Chrome does not ship the event)",
     },
     NotGoverned {
+        setting: "SettingEngineBuilder::with_published_rid_id_grammar",
+        class: NotGovernedClass::Same,
+        note: "off: received rid-ids follow RFC 8851 10 as corrected by erratum 7132, 1*255(alpha-numeric). libwebrtc is stricter (modules/rtp_rtcp/include/rtp_rtcp_defines.cc @ a222406d: IsLegalRsidName takes 1 to kMidRsidMaxSize 16 alphanumerics; pc/webrtc_sdp.cc discards a malformed a=rid line), and Firefox refuses '-' and '_' and more than 255 (dom/media/webrtc/sdp/SdpAttribute.cpp, CheckRidValidity, citing eid7132); no browser in the fixtures writes another rid",
+    },
+    NotGoverned {
         setting: "SettingEngineBuilder::with_ice_unauthenticated_requests",
         class: NotGovernedClass::Same,
         note: "RFC 8489 9.1.3 error responses; libwebrtc answers 400 / 401 as well",
@@ -1469,6 +1522,21 @@ pub(crate) static NOT_GOVERNED: &[NotGoverned] = &[
         note: "none (RFC 8832 has none); libwebrtc has none",
     },
     NotGoverned {
+        setting: "SettingEngineBuilder::with_rollback_resets_offer_created_senders",
+        class: NotGovernedClass::Same,
+        note: "off: a rollback keeps the proposed simulcast encodings of an offer-created sender a track was added to (W3C [[LastStableRidlessSendEncodings]] null), as Chrome 158 (wpt.fyi run 6329870674821120, webrtc/simulcast/negotiation-encodings.https.html?rest \"sRD(simulcast offer), addTrack, then rollback brings us back to having a single encoding\": FAIL, got [\"foo\", \"bar\"]); on is the WPT form, which Firefox 161 passes",
+    },
+    NotGoverned {
+        setting: "SettingEngineBuilder::with_remote_rid_renegotiation_refused",
+        class: NotGovernedClass::Same,
+        note: "off: a later remote offer asking a simulcast sender for rids outside its envelope is applied and answered within it (W3C webrtc-pc Candidate Correction 37, PR #2794, 2022-12-08), as libwebrtc does: pc/sdp_offer_answer.cc @ a222406d has no rid check that fails a remote description, and w3c/webrtc-pc#2762 (resolution 2022-10-18) records that Chrome and Safari never fail it; on is the uncorrected Recommendation's InvalidAccessError",
+    },
+    NotGoverned {
+        setting: "SettingEngineBuilder::with_rtp_timeout_mutes_track",
+        class: NotGovernedClass::Same,
+        note: "off: a remote SSRC that times out (RFC 3550 6.3.5) leaves its track unmuted (W3C webrtc-pc Candidate Correction 57, PR #3082, 2025-10-23: only a BYE mutes); no browser mutes on the RTP timeout: w3c/webrtc-pc#3077 (henbos, 2025-09-30, of the timeout sentence: \"This is demonstrably not implemented\"; Chrome's muting of a video track whose frames stop is a frame-rate heuristic, not this rule); on is the uncorrected Recommendation's muting",
+    },
+    NotGoverned {
         setting: "SettingEngineBuilder::with_ignore_rid_pause_for_recv",
         class: NotGovernedClass::Same,
         note: "applies with rid pause marks only",
@@ -1523,6 +1591,11 @@ pub(crate) static NOT_GOVERNED: &[NotGoverned] = &[
         setting: "SettingEngineBuilder::with_turn_allocation_refresh_interval_cap",
         class: NotGovernedClass::Input,
         note: "a NAT keep-alive need of the deployment",
+    },
+    NotGoverned {
+        setting: "SettingEngineBuilder::with_turn_reallocation_delay",
+        class: NotGovernedClass::Input,
+        note: "a TURN server that keeps a deleted allocation's 5-tuple after answering (coturn: about a second); zero, RFC 8656 section 8.2, in every profile",
     },
     NotGoverned {
         setting: "SettingEngineBuilder::with_host_acceptance_min_wait",
@@ -1736,6 +1809,21 @@ pub(crate) static NOT_GOVERNED: &[NotGoverned] = &[
         setting: "DefaultInterceptorOptions::bandwidth_probing",
         class: NotGovernedClass::Same,
         note: "probing on, as libwebrtc's ProbeController (modules/congestion_controller/goog_cc/probe_controller.cc @ a222406d: exponential probes at 3x and 6x the start rate)",
+    },
+    NotGoverned {
+        setting: "DefaultInterceptorOptions::congestion_start_bitrate",
+        class: NotGovernedClass::Same,
+        note: "300 kbit/s, libwebrtc's start too (pc/peer_connection_factory.cc FieldTrialParameter start_bandwidth KilobitsPerSec(300) @ a222406d). No specification names a value: RFC 8836 2 requirement 4 asks to adapt as quickly as possible at the start and allows a history-based start; draft-ietf-rmcat-gcc-02 has none",
+    },
+    NotGoverned {
+        setting: "DefaultInterceptorOptions::congestion_min_bitrate",
+        class: NotGovernedClass::Input,
+        note: "100 kbit/s in every profile, the estimator's floor since before the profiles; libwebrtc's is 30 kbit/s (pc/peer_connection_factory.cc min_bandwidth @ a222406d), not taken into the Chrome profile: a floor is a limit of the application's own deployment, set here or with CongestionControlHandle::set_min_bitrate",
+    },
+    NotGoverned {
+        setting: "DefaultInterceptorOptions::congestion_max_bitrate",
+        class: NotGovernedClass::Input,
+        note: "100 Mbit/s in every profile; libwebrtc's is 2 Mbit/s (pc/peer_connection_factory.cc max_bandwidth @ a222406d), not taken into the Chrome profile: a ceiling is a limit of the application's own deployment (b=AS / b=TIAS and set_session_bitrate_limit lower it during a call)",
     },
     NotGoverned {
         setting: "DefaultInterceptorOptions::recovery_probing",

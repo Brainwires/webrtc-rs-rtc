@@ -74,3 +74,4 @@ pub mod client;
 pub mod fuzzing;
 /// The TURN-specific STUN attributes, methods and ChannelData framing.
 pub mod proto;
+pub mod rest;

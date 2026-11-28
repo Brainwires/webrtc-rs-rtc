@@ -140,6 +140,8 @@ struct Probe {
     /// open while the mapped address may be used (RFC 8489 section 6.2.2), until ICE of its
     /// transport has completed.
     kept: Option<(StreamId, SocketAddr)>,
+    /// The last error response a server address gave (code, reason), for `icecandidateerror`.
+    error: Option<(u16, String)>,
 }
 
 impl Probe {
@@ -168,6 +170,15 @@ pub(crate) struct EngineSrflx {
     last_start: Option<Instant>,
     /// Mapped addresses announced: transport, address, base kind, ICE ufrag.
     announced: Vec<(TransportId, SocketAddr, Base, String)>,
+    /// Servers gathering rejected and has not reported yet (`stuns:` with an IP address).
+    rejected: Vec<String>,
+}
+
+/// RFC 8489 section 8.1: "A 'stuns' URI containing an IP address MUST be rejected" (the
+/// server's certificate cannot be checked against a name; "a future STUN extension or usage
+/// may relax this requirement, provided it demonstrates how to authenticate the STUN server").
+fn rejected_by_rfc8489(url: &Url) -> bool {
+    url.scheme == SchemeType::Stuns && url.host.parse::<IpAddr>().is_ok()
 }
 
 impl EngineSrflx {
@@ -190,6 +201,7 @@ impl EngineSrflx {
             application_bases: vec![],
             last_start: None,
             announced: vec![],
+            rejected: vec![],
         }
     }
 
@@ -242,6 +254,13 @@ impl EngineSrflx {
             }
         }
         for url in &servers {
+            if rejected_by_rfc8489(url) {
+                let text = url.to_string();
+                if !self.rejected.contains(&text) {
+                    self.rejected.push(text);
+                }
+                continue;
+            }
             let tls = url.scheme == SchemeType::Stuns;
             // `stuns:` is TLS over TCP (RFC 7064); STUN over DTLS is not run here.
             if tls && kind == Base::Udp {
@@ -283,6 +302,7 @@ impl EngineSrflx {
                 discovery: None,
                 ufrag: ufrag.to_owned(),
                 kept: None,
+                error: None,
             });
         }
         found
@@ -418,6 +438,13 @@ impl RTCPeerConnection {
         if !self.srflx_wanted() {
             return;
         }
+        // The servers RFC 8489 section 8.1 rejects are reported when gathering would use
+        // them, whether or not this base would have asked them.
+        self.report_rejected_srflx_servers_after(|pc| pc.gather_srflx_for_base(&candidate));
+    }
+
+    /// [`Self::gather_srflx_for`] once `candidate` is a UDP host candidate to probe from.
+    fn gather_srflx_for_base(&mut self, candidate: &ice::candidate::Candidate) {
         let on = self.pipeline_context.transports.active_id();
         let base = candidate.addr();
         // A base whose host candidate the agent withheld (mDNS fails closed,
@@ -436,6 +463,27 @@ impl RTCPeerConnection {
                 self.announce_srflx(on, base, Base::Udp, mapped, &url);
             }
             self.drive_srflx(self.pipeline_context.now);
+        }
+    }
+
+    /// Runs `gather`, then reports each server it rejected (RFC 8489 section 8.1) as W3C
+    /// 4.8.3 has a failed server reported: an `icecandidateerror` of code 701, "If no host
+    /// candidate can reach the server" (none is asked), without a local address (none was
+    /// used), once per server URL while gathering (`report_ice_candidate_error`).
+    fn report_rejected_srflx_servers_after(&mut self, gather: impl FnOnce(&mut Self)) {
+        gather(self);
+        for url in std::mem::take(&mut self.streams.srflx.rejected) {
+            let error = crate::peer_connection::event::RTCPeerConnectionIceErrorEvent {
+                url,
+                error_code: crate::peer_connection::event::ICE_SERVER_UNREACHABLE,
+                error_text: "a stuns: URI whose host is an IP address is rejected \
+                             (RFC 8489 section 8.1)"
+                    .to_owned(),
+                ..Default::default()
+            };
+            if let Err(err) = self.report_ice_candidate_error(error) {
+                debug!("srflx: the rejected server is not reported: {err}");
+            }
         }
     }
 
@@ -460,15 +508,17 @@ impl RTCPeerConnection {
         if !self.srflx_wanted() || tcp_type == TcpType::Active {
             return;
         }
-        let ufrag = self.ice_username_fragment_of(transport);
-        for (mapped, url) in self
-            .streams
-            .srflx
-            .add(transport, base, Base::Tcp(tcp_type), &ufrag)
-        {
-            self.announce_tcp_srflx(transport, base, tcp_type, mapped, &url);
-        }
-        self.drive_srflx(self.pipeline_context.now);
+        self.report_rejected_srflx_servers_after(|pc| {
+            let ufrag = pc.ice_username_fragment_of(transport);
+            for (mapped, url) in pc
+                .streams
+                .srflx
+                .add(transport, base, Base::Tcp(tcp_type), &ufrag)
+            {
+                pc.announce_tcp_srflx(transport, base, tcp_type, mapped, &url);
+            }
+            pc.drive_srflx(pc.pipeline_context.now);
+        });
     }
 
     /// Starts what is due: names to resolve, races to start, transactions at most one per Ta.
@@ -578,6 +628,14 @@ impl RTCPeerConnection {
                         probe.url, probe.base
                     );
                     probe.state = ProbeState::Done;
+                    // W3C webrtc-pc 4.8.3: the server's error code, or 701 when no address
+                    // of it answered.
+                    let (code, text) = probe.error.clone().unwrap_or((
+                        crate::peer_connection::event::ICE_SERVER_UNREACHABLE,
+                        "no address of the server answered".to_owned(),
+                    ));
+                    let (transport, base, url) = (probe.transport, probe.base, probe.url_string());
+                    self.report_engine_gathering_error(transport, Some(base), url, code, text);
                 }
             }
         }
@@ -700,6 +758,13 @@ impl RTCPeerConnection {
                         Some(mapped) => Outcome::Mapped(mapped),
                         None => {
                             debug!("{}: Binding error or no mapped address", a.server);
+                            let mut code = stun::error_code::ErrorCodeAttribute::default();
+                            if stun::message::Getter::get_from(&mut code, &response).is_ok() {
+                                probe.error = Some((
+                                    code.code.0,
+                                    String::from_utf8_lossy(&code.reason).into_owned(),
+                                ));
+                            }
                             Outcome::Failed
                         }
                     },
@@ -1507,6 +1572,106 @@ mod tests {
             pc.handle_timeout(now + TA * step).unwrap();
         }
         panic!("no Binding request reached the STUN server");
+    }
+
+    /// RFC 8489 section 8.1: "A 'stuns' URI containing an IP address MUST be rejected". Given
+    /// such a server (as a configuration that takes the URL gives it, the half
+    /// `a_url_no_check_refuses_is_accepted` covers; set directly here so that this half does
+    /// not depend on it), gathering does not use it, from a UDP base nor from the engine's passive ICE-TCP
+    /// listener, which is bound here as a driver would (the base a `stuns:` server is asked
+    /// from): nothing is sent and no connection is opened to it, it is reported once with an
+    /// `icecandidateerror` of code 701 (W3C 4.8.3: the server cannot be reached; no local
+    /// address was used, so none is given), and once the application ends gathering it
+    /// completes (nothing is left waiting for the server).
+    #[test]
+    fn a_stuns_server_whose_host_is_an_ip_address_is_not_asked_and_is_reported() {
+        let now = Instant::now();
+        // Roots to check a server with: without them a `stuns:` attempt fails before any
+        // connection is opened ("stuns: server without roots or a verifier to check it"), and
+        // an engine that asked the server would go unnoticed by the connection assertion.
+        let (_, roots) = tls_server("stun.rtc.test");
+        let mut pc = RTCPeerConnectionBuilder::new()
+            .with_setting_engine(
+                SettingEngineBuilder::new()
+                    .with_tcp_simultaneous_open(false)
+                    .with_turn_tls(TurnTlsConfig {
+                        roots: Some(roots),
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .build(now)
+            .unwrap();
+        pc.streams
+            .srflx
+            .set_servers(&[Url::parse_url_lenient("stuns:192.0.2.1:5349").unwrap()]);
+        pc.create_data_channel("d", None).unwrap();
+        let offer = pc.create_offer(None).unwrap();
+        pc.set_local_description(now, offer).unwrap();
+        pc.add_local_candidate(RTCIceCandidateInit {
+            candidate: "candidate:1 1 udp 2130706431 10.0.0.1 4000 typ host".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let server: SocketAddr = "192.0.2.1:5349".parse().unwrap();
+        let mut commands = vec![];
+        let mut errors = vec![];
+        let mut bound = 0u16;
+        for step in 0..10u32 {
+            while let Some(t) = pc.poll_write() {
+                assert_ne!(t.transport.peer_addr, server, "nothing is sent to it");
+            }
+            let mut listeners = vec![];
+            while let Some(command) = pc.poll_stream_command() {
+                if let StreamCommand::Listen { listener, .. } = &command {
+                    listeners.push(*listener);
+                }
+                commands.push(command);
+            }
+            for listener in listeners {
+                bound += 1;
+                pc.handle_stream_event(
+                    now,
+                    StreamEvent::Listening {
+                        listener,
+                        local: SocketAddr::new("10.0.0.1".parse().unwrap(), 7000 + bound),
+                    },
+                )
+                .unwrap();
+            }
+            while let Some(event) = pc.poll_event() {
+                if let RTCPeerConnectionEvent::OnIceCandidateErrorEvent(e) = event {
+                    errors.push(e);
+                }
+            }
+            pc.handle_timeout(now + TA * step).unwrap();
+        }
+        assert!(
+            bound > 0,
+            "the passive listener was asked for and bound: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, StreamCommand::Connect { remote, .. } if *remote == server)),
+            "no connection is opened to it: {commands:?}"
+        );
+        assert_eq!(errors.len(), 1, "reported once per server URL: {errors:?}");
+        assert_eq!(errors[0].url, "stuns:192.0.2.1:5349");
+        assert_eq!(
+            errors[0].error_code,
+            crate::peer_connection::event::ICE_SERVER_UNREACHABLE
+        );
+        assert_eq!((errors[0].address.as_str(), errors[0].port), ("", 0));
+
+        pc.add_local_candidate(RTCIceCandidateInit::default())
+            .unwrap();
+        while pc.poll_event().is_some() {}
+        assert_eq!(
+            pc.ice_gathering_state(),
+            crate::peer_connection::state::RTCIceGatheringState::Complete,
+            "gathering waits for nothing of the rejected server"
+        );
     }
 
     /// RFC 8489 section 14.14: "This attribute SHOULD be used by clients and servers. ... in

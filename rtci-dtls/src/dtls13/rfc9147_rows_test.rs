@@ -423,3 +423,289 @@ fn extraneous_certificates_in_the_chain_are_tolerated() -> Result<()> {
     );
     Ok(())
 }
+
+// ----------------------------------------------------------------------------------------
+// MUST rows of audit batch 8 (must8a): datagrams of one association, fragments that tile.
+// ----------------------------------------------------------------------------------------
+
+/// Every handshake fragment in the plaintext records of `datagrams`, in the order sent:
+/// (message_seq, the message's length, fragment_offset, fragment_length).
+fn plaintext_fragments(datagrams: &[BytesMut]) -> Vec<(u16, usize, usize, usize)> {
+    use super::record::{CONTENT_TYPE_HANDSHAKE, DatagramRecord, next_record};
+    let u24 = |b: &[u8]| usize::from(b[0]) << 16 | usize::from(b[1]) << 8 | usize::from(b[2]);
+    let mut fragments = vec![];
+    for datagram in datagrams {
+        let mut rest = &datagram[..];
+        while !rest.is_empty() {
+            let (record, taken) = next_record(rest, 0).expect("a datagram of whole records");
+            if let DatagramRecord::Plaintext {
+                content_type: CONTENT_TYPE_HANDSHAKE,
+                fragment,
+                ..
+            } = record
+            {
+                let fragment_length = u24(&fragment[9..12]);
+                assert_eq!(
+                    fragment.len(),
+                    12 + fragment_length,
+                    "one fragment a record"
+                );
+                fragments.push((
+                    u16::from_be_bytes([fragment[4], fragment[5]]),
+                    u24(&fragment[1..4]),
+                    u24(&fragment[6..9]),
+                    fragment_length,
+                ));
+            }
+            rest = &rest[taken..];
+        }
+    }
+    fragments
+}
+
+/// RFC 9147 section 5.5: "the sender divides the message into a series of N contiguous data
+/// ranges. The ranges MUST NOT overlap." A client at the smallest MTU (128 bytes) cuts each
+/// of its ClientHellos (the first, and the second with the server's cookie) into several
+/// fragments; in each transmission the fragments of a message, in the order sent, start at
+/// 0, each where the one before it ended, and end at the message's length. The handshake
+/// completes.
+#[test]
+fn the_fragments_of_a_handshake_message_tile_it_without_overlap() -> Result<()> {
+    let mut pair = Pair::new(client_builder().with_mtu(128), server_builder())?;
+    let mut fragmented = 0;
+    for _ in 0..32 {
+        let (up, down) = pair.round();
+        for transmission in [&up, &down] {
+            let fragments = plaintext_fragments(transmission);
+            let mut messages: Vec<u16> = fragments.iter().map(|f| f.0).collect();
+            messages.dedup();
+            for seq in messages {
+                let pieces: Vec<_> = fragments.iter().filter(|f| f.0 == seq).collect();
+                let length = pieces[0].1;
+                let mut end = 0;
+                for &&(_, message_length, offset, fragment_length) in &pieces {
+                    assert_eq!(message_length, length, "message {seq}: {pieces:?}");
+                    assert_eq!(
+                        offset, end,
+                        "message {seq}: a fragment at {offset} after one that ended at {end}: \
+                         {pieces:?}"
+                    );
+                    end = offset + fragment_length;
+                }
+                assert_eq!(
+                    end, length,
+                    "message {seq}: the fragments cover it: {pieces:?}"
+                );
+                if pieces.len() > 1 {
+                    fragmented += 1;
+                }
+            }
+        }
+        if up.is_empty() && down.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        pair.client_complete && pair.server_complete,
+        "the handshake completes (client: {:?}, server: {:?})",
+        pair.client_error,
+        pair.server_error
+    );
+    assert!(
+        fragmented >= 2,
+        "both ClientHellos are cut into several fragments at an MTU of 128: {fragmented}"
+    );
+    Ok(())
+}
+
+/// The address of a second client of the server in [`Pair`]'s addresses.
+fn second_client_addr() -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], 6446))
+}
+
+/// The server's datagrams in [`records_of_two_associations_never_share_a_datagram`]: which
+/// client each went to, and its bytes.
+type Sent = Vec<(usize, BytesMut)>;
+
+/// Hands every queued datagram to its peer until nobody sends: the clients' to the server,
+/// the server's to the client its address names. Returns what the server sent, and adds the
+/// application data each client was handed to `received`.
+fn exchange(
+    server: &mut crate::endpoint::Endpoint,
+    clients: &mut [crate::endpoint::Endpoint],
+    addresses: &[std::net::SocketAddr],
+    now: Instant,
+    received: &mut [Vec<Vec<u8>>],
+    completed: &mut [bool],
+) -> Sent {
+    let mut sent = vec![];
+    for _ in 0..32 {
+        let mut quiet = true;
+        for (index, client) in clients.iter_mut().enumerate() {
+            while let Some(transmit) = client.poll_transmit() {
+                quiet = false;
+                let _ = server.read(now, addresses[index], None, transmit.message);
+            }
+        }
+        while let Some(transmit) = server.poll_transmit() {
+            quiet = false;
+            let index = addresses
+                .iter()
+                .position(|address| *address == transmit.transport.peer_addr)
+                .expect("a datagram to one of the clients");
+            sent.push((index, transmit.message.clone()));
+            if let Ok(events) = clients[index].read(now, server_addr(), None, transmit.message) {
+                received[index].extend(application_data(&events));
+                completed[index] |= events.iter().any(|event| {
+                    matches!(event, crate::endpoint::EndpointEvent::HandshakeComplete)
+                });
+            }
+        }
+        if quiet {
+            break;
+        }
+    }
+    sent
+}
+
+/// The connection id of every protected record of `datagram` (each client asked for 4-byte
+/// ids), and how many plaintext records it holds.
+fn record_connection_ids(datagram: &[u8]) -> (Vec<Vec<u8>>, usize) {
+    use super::record::{DatagramRecord, next_record};
+    let mut ids = vec![];
+    let mut plaintext = 0;
+    let mut rest = datagram;
+    while !rest.is_empty() {
+        let (record, taken) = next_record(rest, 4).expect("a datagram of whole records");
+        match record {
+            DatagramRecord::Ciphertext { header, record } => {
+                ids.push(record[header.connection_id].to_vec());
+            }
+            DatagramRecord::Plaintext { .. } => plaintext += 1,
+        }
+        rest = &rest[taken..];
+    }
+    (ids, plaintext)
+}
+
+/// RFC 9147 section 4: "Sending implementations MUST NOT mix records from multiple DTLS
+/// associations in the same datagram." One server endpoint with two DTLS 1.3 associations
+/// (two clients, each asking for its own 4-byte connection id, so that every protected record
+/// says whose it is): their handshakes run together, then the server writes to both in turn
+/// and closes both at once. Every protected record of every datagram the server sent carries
+/// the connection id of the client the datagram went to, and each client is handed exactly
+/// what was written to it.
+#[test]
+fn records_of_two_associations_never_share_a_datagram() -> Result<()> {
+    use crate::config::DtlsVersion;
+    use crate::endpoint::Endpoint;
+    use shared::TransportProtocol;
+    let dtls13 = |builder: ConfigBuilder| {
+        builder
+            .with_protocol_versions(DtlsVersion::Dtls1_3, DtlsVersion::Dtls1_3)
+            .with_connection_id(Some(4))
+    };
+    let now = Instant::now();
+    let addresses = [client_addr(), second_client_addr()];
+    let mut server = Endpoint::new(
+        server_addr(),
+        TransportProtocol::UDP,
+        Some(Arc::new(
+            dtls13(server_builder())
+                .with_cookie_exchange(false)
+                .build(false, None)?,
+        )),
+    );
+    let mut clients = vec![];
+    for address in addresses {
+        let mut client = Endpoint::new(address, TransportProtocol::UDP, None);
+        client.connect(
+            now,
+            server_addr(),
+            Arc::new(dtls13(client_builder()).build(true, None)?),
+            None,
+        )?;
+        clients.push(client);
+    }
+    let mut received = vec![vec![], vec![]];
+    let mut completed = vec![false, false];
+    let handshakes = exchange(
+        &mut server,
+        &mut clients,
+        &addresses,
+        now,
+        &mut received,
+        &mut completed,
+    );
+    // The id each client asked for, as the server took it from the client's ClientHello (a
+    // client sets its own only once it has the ServerHello). Read before the close, which
+    // ends the associations.
+    let ids: Vec<Vec<u8>> = addresses
+        .iter()
+        .map(|address| {
+            server
+                .connection_mut(address)
+                .expect("the server's association")
+                .connection_ids()
+                .expect("a DTLS 1.3 association")
+                .1
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids[0].len(), 4);
+    assert_ne!(ids[0], ids[1], "the clients asked for different ids");
+    let mut protected = [0usize; 2];
+    let mut check = |sent: &Sent| {
+        for (index, datagram) in sent {
+            let (record_ids, plaintext) = record_connection_ids(datagram);
+            assert!(
+                record_ids.iter().all(|id| *id == ids[*index]),
+                "a datagram to client {index} holds records of {record_ids:?} (its id: {:?}, \
+                 the other's: {:?}) and {plaintext} plaintext records",
+                ids[*index],
+                ids[1 - *index]
+            );
+            protected[*index] += record_ids.len();
+        }
+    };
+    check(&handshakes);
+    assert_eq!(completed, vec![true, true], "both handshakes complete");
+    for (index, client) in clients.iter_mut().enumerate() {
+        let conn = client
+            .connection_mut(&server_addr())
+            .expect("the client's association");
+        assert_eq!(
+            conn.connection_ids().expect("a DTLS 1.3 association").0,
+            &ids[index][..],
+            "client {index} asked for the id the server sends"
+        );
+    }
+
+    let mut written = vec![vec![], vec![]];
+    for n in 0..8 {
+        for (index, address) in addresses.iter().enumerate() {
+            let data = format!("to client {index}, message {n}").into_bytes();
+            server.write(now, *address, &data)?;
+            written[index].push(data);
+        }
+    }
+    server.close(now)?;
+    let data = exchange(
+        &mut server,
+        &mut clients,
+        &addresses,
+        now,
+        &mut received,
+        &mut completed,
+    );
+    check(&data);
+    assert!(
+        protected.iter().all(|count| *count > 8),
+        "each association's records were looked at: {protected:?}"
+    );
+    assert_eq!(
+        received, written,
+        "each client is handed what was written to it"
+    );
+    Ok(())
+}

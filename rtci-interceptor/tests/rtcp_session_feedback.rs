@@ -286,6 +286,58 @@ fn a_large_feedback_packet_is_sent_compound() {
     assert!(sent[0].is_compound());
 }
 
+/// RFC 3550 6.1: "If the overall length of a compound packet would exceed the MTU of the
+/// network path, it SHOULD be segmented into multiple shorter compound packets to be
+/// transmitted in separate packets of the underlying protocol", each beginning with an SR or
+/// RR. A NACK larger than the MTU by itself leaves at once in several compound packets, each
+/// under the MTU, that together ask for every packet it asked for.
+#[test]
+fn a_nack_larger_than_the_mtu_is_split_into_several_compound_packets() {
+    let mut chain = chain(builder().with_mtu(300));
+    let base = Instant::now();
+    chain.bind_remote_stream(&video(200));
+    control(&mut chain, base, RtcpSessionControl::Start);
+
+    // 150 separate losses: 150 PID/BLP pairs, 612 octets of NACK, twice the MTU.
+    let pairs: Vec<NackPair> = (0..150u16)
+        .map(|n| NackPair {
+            packet_id: n * 20,
+            lost_packets: 0,
+        })
+        .collect();
+    let asked: Vec<u16> = {
+        let mut asked: Vec<u16> = pairs.iter().flat_map(|pair| pair.packet_list()).collect();
+        asked.sort_unstable();
+        asked
+    };
+    let large: Vec<Box<dyn rtcp::Packet>> = vec![Box::new(TransportLayerNack {
+        sender_ssrc: 0,
+        media_ssrc: 200,
+        nacks: pairs,
+    })];
+    let now = base + secs(0.01);
+    chain.handle_write(rtcp(now, large)).unwrap();
+    let sent = written(&mut chain);
+
+    assert!(
+        sent.len() >= 3,
+        "612 octets in 300-octet packets: {}",
+        sent.len()
+    );
+    for datagram in &sent {
+        assert_eq!(now, datagram.at, "all at once");
+        let size: usize = datagram.packets.iter().map(|p| p.marshal_size()).sum();
+        assert!(size <= 300, "{size} octets");
+        assert!(datagram.is_compound());
+        assert_eq!(Some(REPORTER), datagram.leader());
+        assert!(datagram.has::<TransportLayerNack>());
+        for nack in datagram.get::<TransportLayerNack>() {
+            assert_eq!(REPORTER, nack.sender_ssrc);
+        }
+    }
+    assert_eq!(asked, nacked(&sent, 200), "every packet asked for, once");
+}
+
 /// RFC 4585 3.5.2 step 3: when the next regular packet is due within the dither of an Early
 /// one, no Early packet is scheduled; the feedback goes with the regular packet.
 #[test]
@@ -928,5 +980,114 @@ fn with_rfc_4585_timing_a_second_congestion_feedback_waits_for_the_regular_packe
             assert!(sent[0].is_compound(), "with the regular packet");
             assert_eq!(1, sent[0].get::<TransportLayerCc>().len());
         }
+    }
+}
+
+/// The RTCP datagrams a chain wrote, without the attribute carriers that pass it.
+fn datagrams(chain: &mut impl Interceptor) -> Vec<Sent> {
+    let mut sent = vec![];
+    while let Some(tagged) = chain.poll_write() {
+        if let Packet::Rtcp(packets) = tagged.message.packet
+            && !packets.is_empty()
+        {
+            sent.push(Sent {
+                at: tagged.now,
+                packets,
+            });
+        }
+    }
+    sent
+}
+
+/// RFC 5104 section 4.2.1.3: "The first transmission of the TMMBR message MAY use early or
+/// immediate feedback [...]. Any repetition of a request message SHOULD use regular RTCP mode
+/// for its transmission timing." Congestion control above the RTCP session: the first TMMBR
+/// leaves at once in an Early (minimal) compound packet; every repetition of it, while no
+/// TMMBN answers, rides a Regular compound packet (one with the report block on the media
+/// sender), never an Early one of its own.
+#[test]
+fn a_repeated_tmmbr_waits_for_the_regular_compound_packet() {
+    use rtci_interceptor::{
+        CongestionControlBuilder, ConstantBitrate, Registry, Slot, StreamInfo, TmmbrControl,
+    };
+    use rtcp::transport_feedbacks::tmmb::TemporaryMaximumBitrateRequest;
+
+    let (cc, _handle) =
+        CongestionControlBuilder::new(ConstantBitrate::new(2_000_000.0)).build_with_handle();
+    let mut chain = Registry::new()
+        .with(Slot::CongestionControl, cc)
+        .with(Slot::RtcpSession, builder().build())
+        .build();
+    let media = StreamInfo {
+        rtcp_feedback: vec![feedback("ccm", "tmmbr")],
+        ..video(200)
+    };
+    chain.bind_remote_stream(&media);
+    let base = Instant::now();
+    control(&mut chain, base, RtcpSessionControl::Start);
+
+    let limit_at = base + secs(0.5);
+    let mut sent = vec![];
+    let mut at = base;
+    let mut sequence_number = 0u16;
+    let mut limited = false;
+    while at < base + secs(8.0) {
+        sequence_number = sequence_number.wrapping_add(1);
+        chain
+            .handle_read(rtp(
+                at,
+                200,
+                sequence_number,
+                u32::from(sequence_number) * 3000,
+            ))
+            .unwrap();
+        read(&mut chain);
+        if !limited && at >= limit_at {
+            limited = true;
+            chain
+                .handle_write(
+                    TmmbrControl::Limit {
+                        media_ssrc: 200,
+                        bitrate: 250_000,
+                    }
+                    .into_packet(at),
+                )
+                .unwrap();
+            sent.extend(datagrams(&mut chain));
+        }
+        at += secs(0.02);
+        while let Some(next) = chain.poll_timeout() {
+            if next > at {
+                break;
+            }
+            chain.handle_timeout(next).unwrap();
+            sent.extend(datagrams(&mut chain));
+        }
+        chain.handle_timeout(at).unwrap();
+        sent.extend(datagrams(&mut chain));
+    }
+
+    let with_request: Vec<&Sent> = sent
+        .iter()
+        .filter(|datagram| datagram.has::<TemporaryMaximumBitrateRequest>())
+        .collect();
+    assert!(
+        with_request.len() >= 4,
+        "repeated while no TMMBN answers: {}",
+        with_request.len()
+    );
+    let first = with_request[0];
+    assert!(
+        first.at >= limit_at && first.at < limit_at + secs(0.02),
+        "at once"
+    );
+    assert!(first.is_compound());
+    for repetition in &with_request[1..] {
+        assert!(repetition.is_compound());
+        assert!(
+            repetition.reported().contains(&200),
+            "a repetition at {:?} left in an Early packet, not a Regular one",
+            repetition.at - base
+        );
     }
 }

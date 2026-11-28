@@ -772,6 +772,55 @@ fn unknown_cipher_suites_in_a_client_hello_are_ignored() {
     assert_eq!(&server_hello[35..37], &ECDSA_GCM.to_be_bytes());
 }
 
+/// RFC 5746 section 3.6: "TLS servers implementing this specification MUST ignore any unknown
+/// extensions offered by the client". A ClientHello with extension types this server does not
+/// know (a GREASE value, empty, and an unassigned one with data) among the usual ones, before
+/// and after them, is answered with the same full flight as without them, and the ServerHello
+/// answers none of them.
+#[test]
+fn unknown_extensions_in_a_client_hello_are_ignored() {
+    let flight = |answer: &ServerAnswer| {
+        answer
+            .messages()
+            .into_iter()
+            .map(|(typ, _)| typ)
+            .collect::<Vec<_>>()
+    };
+    let plain = answer_from(builder(), |cookie| {
+        client_hello_body(&[], cookie, &[ECDSA_GCM], Some(&usual_client_extensions()))
+    });
+    plain
+        .result
+        .as_ref()
+        .expect("the usual ClientHello is accepted");
+
+    let unknown = [
+        extension(0x0a0a, &[]),
+        usual_client_extensions(),
+        extension(0x7e57, &[0xde, 0xad, 0xbe, 0xef]),
+    ]
+    .concat();
+    let answer = answer_from(builder(), |cookie| {
+        client_hello_body(&[], cookie, &[ECDSA_GCM], Some(&unknown))
+    });
+    answer
+        .result
+        .as_ref()
+        .expect("a ClientHello with unknown extensions is accepted");
+    assert!(plaintext_alerts(&answer.datagrams).is_empty());
+    let messages = flight(&answer);
+    assert_eq!(messages.first(), Some(&SERVER_HELLO));
+    assert!(messages.contains(&CERTIFICATE) && messages.contains(&SERVER_KEY_EXCHANGE));
+    assert_eq!(messages.last(), Some(&SERVER_HELLO_DONE), "{messages:?}");
+    assert_eq!(messages, flight(&plain));
+    let types = answer.server_hello_extension_types();
+    assert!(
+        !types.contains(&0x0a0a) && !types.contains(&0x7e57),
+        "the ServerHello answers no unknown extension: {types:?}"
+    );
+    assert_eq!(types, plain.server_hello_extension_types());
+}
+
 /// RFC 8122 section 7: "TLS_NULL_WITH_NULL_NULL ... is not acceptable" for the DTLS of an
 /// SDP-negotiated session, which SHOULD refuse it. A ClientHello offering only that suite
 /// (0x0000) has nothing the server selects: a handshake_failure, and no ServerHello; offered

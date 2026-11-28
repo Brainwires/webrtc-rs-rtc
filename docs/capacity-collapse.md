@@ -239,10 +239,15 @@ that instant:
 - on `RTCPeerConnection::poll_read`, an `RTCMessage::RtcpPacket` holding a Picture Loss
   Indication for the stream's SSRC with sender SSRC 0, the same message a receiver's request
   arrives as; and
-- on `poll_event`, `RTCPeerConnectionEvent::OnKeyFrameRequest { sender, rid }`.
+- on `poll_event`, `RTCPeerConnectionEvent::OnKeyFrameRequest { sender, rid }`, followed by
+  `OnKeyFrameRequestOrigin`, the same request with its origin:
+  `RTCKeyFrameRequestOrigin::Local(LocalKeyFrameRequest::PacerFlush)` (or `PacerDiscard`,
+  `RepairGivenUp`), where a receiver's request is `RemotePictureLossIndication` or
+  `RemoteFullIntraRequest`. The origin rides on the PLI as an attribute from the interceptor
+  that made it, not inferred from sender SSRC 0, which a remote peer may hold too.
 
 An application that answers either with a key frame, as it must for a remote request anyway,
-needs no new code. `OnPacerDiscard` names the media that was queued. The key frame should be
+needs no new code. One that treats the engine's own requests differently reads the origin. `OnPacerDiscard` names the media that was queued. The key frame should be
 sized for the target read then (`RTCRtpSender::target_bitrates`).
 
 **On the receiving side**, bound the wait for a missing packet in time, or resume at a key

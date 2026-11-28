@@ -184,51 +184,78 @@ fn a_bye_for_another_ssrc_changes_nothing() {
 }
 
 /// RFC 3550 6.3.5: a source not heard from for five report intervals has timed out (the RTCP
-/// session's `SourceTimedOut`); RFC 8830 section 3 has the track whose SSRCs are gone ended
-/// "(BYE, timeout)". Under W3C webrtc 9.3 the timeout does what a BYE does: the track is
-/// muted, not ended. Another source's timeout changes nothing.
-#[test]
-fn a_timed_out_source_mutes_its_track_as_a_bye_does() {
-    for (ssrc, expected) in [
-        (SSRC, vec!["mute:remote-track".to_string()]),
-        (4242, vec![]),
-    ] {
-        let mut ctx = InterceptorHandlerContext {
-            is_dtls_handshake_complete: true,
-            ..Default::default()
-        };
-        let mut transceivers = vec![transceiver()];
-        let media_engine = MediaEngine::default();
-        let mut chain = NullChain;
-        let mut stats = RTCStatsAccumulator::default();
-        let mut handler = InterceptorHandler::new(
-            &mut ctx,
-            &mut transceivers,
-            &media_engine,
-            &mut chain,
-            &mut stats,
-            None,
-        );
-        handler.process_session_event(
-            Instant::now(),
-            &interceptor::RtcpSessionEvent::SourceTimedOut { ssrc },
-        );
-        let events: Vec<String> = std::iter::from_fn(|| handler.poll_event())
-            .filter_map(|event| match event.event {
-                RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnTrack(
-                    RTCTrackEvent::OnMute(track_id),
-                )) => Some(format!("mute:{track_id}")),
-                RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnTrack(
-                    RTCTrackEvent::OnClose(track_id),
-                )) => Some(format!("close:{track_id}")),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(events, expected, "ssrc {ssrc}");
-        let track = transceivers[0].receiver().as_ref().unwrap().track();
-        assert_eq!(MediaStreamTrackState::Live, track.ready_state());
-        assert_eq!(track.muted(), ssrc == SSRC);
+/// session's `SourceTimedOut`). W3C webrtc-pc Candidate Correction 57 (w3c/webrtc-pc PR #3082,
+/// merged 2025-10-23, "RTCP timeout is not a reason to mute a remote track", fixing #3077)
+/// took "or via timeout" out of section 9.3, which now mutes the track only "due to reception
+/// of a BYE": by default a timed-out source leaves its track live and unmuted, and no event
+/// fires. With `with_rtp_timeout_muting(true)` (the Recommendation of 13 March 2025 without the
+/// correction: "removed either due to reception of a BYE or via timeout, it MUST queue a task
+/// to set the muted state ... to true") the timeout mutes it as a BYE does. Another source's
+/// timeout changes nothing either way. The two forms are two tests.
+/// The events and the track's (state, muted) after a timeout of `ssrc`, with or without
+/// `with_rtp_timeout_muting`.
+fn after_timeout(mutes: bool, ssrc: u32) -> (Vec<String>, MediaStreamTrackState, bool) {
+    let mut ctx = InterceptorHandlerContext {
+        is_dtls_handshake_complete: true,
+        ..Default::default()
     }
+    .with_rtp_timeout_muting(mutes);
+    let mut transceivers = vec![transceiver()];
+    let media_engine = MediaEngine::default();
+    let mut chain = NullChain;
+    let mut stats = RTCStatsAccumulator::default();
+    let mut handler = InterceptorHandler::new(
+        &mut ctx,
+        &mut transceivers,
+        &media_engine,
+        &mut chain,
+        &mut stats,
+        None,
+    );
+    handler.process_session_event(
+        Instant::now(),
+        &interceptor::RtcpSessionEvent::SourceTimedOut { ssrc },
+    );
+    let events: Vec<String> = std::iter::from_fn(|| handler.poll_event())
+        .filter_map(|event| match event.event {
+            RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnTrack(
+                RTCTrackEvent::OnMute(track_id),
+            )) => Some(format!("mute:{track_id}")),
+            RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnTrack(
+                RTCTrackEvent::OnClose(track_id),
+            )) => Some(format!("close:{track_id}")),
+            _ => None,
+        })
+        .collect();
+    let track = transceivers[0].receiver().as_ref().unwrap().track();
+    (events, track.ready_state(), track.muted())
+}
+
+/// The default: a timed-out source (its own or another) leaves the track live and unmuted,
+/// and no event fires.
+#[test]
+fn a_timed_out_source_leaves_its_track_unmuted() {
+    for ssrc in [SSRC, 4242] {
+        let (events, state, muted) = after_timeout(false, ssrc);
+        assert!(events.is_empty(), "ssrc {ssrc}: {events:?}");
+        assert_eq!(MediaStreamTrackState::Live, state, "ssrc {ssrc}");
+        assert!(!muted, "ssrc {ssrc}: muted by a timeout");
+    }
+}
+
+/// `with_rtp_timeout_muting(true)`, the uncorrected Recommendation's form: the track's own
+/// SSRC timing out mutes it (`OnMute`), as a BYE does; it stays live. Another source's
+/// timeout changes nothing.
+#[test]
+fn with_timeout_muting_a_timed_out_source_mutes_its_track() {
+    let (events, state, muted) = after_timeout(true, SSRC);
+    assert_eq!(events, vec!["mute:remote-track".to_string()]);
+    assert_eq!(MediaStreamTrackState::Live, state);
+    assert!(muted, "not muted by the timeout");
+    let (events, state, muted) = after_timeout(true, 4242);
+    assert!(events.is_empty(), "another source: {events:?}");
+    assert_eq!(MediaStreamTrackState::Live, state);
+    assert!(!muted);
 }
 
 /// RFC 8830 section 3: "a MediaStreamTrack ... has ended when all of its SSRCs have ended

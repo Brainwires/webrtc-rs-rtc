@@ -11,8 +11,8 @@
 //! blocks still live can be searched just before the drop ("found live": the bytes are in the
 //! Rust heap, so the check can see them), and searches every block freed during the drop
 //! ("left in freed memory": the bytes were not erased). Memory the provider allocates in C
-//! (AWS-LC's `EVP_AEAD_CTX`) and stack frames are not seen here; `key_erasure_process_memory.rs`
-//! (Linux) searches the whole process for those.
+//! (AWS-LC's `EVP_AEAD_CTX`) and stack frames are not seen here; `key_residue.rs` reads the
+//! stack frames and (Linux) searches the whole process.
 
 mod key_material;
 
@@ -264,7 +264,7 @@ fn keys_the_crate_holds_are_erased_with_every_provider() {
 
 /// AWS-LC's key objects that live in the Rust heap (its HMAC contexts) are erased: a needle
 /// found in a live block is in no block freed by the drop. Its AES-GCM contexts are in C memory,
-/// which `key_erasure_process_memory.rs` searches.
+/// which `key_residue.rs` searches.
 #[cfg(feature = "crypto-aws-lc-rs")]
 #[test]
 fn aws_lc_leaves_no_key_in_freed_rust_memory() {
@@ -276,8 +276,8 @@ fn aws_lc_leaves_no_key_in_freed_rust_memory() {
 
 /// With the ring provider no key is left in freed memory, for every profile: the keys the
 /// crate holds, the HMAC-SHA1 states of the AES-CM and NULL profiles' authentication keys
-/// (RustCrypto `hmac`, which `rtci-crypto` builds for the ring provider and overwrites when a
-/// context is dropped; left in freed memory in 0.1.0) and ring's own AES-GCM key objects
+/// (RustCrypto `hmac` and `sha1`, which `rtci-crypto` uses for the ring provider, with their
+/// `zeroize` features: overwritten when a context is dropped; left in freed memory in 0.1.0) and ring's own AES-GCM key objects
 /// (`ring::aead::LessSafeKey`: the session key and every AES round key), which `rtci-crypto`
 /// keeps in an allocation of its own and overwrites after ring has dropped them (left in freed
 /// memory in 0.1.0, a known limit of that provider). Each is found live first: the needles are

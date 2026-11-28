@@ -105,7 +105,12 @@ async fn main() -> Result<()> {
 }
 
 async fn run_peer_connection(offer: RTCSessionDescription, rtp_listener: UdpSocket) -> Result<()> {
-    let setting_engine = SettingEngine::default();
+    // The browser page pastes its description and never signals the end of its candidates:
+    // the PAC timer stands in for it (RFC 8863 section 5; W3C webrtc-pc 5.6.4).
+    let setting_engine: SettingEngine =
+        rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder::new()
+            .with_ice_failed_without_end_of_candidates(true)
+            .build();
 
     // Create a MediaEngine with VP8 support
     let mut media_engine = MediaEngine::default();
@@ -181,6 +186,10 @@ async fn run_peer_connection(offer: RTCSessionDescription, rtp_listener: UdpSock
     .new_candidate_host()?;
     let local_candidate_init = RTCIceCandidate::from(&candidate).to_json()?;
     peer_connection.add_local_candidate(local_candidate_init)?;
+    // This side's gathering is done: its end-of-candidates (W3C webrtc-pc 5.6.4: "failed" and
+    // "completed" need it; the answer then carries a=end-of-candidates).
+    peer_connection
+        .add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
 
     let answer = peer_connection.create_answer(None)?;
     println!("Created Answer={}", answer);

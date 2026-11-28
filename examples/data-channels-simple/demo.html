@@ -30,13 +30,13 @@
     channel.onmessage = e => log(`📩 Server: ${e.data}`);
 
     pc.onicecandidate = event => {
-      if(event.candidate){
-        fetch("/candidate", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify(event.candidate),
-        });
-      }
+      // The end of the candidates too (an empty candidate, or `null` at the very end): the
+      // server's transport is "failed" only once it has it (W3C webrtc-pc 5.6.4).
+      fetch("/candidate", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(event.candidate ? event.candidate : {candidate: ""}),
+      });
     };
 
     async function start(){

@@ -11,8 +11,9 @@
 
 use rtci_interceptor::{
     Attribute, AttributedPacket, CircuitBreakerNotice, CircuitBreakerReason, Interceptor,
-    MinimumTarget, PacerBuilder, PacerDiscard, PacerPause, PacerQueueOverflow as QueueOverflow,
-    Packet, Registry, RetransmissionsLeft, Slot, StreamInfo, TaggedPacket,
+    LocalKeyFrameRequest, MinimumTarget, PacerBuilder, PacerDiscard, PacerPause,
+    PacerQueueOverflow as QueueOverflow, Packet, Registry, RetransmissionsLeft, Slot, StreamInfo,
+    TaggedPacket,
 };
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use sansio::Protocol;
@@ -933,6 +934,27 @@ fn key_frame_requests(reads: &[TaggedPacket]) -> Vec<u32> {
         .collect()
 }
 
+/// The reason each key-frame request among `reads` carries ([`LocalKeyFrameRequest`], `None`
+/// for a request without one), by stream.
+fn key_frame_request_origins(reads: &[TaggedPacket]) -> Vec<(u32, Option<LocalKeyFrameRequest>)> {
+    reads
+        .iter()
+        .filter(|read| read.message.has(&Attribute::DeliverToApplication))
+        .filter_map(|read| match &read.message.packet {
+            Packet::Rtcp(packets) => Some((packets, read.message.custom::<LocalKeyFrameRequest>())),
+            _ => None,
+        })
+        .flat_map(|(packets, why)| {
+            packets.iter().filter_map(move |packet| {
+                packet
+                    .as_any()
+                    .downcast_ref::<PictureLossIndication>()
+                    .map(|pli| (pli.media_ssrc, why.copied()))
+            })
+        })
+        .collect()
+}
+
 /// 12 kbit/s: one full-sized packet a second, so waits of seconds are easy to read.
 const SLOW: f64 = 12_000.0;
 
@@ -1029,6 +1051,11 @@ fn a_discard_asks_the_application_for_a_key_frame_of_a_media_stream_only() {
     let reads = harness.reads();
     assert_eq!(vec![(1, vec![3], 1), (11, vec![50], 1)], discards(&reads));
     assert_eq!(vec![1], key_frame_requests(&reads));
+    assert_eq!(
+        vec![(1, Some(LocalKeyFrameRequest::PacerDiscard))],
+        key_frame_request_origins(&reads),
+        "the request says it is the pacer's, after a discard"
+    );
 }
 
 /// The packets of a discarded frame that the application writes after the discard are

@@ -11,7 +11,9 @@ mod jsep_common;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use jsep_common::{TestResult, crlf, default_peer, exchange, media_sections, video_track};
+use jsep_common::{
+    TestResult, crlf, default_peer, exchange, media_sections, peer_adding_formats, video_track,
+};
 use rtci::peer_connection::RTCPeerConnection;
 use rtci::peer_connection::sdp::RTCSessionDescription;
 use rtci::rtp_transceiver::{RTCRtpSenderId, RTCRtpTransceiverId};
@@ -192,7 +194,7 @@ a=rtpmap:{pt} VP8/90000
 #[test]
 fn a_remote_offer_reusing_a_payload_type_across_sframe_and_plain_sections_is_refused() -> TestResult
 {
-    let mut pc = default_peer()?;
+    let mut pc = peer_adding_formats()?; // the answer adds formats: their numbering is checked
     let shared = crlf(&format!(
         "{SESSION}{}{}",
         section("0", 96, false),

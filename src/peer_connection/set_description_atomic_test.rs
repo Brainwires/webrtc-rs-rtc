@@ -243,6 +243,9 @@ fn a_remote_answer_that_does_not_answer_the_offer_changes_nothing() -> Result<()
         answer.contains("m=audio") && answer.contains("m=video"),
         "{answer}"
     );
+    // RFC 9429 section 5.11's refusal, the default of every profile but `Chrome` (which a
+    // `chrome-defaults` build takes as its default): stated, so the case below holds there too.
+    offerer.setting_engine.unoffered_feedback_refused = true;
     let events = offerer.pipeline_context.event_outs.len();
     let negotiated = (
         offerer.media_engine.negotiated_audio,
@@ -285,6 +288,12 @@ fn a_remote_answer_that_does_not_answer_the_offer_changes_nothing() -> Result<()
         (
             "a BUNDLE group naming a section the offer did not bundle (RFC 9143 section 7.4)",
             answer.replace("a=group:BUNDLE ", "a=group:BUNDLE other "),
+        ),
+        (
+            "an a=rtcp-fb the offer did not have (RFC 9429 section 5.11)",
+            edit_section(&answer, 1, |lines| {
+                lines.push("a=rtcp-fb:* made-up".to_owned());
+            }),
         ),
     ];
 
@@ -607,12 +616,15 @@ fn an_answer_resets_the_last_created_offer_and_answer() -> Result<()> {
     Ok(())
 }
 
-/// RFC 4585 section 4.2 has an answerer add no feedback; real ones answer with their own list.
-/// Such an answer is applied, and the feedback the offer did not have is not enabled: what is
-/// negotiated is the intersection with this endpoint's own feedback for the format.
+/// RFC 4585 section 4.2 has an answerer add no feedback, and RFC 9429 section 5.11 makes such
+/// an answer an error, the default. With `with_unoffered_feedback_refused(false)` (the
+/// `Chrome` profile, libwebrtc's form) it is applied, and the feedback the offer did not have
+/// is not enabled: what is negotiated is the intersection with this endpoint's own feedback
+/// for the format.
 #[test]
 fn feedback_an_answer_adds_is_not_enabled() -> Result<()> {
     let (mut offerer, answer) = pending_offer()?;
+    offerer.setting_engine.unoffered_feedback_refused = false;
     let video_payload_type = answer
         .lines()
         .find(|l| l.starts_with("m=video"))

@@ -312,7 +312,7 @@ fn rid_follows_the_rfc_8851_grammar() {
             "5 recv max-fs=3600;max-fps=15;max-br=300000",
             "1 send",
             "hi recv",
-            "a-b_c send pt=96,97,98",
+            "abc send pt=96,97,98",
             "1 send pt=96",
             "1 send max-bpp=0.5",
             "1 send max-pps=27648000",
@@ -331,6 +331,8 @@ fn rid_follows_the_rfc_8851_grammar() {
             "1  send",
             " 1 send",
             "a.b send",
+            // Erratum 7132: `rid-id = 1*255(alpha-numeric)`.
+            "a-b_c send pt=96,97,98",
             "a b send",
             "1 send ",
             "1 send pt=",
@@ -454,6 +456,88 @@ fn simulcast_follows_the_rfc_8853_grammar() {
             "send 1,~1",
         ],
     );
+}
+
+/// RFC 8851 section 10 as corrected by erratum 7132 (Verified 2022-10-13): `rid-id =
+/// 1*255(alpha-numeric)`, "consistent with the rules for the RtpStreamId/RepairedRtpStreamId
+/// SDES from RFC 8852 section 3". `a=simulcast` (RFC 8853 section 5.1) and `depend=` use the
+/// same rid-id.
+#[test]
+fn a_rid_id_is_1_to_255_alphanumerics() {
+    let longest = "a".repeat(255);
+    for id in ["0", "Az09", longest.as_str()] {
+        assert!(Rid::parse(&format!("{id} send")).is_ok(), "a=rid:{id} send");
+        assert!(Rid::new(id, RidDirection::Send).is_ok(), "Rid::new({id})");
+        assert!(
+            Simulcast::parse(&format!("send {id};~b")).is_ok(),
+            "a=simulcast:send {id};~b"
+        );
+        assert!(
+            Rid::parse(&format!("x send depend={id}")).is_ok(),
+            "depend={id}"
+        );
+    }
+}
+
+/// `id` is refused wherever a rid-id is read: on an `a=rid` line, by `Rid::new`, in either
+/// direction of `a=simulcast` (paused or not) and in `depend=`.
+fn assert_rid_id_refused(id: &str) {
+    assert!(
+        Rid::parse(&format!("{id} send")).is_err(),
+        "a=rid:{id} send"
+    );
+    assert!(Rid::new(id, RidDirection::Send).is_err(), "Rid::new({id})");
+    assert!(
+        Simulcast::parse(&format!("send h;{id}")).is_err(),
+        "a=simulcast:send h;{id}"
+    );
+    assert!(
+        Simulcast::parse(&format!("recv ~{id}")).is_err(),
+        "a=simulcast:recv ~{id}"
+    );
+    assert!(
+        Rid::parse(&format!("h send depend={id}")).is_err(),
+        "depend={id}"
+    );
+}
+
+/// Erratum 7132: the published grammar's `"-"` is not in `rid-id`.
+#[test]
+fn a_rid_id_with_a_dash_is_refused() {
+    assert_rid_id_refused("a-b");
+    assert_rid_id_refused("-");
+}
+
+/// Erratum 7132: the published grammar's `"_"` is not in `rid-id`.
+#[test]
+fn a_rid_id_with_an_underscore_is_refused() {
+    assert_rid_id_refused("a_b");
+    assert_rid_id_refused("_");
+}
+
+/// Erratum 7132: `1*255`, the 255-octet limit of an SDES item (RFC 8852 section 3).
+#[test]
+fn a_rid_id_longer_than_255_is_refused() {
+    assert_rid_id_refused(&"a".repeat(256));
+}
+
+/// `RidIdGrammar::Published` reads rid-ids as RFC 8851 section 10 was published, before
+/// erratum 7132: `-` and `_` taken, any length.
+#[test]
+fn the_published_grammar_takes_dashes_underscores_and_any_length() {
+    let long = "a".repeat(256);
+    for id in ["a-b", "a_b", "-", long.as_str()] {
+        let rid = Rid::parse_with(&format!("{id} send depend={id}"), RidIdGrammar::Published)
+            .unwrap_or_else(|e| panic!("a=rid:{id}: {e}"));
+        assert_eq!(rid.id, id);
+        let simulcast = Simulcast::parse_with(&format!("send h;~{id}"), RidIdGrammar::Published)
+            .unwrap_or_else(|e| panic!("a=simulcast:send h;~{id}: {e}"));
+        assert_eq!(simulcast.send[1][0].rid, id);
+        assert!(RidIdGrammar::Published.admits(id));
+        assert!(!RidIdGrammar::Corrected.admits(id));
+    }
+    assert!(Rid::parse_with("a.b send", RidIdGrammar::Published).is_err());
+    assert!(Simulcast::parse_with("send a.b", RidIdGrammar::Published).is_err());
 }
 
 #[test]

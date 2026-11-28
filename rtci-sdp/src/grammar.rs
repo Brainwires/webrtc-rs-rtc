@@ -79,7 +79,15 @@ pub(crate) fn is_integer(value: &str) -> bool {
     is_digits(value) && !value.starts_with('0')
 }
 
-/// `1*(alpha-numeric / "-" / "_")`: an RFC 8851 `rid-id` or an RFC 4585 `rtcp-fb-id`.
+/// `1*255(alpha-numeric)`: an RFC 8851 `rid-id` as corrected by erratum 7132 (Verified
+/// 2022-10-13), "consistent with the rules for the RtpStreamId/RepairedRtpStreamId SDES from
+/// RFC 8852 section 3" (255 octets, bytes 48-57, 65-90, 97-122).
+pub(crate) fn is_rid_id(value: &str) -> bool {
+    (1..=255).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// `1*(alpha-numeric / "-" / "_")`: an RFC 4585 `rtcp-fb-id`, and the `rid-id` of RFC 8851
+/// section 10 as published (before erratum 7132).
 pub(crate) fn is_alnum_dash_underscore(value: &str) -> bool {
     !value.is_empty()
         && value

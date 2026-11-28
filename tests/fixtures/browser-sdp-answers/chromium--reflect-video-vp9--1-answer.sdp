@@ -3,11 +3,11 @@ o=- <session-id> <session-version> IN IP4 0.0.0.0
 s=-
 t=0 0
 a=msid-semantic:WMS *
-a=ice-options:trickle ice2
+a=ice-options:trickle
 a=ice-pacing:50
 a=extmap-allow-mixed
 a=group:BUNDLE 0
-m=video 9 UDP/TLS/RTP/SAVPF 98 99 96 102 127 125 108 123 118 119 120 121 41 126
+m=video 9 UDP/TLS/RTP/SAVPF 98 99
 c=IN IP4 0.0.0.0
 a=setup:active
 a=mid:0
@@ -24,29 +24,6 @@ a=rtcp-fb:98 nack pli
 a=rtcp-fb:98 transport-cc
 a=rtpmap:99 rtx/90000
 a=fmtp:99 apt=98
-a=rtpmap:96 VP8/90000
-a=rtpmap:102 H264/90000
-a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f
-a=rtpmap:127 H264/90000
-a=fmtp:127 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f
-a=rtpmap:125 H264/90000
-a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
-a=rtpmap:108 H264/90000
-a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
-a=rtpmap:123 H264/90000
-a=fmtp:123 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032
-a=rtpmap:118 H264/90000
-a=fmtp:118 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640028
-a=rtpmap:119 H264/90000
-a=fmtp:119 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640029
-a=rtpmap:120 H264/90000
-a=fmtp:120 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64002a
-a=rtpmap:121 H264/90000
-a=fmtp:121 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640033
-a=rtpmap:41 AV1/90000
-a=fmtp:41 profile=0
-a=rtpmap:126 H265/90000
-a=fmtp:126 level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST
 a=rtcp-xr:rcvr-rtt=all
 a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
 a=extmap:3 urn:3gpp:video-orientation

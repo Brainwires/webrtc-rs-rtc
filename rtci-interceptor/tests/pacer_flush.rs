@@ -12,9 +12,9 @@
 
 use bytes::Bytes;
 use rtci_interceptor::{
-    Attribute, AttributedPacket, Interceptor, NackResponderBuilder, PacerBacklog, PacerBuilder,
-    PacerDiscard, PacerFlush, PacerPause, Packet, RTCPFeedback, RetransmissionsLeft, StreamInfo,
-    TaggedPacket,
+    Attribute, AttributedPacket, Interceptor, LocalKeyFrameRequest, NackResponderBuilder,
+    PacerBacklog, PacerBuilder, PacerDiscard, PacerFlush, PacerPause, Packet, RTCPFeedback,
+    RetransmissionsLeft, StreamInfo, TaggedPacket,
 };
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtcp::transport_feedbacks::transport_layer_nack::{NackPair, TransportLayerNack};
@@ -116,6 +116,8 @@ struct Reads {
     discards: Vec<(u32, Vec<u16>)>,
     /// The streams a key frame was asked of.
     key_frames: Vec<u32>,
+    /// The reason each of those requests carries.
+    key_frame_origins: Vec<(u32, Option<LocalKeyFrameRequest>)>,
     /// The streams of each flush notice.
     flushes: Vec<Vec<u32>>,
     /// Retransmissions dropped: (SSRC, sequence number repaired).
@@ -150,6 +152,10 @@ fn reads(chain: &mut impl Interceptor, into: &mut Reads) {
             for packet in packets {
                 if let Some(pli) = packet.as_any().downcast_ref::<PictureLossIndication>() {
                     into.key_frames.push(pli.media_ssrc);
+                    into.key_frame_origins.push((
+                        pli.media_ssrc,
+                        read.message.custom::<LocalKeyFrameRequest>().copied(),
+                    ));
                 }
             }
         }
@@ -246,6 +252,11 @@ fn a_collapse_of_the_target_flushes_the_queue_and_asks_for_a_key_frame() {
         "the queued video is discarded: {discarded:?}"
     );
     assert_eq!(vec![VIDEO], seen.key_frames, "one key frame asked for");
+    assert_eq!(
+        vec![(VIDEO, Some(LocalKeyFrameRequest::PacerFlush))],
+        seen.key_frame_origins,
+        "the request says it is the pacer's flush"
+    );
     assert!(
         seen.dropped.contains(&(RTX, 501)),
         "the retransmissions waiting are dropped: {:?}",
@@ -466,6 +477,41 @@ fn a_flush_leaves_the_audio_stream_alone() {
     assert!(
         after.flushes.is_empty() && after.key_frames.is_empty() && after.discards.is_empty(),
         "{after:?}"
+    );
+}
+
+/// A video stream with nothing queued at a collapse has its key frame asked for too (its
+/// repairs are given up with the rest), with no `PacerDiscard` before the request: the
+/// request carries `LocalKeyFrameRequest::PacerFlush` like the one of the stream whose media
+/// was discarded, so the application can tell both from a receiver's PLI.
+#[test]
+fn every_request_of_a_flush_says_it_is_the_flushs() {
+    const IDLE: u32 = 0x4321;
+    let epoch = Instant::now();
+    let mut chain = pacer(PacerBacklog::Flush);
+    chain.bind_local_stream(&StreamInfo {
+        ssrc: IDLE,
+        ..stream_info()
+    });
+    backlog_at_the_high_rate(&mut chain, epoch);
+    reads(&mut chain, &mut Reads::default());
+    let fall = epoch + ms(10);
+    chain.handle_read(target(fall, LOW)).unwrap();
+    chain.handle_timeout(fall).unwrap();
+    let mut seen = Reads::default();
+    reads(&mut chain, &mut seen);
+    assert_eq!(1, seen.flushes.len(), "{seen:?}");
+    assert!(
+        seen.discards.iter().all(|(ssrc, _)| *ssrc == VIDEO),
+        "nothing of the idle stream was queued: {seen:?}"
+    );
+    assert_eq!(
+        vec![
+            (VIDEO, Some(LocalKeyFrameRequest::PacerFlush)),
+            (IDLE, Some(LocalKeyFrameRequest::PacerFlush)),
+        ],
+        seen.key_frame_origins,
+        "{seen:?}"
     );
 }
 

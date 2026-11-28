@@ -107,6 +107,10 @@ pub(crate) struct UdpAttempt {
     remote: SocketAddr,
     base: SocketAddr,
     client: turn::client::Client,
+    /// Its Allocate has gone out. Not yet while the engine is deleting an allocation of the
+    /// same 5-tuple (`EngineTurn::five_tuple_in_release`): the request waits for that release
+    /// to end.
+    sent: bool,
 }
 
 /// Who gathers relayed candidates from `turn:` servers over UDP. See
@@ -348,6 +352,9 @@ pub(crate) struct EngineTurn {
     /// until). A link does not allocate from such a base to that server again for two
     /// minutes.
     mismatched: Vec<(SocketAddr, SocketAddr, Instant)>,
+    /// 5-tuples whose release ended: (base, server, the instant a new Allocate may leave from
+    /// it: the end plus `SettingEngine::turn_reallocation_delay`).
+    freed: Vec<(SocketAddr, SocketAddr, Instant)>,
 }
 
 impl EngineTurn {
@@ -371,6 +378,7 @@ impl EngineTurn {
             application_relays: vec![],
             releases: vec![],
             mismatched: vec![],
+            freed: vec![],
         }
     }
 
@@ -398,6 +406,21 @@ impl EngineTurn {
         self.mismatched
             .iter()
             .any(|(b, s, until)| *b == base && *s == server && now < *until)
+    }
+
+    /// Whether an allocation of the 5-tuple (`base`, `server`) is being deleted at `now`: a
+    /// release of it is under way (`UdpRelease`), or ended less than the reallocation delay
+    /// before. Until the server has answered the Refresh of LIFETIME 0 the allocation is the
+    /// 5-tuple's, and an Allocate on it would be refused with 437 (RFC 8656 section 7.2, step
+    /// 2), after which the client leaves the server alone for two minutes (section 7.4).
+    fn five_tuple_in_release(&self, base: SocketAddr, server: SocketAddr, now: Instant) -> bool {
+        self.releases
+            .iter()
+            .any(|r| !r.done && r.base == base && r.server == server)
+            || self
+                .freed
+                .iter()
+                .any(|(b, s, at)| *b == base && *s == server && now < *at)
     }
 
     /// Whether `server` is held back at `now`.
@@ -595,7 +618,9 @@ fn release_udp_allocation(
         return;
     }
     let url = link.url_string();
-    for a in link.udp_attempts.drain(..) {
+    // An Allocate that never left (it waited for a release of its 5-tuple) has nothing to
+    // follow.
+    for a in link.udp_attempts.drain(..).filter(|a| a.sent) {
         releases.push(UdpRelease {
             url: a.url,
             base: a.base,
@@ -941,6 +966,17 @@ impl RTCPeerConnection {
                         self.streams.turn.links[index].url
                     );
                     self.streams.turn.links[index].state = LinkState::Failed;
+                    // W3C webrtc-pc 4.8.3: "If no host candidate can reach the server,
+                    // errorCode will be set to the value 701".
+                    let l = &self.streams.turn.links[index];
+                    let (transport, url) = (l.transport, l.url_string());
+                    self.report_engine_gathering_error(
+                        transport,
+                        None,
+                        url,
+                        crate::peer_connection::event::ICE_SERVER_UNREACHABLE,
+                        "no address of the server answered".to_owned(),
+                    );
                 }
             }
         }
@@ -1209,15 +1245,21 @@ impl RTCPeerConnection {
         let base = link.link_local;
         let code = err.code();
         let (url, carrier, transport) = (link.url_string(), link.carrier, link.transport);
-        if let Some(ErrorCode(437)) = code {
+        if let Some(ErrorCode(c)) = code {
             self.pipeline_context.event_outs.push_back(
                 crate::peer_connection::event::RTCPeerConnectionEvent::OnTurnRequestRejected {
-                    url,
+                    url: url.clone(),
                     relay: None,
                     method: "Allocate",
-                    error_code: 437,
+                    error_code: c,
                 },
             );
+            // W3C webrtc-pc 4.8.3: gathering from the server failed with its error code.
+            let reason = match &err {
+                turn::client::RequestError::Rejected(r) => r.reason.clone(),
+                other => format!("{other:?}"),
+            };
+            self.report_engine_gathering_error(transport, base, url, c, reason);
         }
         // RFC 8656 section 7.4, 437: "The client SHOULD pick another client transport address
         // and retry the Allocate request [...] The client SHOULD try three different client
@@ -1408,6 +1450,7 @@ impl RTCPeerConnection {
         let mut peers_ready = vec![];
         let mut failed_peers = vec![];
         let mut refused = vec![];
+        let mut rejected = vec![];
         for index in 0..self.streams.turn.links.len() {
             let link = &mut self.streams.turn.links[index];
             let id = match link.state {
@@ -1415,6 +1458,7 @@ impl RTCPeerConnection {
                 LinkState::OpenDtls | LinkState::OpenUdp => None,
                 _ => continue,
             };
+            let link_url = link.url_string();
             let Some(client) = link.client.as_mut() else {
                 continue;
             };
@@ -1441,14 +1485,36 @@ impl RTCPeerConnection {
                     }
                     turn::client::Event::AllocationLost(_, err) => {
                         debug!("TURN allocation on {} lost: {err:?}", link.url);
+                        rejected.push((link_url.clone(), link.relay, "Refresh", err.code()));
                         link.state = LinkState::Failed;
                         link.relay = None;
+                    }
+                    turn::client::Event::RefreshError(relay, err) => {
+                        debug!("TURN Refresh on {} refused: {err:?}", link.url);
+                        rejected.push((link_url.clone(), Some(relay), "Refresh", err.code()));
+                    }
+                    turn::client::Event::PermissionLost(relay, _, err) => {
+                        rejected.push((
+                            link_url.clone(),
+                            Some(relay),
+                            "CreatePermission",
+                            err.code(),
+                        ));
+                    }
+                    turn::client::Event::ChannelBindError(relay, _, err) => {
+                        rejected.push((link_url.clone(), Some(relay), "ChannelBind", err.code()));
                     }
                     turn::client::Event::CreatePermissionResponse(_, peer) => {
                         granted.push(peer.ip());
                     }
                     turn::client::Event::CreatePermissionError(_, err) => {
                         debug!("TURN permission refused: {err:?}");
+                        rejected.push((
+                            link_url.clone(),
+                            link.relay,
+                            "CreatePermission",
+                            err.code(),
+                        ));
                     }
                     turn::client::Event::DataIndicationOrChannelData(_, peer, data) => {
                         if let Some(relay) = link.relay {
@@ -1512,6 +1578,20 @@ impl RTCPeerConnection {
         }
         for (index, peer) in failed_peers {
             self.turn_tcp_connect_failed(now, index, peer);
+        }
+        // A request the server finally refused (the client retried a 401 / 438 already):
+        // the application hears of it, a REST credential that expired, say.
+        for (url, relay, method, code) in rejected {
+            if let Some(code) = code {
+                self.pipeline_context.event_outs.push_back(
+                    crate::peer_connection::event::RTCPeerConnectionEvent::OnTurnRequestRejected {
+                        url,
+                        relay,
+                        method,
+                        error_code: code.0,
+                    },
+                );
+            }
         }
         for (index, err) in refused {
             self.turn_allocate_refused(now, index, err);
@@ -1779,6 +1859,24 @@ impl RTCPeerConnection {
         if let Some(t) = self.turn_releases_poll_timeout() {
             next = Some(next.map_or(t, |n| n.min(t)));
         }
+        // The end of a reallocation delay an Allocate waits for.
+        let turn = &self.streams.turn;
+        let waits = |base: SocketAddr, server: SocketAddr| {
+            turn.links.iter().any(|l| {
+                l.udp_attempts
+                    .iter()
+                    .any(|a| !a.sent && a.base == base && a.remote == server)
+            })
+        };
+        if let Some(t) = turn
+            .freed
+            .iter()
+            .filter(|(b, s, _)| waits(*b, *s))
+            .map(|(_, _, at)| *at)
+            .min()
+        {
+            next = Some(next.map_or(t, |n| n.min(t)));
+        }
         next
     }
 
@@ -1787,6 +1885,7 @@ impl RTCPeerConnection {
         // A DTLS link whose base was added before the local description starts now.
         self.start_turn_links();
         self.turn_releases_handle_timeout(now);
+        self.start_waiting_udp_attempts(now);
         if self.streams.turn.links.is_empty() {
             return;
         }
@@ -1834,6 +1933,30 @@ impl RTCPeerConnection {
         self.drive_turn_races(now);
         self.pump_turn(now);
         self.release_retired_turn_links();
+    }
+
+    /// Raises `icecandidateerror` (W3C webrtc-pc 4.8.3) for a server the engine gathers from
+    /// itself: `base`, the local address it used (left out when no candidate exposes it),
+    /// the server's URL, its STUN error code or 701.
+    pub(crate) fn report_engine_gathering_error(
+        &mut self,
+        transport: TransportId,
+        base: Option<SocketAddr>,
+        url: String,
+        error_code: u16,
+        error_text: String,
+    ) {
+        let error = crate::peer_connection::event::RTCPeerConnectionIceErrorEvent {
+            address: base.map(|b| b.ip().to_string()).unwrap_or_default(),
+            port: base.map_or(0, |b| b.port()),
+            url,
+            error_code,
+            error_text,
+            ice_transport: Some(self.ice_transport_of(transport).id),
+        };
+        if let Err(err) = self.report_ice_candidate_error(error) {
+            debug!("icecandidateerror not raised: {err}");
+        }
     }
 
     /// Whether the relayed candidate of `link` is the local end of the path the agent of its
@@ -1974,7 +2097,14 @@ impl RTCPeerConnection {
                     "{}: its 5-tuple ({base} to {server}) is needed by a new allocation: released first",
                     l.url
                 );
+                let url = l.url_string();
                 self.release_turn_link_in_place(i);
+                self.pipeline_context.event_outs.push_back(
+                    crate::peer_connection::event::RTCPeerConnectionEvent::OnTurnAllocationReplacedInPlace {
+                        url,
+                        local_address: base,
+                    },
+                );
             }
         }
         Some(base)
@@ -2368,6 +2498,9 @@ impl RTCPeerConnection {
                 r.done = true;
             }
         }
+        let delay = self.setting_engine.turn_reallocation_delay;
+        self.streams.turn.freed.retain(|(_, _, at)| now < *at);
+        let mut ended = false;
         let mut i = 0;
         while i < self.streams.turn.releases.len() {
             if !self.streams.turn.releases[i].done {
@@ -2376,6 +2509,13 @@ impl RTCPeerConnection {
             }
             let r = self.streams.turn.releases.remove(i);
             debug!("{}: released from {}", r.url, r.base);
+            ended = true;
+            if !delay.is_zero() {
+                self.streams
+                    .turn
+                    .freed
+                    .push((r.base, r.server, now + delay));
+            }
             self.pipeline_context.event_outs.push_back(
                 crate::peer_connection::event::RTCPeerConnectionEvent::OnTurnAllocationReleased {
                     url: r.url,
@@ -2383,6 +2523,10 @@ impl RTCPeerConnection {
                     relayed_address: r.relay,
                 },
             );
+        }
+        // An Allocate that waited for one of these 5-tuples leaves now.
+        if ended {
+            self.start_waiting_udp_attempts(now);
         }
     }
 
@@ -2480,8 +2624,13 @@ impl RTCPeerConnection {
             software: self.setting_engine.turn_software(),
             ..Default::default()
         };
+        // The 5-tuple's previous allocation is still being deleted: the Allocate waits for
+        // the release to end (`start_waiting_udp_attempts`).
+        let sent = !self.streams.turn.five_tuple_in_release(base, addr, now);
         let mut client = match turn::client::Client::new(config, provider).and_then(|mut c| {
-            c.allocate(now)?;
+            if sent {
+                c.allocate(now)?;
+            }
             Ok(c)
         }) {
             Ok(client) => client,
@@ -2490,6 +2639,11 @@ impl RTCPeerConnection {
                 return false;
             }
         };
+        if !sent {
+            debug!(
+                "TURN over UDP to {addr}: the allocation from {base} is being deleted; the Allocate waits"
+            );
+        }
         while let Some(t) = client.poll_write() {
             self.pipeline_context.write_outs.push_back(TaggedBytesMut {
                 now,
@@ -2504,8 +2658,59 @@ impl RTCPeerConnection {
                 remote: addr,
                 base,
                 client,
+                sent,
             });
         true
+    }
+
+    /// Sends the Allocates that waited for a release of their 5-tuple, once it has ended (and
+    /// the reallocation delay after it is over). One that cannot be sent fails its address.
+    pub(crate) fn start_waiting_udp_attempts(&mut self, now: Instant) {
+        if self.is_closed() {
+            return;
+        }
+        let mut failed = false;
+        for index in 0..self.streams.turn.links.len() {
+            let mut i = 0;
+            while i < self.streams.turn.links[index].udp_attempts.len() {
+                let a = &self.streams.turn.links[index].udp_attempts[i];
+                if a.sent
+                    || self
+                        .streams
+                        .turn
+                        .five_tuple_in_release(a.base, a.remote, now)
+                {
+                    i += 1;
+                    continue;
+                }
+                let a = &mut self.streams.turn.links[index].udp_attempts[i];
+                if let Err(err) = a.client.allocate(now) {
+                    debug!("TURN client for {}: {err}", a.remote);
+                    self.streams.turn.links[index].udp_attempts.remove(i);
+                    if let Some(race) = self.streams.turn.links[index].race.as_mut() {
+                        race.failed();
+                    }
+                    failed = true;
+                    continue;
+                }
+                a.sent = true;
+                debug!(
+                    "TURN over UDP to {}: the 5-tuple is free; Allocate sent",
+                    a.remote
+                );
+                while let Some(t) = a.client.poll_write() {
+                    self.pipeline_context.write_outs.push_back(TaggedBytesMut {
+                        now,
+                        transport: udp_context(a.base, a.remote),
+                        message: t.message,
+                    });
+                }
+                i += 1;
+            }
+        }
+        if failed {
+            self.drive_turn_races(now);
+        }
     }
 
     /// The racing Allocates over UDP: their retransmissions leave, and one that timed out (or
@@ -2641,10 +2846,11 @@ impl RTCPeerConnection {
             return;
         }
         let winner = link.udp_attempts.remove(position);
-        self.streams
-            .turn
-            .udp_losers
-            .extend(std::mem::take(&mut link.udp_attempts));
+        self.streams.turn.udp_losers.extend(
+            std::mem::take(&mut link.udp_attempts)
+                .into_iter()
+                .filter(|a| a.sent),
+        );
         if let Some(race) = link.race.as_mut() {
             race.succeeded();
         }

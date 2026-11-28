@@ -129,6 +129,16 @@ impl MulticastSocket {
     /// If not set, the socket joins the multicast group on all interfaces
     /// (`INADDR_ANY`).
     ///
+    /// With an interface the socket also sends by it (`IP_MULTICAST_IF`, RFC 6762 section 14).
+    /// Without one, on Linux, macOS and other systems, it sends by the system's route for
+    /// 224.0.0.251. On Windows that route comes from the destination cache, and a process that
+    /// sent to the group from 127.0.0.1 leaves it on loopback after it exits, so on Windows a
+    /// socket built without an interface (and without a local address of its own,
+    /// [`with_multicast_local_ipv4`](Self::with_multicast_local_ipv4)) joins and sends on the
+    /// interface of the default route instead (see [`into_std`](Self::into_std)). On a Windows host with
+    /// several interfaces whose mDNS link is not the default route's, pass the interface of
+    /// the address the application publishes.
+    ///
     /// # Arguments
     ///
     /// * `interface` - The IPv4 address of the network interface to use.
@@ -153,8 +163,22 @@ impl MulticastSocket {
     /// - `SO_REUSEADDR` enabled (allows multiple processes to bind)
     /// - `SO_REUSEPORT` enabled on Unix platforms (except Solaris/illumos)
     /// - Non-blocking mode enabled (for async compatibility)
-    /// - Joined to the mDNS multicast group (224.0.0.251)
+    /// - Joined to the mDNS multicast group (224.0.0.251), on [`with_interface`]'s interface when
+    ///   one is given, and sending by that interface (`IP_MULTICAST_IF`), whatever the system's
+    ///   route for the group says
+    /// - Without an interface: on Windows, unless [`with_multicast_local_ipv4`] names a local
+    ///   address, joined and sending on the interface of the default route (the address a UDP
+    ///   socket connected to 192.0.2.1, a documentation address, takes; nothing is sent there),
+    ///   as if [`with_interface`] had named it: the system's route for the group, which both a
+    ///   join on `INADDR_ANY` and a send without `IP_MULTICAST_IF` follow there, is left on
+    ///   loopback for the whole host by any process that sent to the group from 127.0.0.1.
+    ///   Where the default route's address is unspecified or loopback, or there is none, and on
+    ///   other systems: joined on the default interface (`INADDR_ANY`), sending by the system's
+    ///   route for the group
     /// - IP TTL 255 on what it sends (RFC 6762 section 11)
+    ///
+    /// [`with_interface`]: Self::with_interface
+    /// [`with_multicast_local_ipv4`]: Self::with_multicast_local_ipv4
     ///
     /// # Errors
     ///
@@ -218,11 +242,65 @@ impl MulticastSocket {
         // Bind to the specified address
         socket.bind(&multicast_local_addr.into())?;
 
-        // Join the mDNS multicast group
-        let iface = self.interface.unwrap_or(Ipv4Addr::UNSPECIFIED);
-        socket.join_multicast_v4(&MDNS_MULTICAST_IPV4, &iface)?;
+        // RFC 6762 section 14: the socket joins the group on the interface it sends by, and what
+        // it sends leaves by that interface (`IP_MULTICAST_IF`), not by the system's route for
+        // the group. On Windows that route comes from the destination cache, which a process
+        // that sent to the group from loopback leaves on loopback after it has exited (source
+        // 127.0.0.1, `netsh interface ipv4 show destinationcache`): a socket without
+        // `IP_MULTICAST_IF` then sends by loopback with source 127.0.0.1, and a join on
+        // `INADDR_ANY` lands on loopback too (agent-test run 46123619860: a socket joined on
+        // `INADDR_ANY` and sending by the network interface no longer heard its own datagrams).
+        // So without an interface, on Windows, the socket joins and sends on the default route's
+        // interface (`multicast_if`). Elsewhere it keeps `INADDR_ANY` and the system's route
+        // (GitHub's macOS image routes the group to lo0 on purpose).
+        let bound_unspecified = self
+            .multicast_local_ipv4
+            .is_none_or(|ip| ip.is_unspecified());
+        let iface = multicast_if(
+            self.interface,
+            cfg!(windows) && bound_unspecified,
+            default_route_v4,
+        );
+        socket.join_multicast_v4(
+            &MDNS_MULTICAST_IPV4,
+            &iface.unwrap_or(Ipv4Addr::UNSPECIFIED),
+        )?;
+        if let Some(iface) = iface {
+            socket.set_multicast_if_v4(&iface)?;
+        }
 
         Ok(socket.into())
+    }
+}
+
+/// The interface a socket joins the group on and its multicast leaves by (`IP_MULTICAST_IF`), or
+/// `None` for `INADDR_ANY` and the system's route for the group: the interface given; without one, where `default_route_instead` (on
+/// Windows, a socket bound to the unspecified address), the default route's
+/// ([`default_route_v4`]) unless that is unspecified or loopback.
+fn multicast_if(
+    interface: Option<Ipv4Addr>,
+    default_route_instead: bool,
+    default_route: impl FnOnce() -> Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    match interface {
+        Some(interface) if !interface.is_unspecified() => Some(interface),
+        _ if default_route_instead => {
+            default_route().filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+        }
+        _ => None,
+    }
+}
+
+/// The address of the host's default-route IPv4 interface: the local address a UDP socket
+/// connected to 192.0.2.1:9 (TEST-NET-1, RFC 5737) takes. Connecting a UDP socket sends nothing.
+/// `None` without an IPv4 default route. Not the route for 224.0.0.251, which is what a stale
+/// destination-cache entry moves on Windows.
+fn default_route_v4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
     }
 }
 
@@ -266,6 +344,45 @@ mod tests {
         set_mdns_ttl(&socket).unwrap();
         assert_eq!(socket.multicast_ttl_v4().unwrap(), 255);
         assert_eq!(socket.ttl_v4().unwrap(), 255);
+    }
+
+    const NIC: Ipv4Addr = Ipv4Addr::new(10, 1, 0, 49);
+
+    // RFC 6762 section 14: an interface given is the one sent by, on every platform; the default
+    // route is not even asked.
+    #[test]
+    fn an_interface_given_is_the_one_multicast_leaves_by() {
+        let given = Ipv4Addr::new(192, 168, 1, 100);
+        for default_route_instead in [false, true] {
+            assert_eq!(
+                multicast_if(Some(given), default_route_instead, || panic!("not asked")),
+                Some(given)
+            );
+        }
+    }
+
+    // On Windows (`default_route_instead`) a socket without an interface sends by the default
+    // route's interface, not by the group's route that a stale destination-cache entry leaves on
+    // loopback; elsewhere it follows the system's route (`None`).
+    #[test]
+    fn without_an_interface_windows_sends_by_the_default_route_and_others_by_the_group_route() {
+        assert_eq!(multicast_if(None, true, || Some(NIC)), Some(NIC));
+        assert_eq!(
+            multicast_if(Some(Ipv4Addr::UNSPECIFIED), true, || Some(NIC)),
+            Some(NIC)
+        );
+        assert_eq!(multicast_if(None, false, || panic!("not asked")), None);
+    }
+
+    // A default route that is loopback or unspecified, or none, leaves the system's route.
+    #[test]
+    fn a_default_route_on_loopback_or_none_leaves_the_system_route() {
+        assert_eq!(multicast_if(None, true, || Some(Ipv4Addr::LOCALHOST)), None);
+        assert_eq!(
+            multicast_if(None, true, || Some(Ipv4Addr::UNSPECIFIED)),
+            None
+        );
+        assert_eq!(multicast_if(None, true, || None), None);
     }
 
     // Note: Socket creation tests would require actual network access

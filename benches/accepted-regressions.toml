@@ -17,3 +17,15 @@
 # An entry expires when the branch is merged: from then on the base already has the cost, the
 # entry matches nothing, and the job lists it as stale. Remove it in the next branch that touches
 # this file (scripts/check-performance-ledger.py keeps every entry pointing at a ledger row).
+
+[[accepted]]
+bench = "SRTP/Setup/AES-128-CM-HMAC-SHA1-80/*"
+max_ratio = 2.7
+ledger = "zeroize-3"
+note = "crypto::scrub_stack() after building an SRTP cipher and before each of its three AES-CM cipher objects; x2.33-2.40 per round (run 45886861450)"
+
+[[accepted]]
+bench = "SRTP/Setup/AEAD-AES-128-GCM/*"
+max_ratio = 1.9
+ledger = "zeroize-3"
+note = "crypto::scrub_stack() after building an SRTP cipher and before its header-extension AES-CM cipher object; x1.63-1.70 per round (run 45886861450)"

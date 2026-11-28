@@ -3326,6 +3326,9 @@ impl Association {
                 c.retransmit = false;
                 c.nsent += 1;
                 self.stats.inc_retransmissions();
+                if !matches!(c.reliability, MessageReliability::Reliable) {
+                    self.stats.inc_partially_reliable_retransmissions();
+                }
                 chunks.push(c.clone());
             }
         }
@@ -5487,6 +5490,9 @@ impl Association {
                     c.nsent += 1;
                     chunk.nsent = c.nsent;
                     self.stats.inc_retransmissions();
+                    if !matches!(c.reliability, MessageReliability::Reliable) {
+                        self.stats.inc_partially_reliable_retransmissions();
+                    }
                     // RFC 9260 6.2.1 B, for a Fast Retransmit too.
                     self.rwnd = self
                         .rwnd
@@ -5747,6 +5753,9 @@ impl Association {
                 c.nsent += 1;
                 chunk.nsent = c.nsent;
                 self.stats.inc_retransmissions();
+                if !matches!(c.reliability, MessageReliability::Reliable) {
+                    self.stats.inc_partially_reliable_retransmissions();
+                }
                 if self.t3_retransmitted.len() == MAX_T3_RETRANSMITTED_KEPT {
                     self.t3_retransmitted.pop_front();
                 }

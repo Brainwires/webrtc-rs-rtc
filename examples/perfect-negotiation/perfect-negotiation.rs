@@ -260,6 +260,11 @@ impl PerfectNegotiationHandler {
 
         let local_candidate_init = RTCIceCandidate::from(&candidate).to_json()?;
         self.pc.add_local_candidate(local_candidate_init)?;
+        // This side's gathering is done: its end-of-candidates event is relayed to the other peer like the candidates. W3C webrtc-pc 5.6.4: the peer's transport is
+        // "failed" only once it has the end of the candidates, "disconnected" until then.
+        self.pc.add_local_candidate(
+            rtci::peer_connection::transport::RTCIceCandidateInit::default(),
+        )?;
         info!(
             "[{}] Added local ICE candidate 127.0.0.1:{}",
             if self.polite { "POLITE" } else { "IMPOLITE" },

@@ -418,6 +418,9 @@ async fn main() -> Result<()> {
 
                             // Add local candidate BEFORE create_answer
                             pc.add_local_candidate(local_candidate_init.clone())?;
+                            // This side's gathering is done: its end-of-candidates goes with the description (a=end-of-candidates). W3C webrtc-pc 5.6.4: the peer's transport is
+                            // "failed" only once it has the end of the candidates, "disconnected" until then.
+                            pc.add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
 
                             // Create and set answer
                             let answer = pc.create_answer(None)?;

@@ -396,6 +396,9 @@ async fn run_main_loop() -> Result<()> {
 
                                         // Add to peer connection after SDP exchange
                                         pc.add_local_candidate(local_candidate_init.clone())?;
+                                        // This side's gathering is done: the server-reflexive candidate is its only one. W3C webrtc-pc 5.6.4: the peer's transport is
+                                        // "failed" only once it has the end of the candidates, "disconnected" until then.
+                                        pc.add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
                                         println!("Added local ServerReflexive ICE candidate: {}", local_candidate_init.candidate);
 
                                         // Send answer to browser
@@ -516,8 +519,10 @@ fn parse_ws_message(text: &str) -> Option<WsMessage> {
     }
 
     // Try to parse as ICE candidate
+    // An empty `candidate` is the page's end-of-candidates (RFC 9429 section 4.1.19): it is
+    // handed on like a candidate.
     if let Ok(candidate) = serde_json::from_str::<RTCIceCandidateInit>(text)
-        && !candidate.candidate.is_empty()
+        && (!candidate.candidate.is_empty() || text.contains("\"candidate\""))
     {
         return Some(WsMessage::IceCandidate(candidate));
     }

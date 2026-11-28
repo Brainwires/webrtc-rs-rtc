@@ -309,8 +309,26 @@ async fn run_main_loop(cli: Cli) -> Result<()> {
     let mut ws_stream: Option<WebSocketStream<TcpStream>> = None;
     let mut buf = vec![0; 2000];
     let mut host_candidate_added = false;
+    // The TURN allocation failed: no relay candidate is to come.
+    let mut turn_failed = false;
+    // This side's end-of-candidates was given (W3C webrtc-pc 5.6.4: "failed" needs the
+    // transport to have "finished gathering").
+    let mut gathering_ended = false;
 
     loop {
+        // Gathering is over once each enabled kind has its candidate or cannot have one.
+        if !gathering_ended && let Some(pc) = peer_connection.as_mut() {
+            let host_done = !cli.enable_host || host_candidate_added;
+            let srflx_done = !cli.enable_srflx || srflx_candidate_added || stun_client.is_none();
+            let relay_done = turn_client.is_none() || relay_candidate_added || turn_failed;
+            if host_done && srflx_done && relay_done {
+                pc.add_local_candidate(
+                    rtci::peer_connection::transport::RTCIceCandidateInit::default(),
+                )?;
+                gathering_ended = true;
+                println!("Local gathering complete: end-of-candidates");
+            }
+        }
         // Process STUN client if active
         if let Some(ref mut client) = stun_client {
             while let Some(transmit) = client.poll_write() {
@@ -393,6 +411,7 @@ async fn run_main_loop(cli: Cli) -> Result<()> {
                 match event {
                     TurnEvent::TransactionTimeout(_) => {
                         error!("TURN transaction timeout");
+                        turn_failed |= !relay_candidate_added;
                     }
                     TurnEvent::AllocateResponse(tid, addr) if Some(tid) == allocate_tid => {
                         println!("TURN allocation successful, relay address: {}", addr);
@@ -413,6 +432,7 @@ async fn run_main_loop(cli: Cli) -> Result<()> {
                     }
                     TurnEvent::AllocateError(_, err) => {
                         error!("TURN allocation error: {}", err);
+                        turn_failed = true;
                     }
                     TurnEvent::CreatePermissionResponse(tid, peer_addr)
                         if pending_permissions.remove(&tid).is_some() =>
@@ -1112,8 +1132,10 @@ fn parse_ws_message(text: &str) -> Option<WsMessage> {
     }
 
     // Try to parse as ICE candidate
+    // An empty `candidate` is the page's end-of-candidates (RFC 9429 section 4.1.19): it is
+    // handed on like a candidate.
     if let Ok(candidate) = serde_json::from_str::<RTCIceCandidateInit>(text)
-        && !candidate.candidate.is_empty()
+        && (!candidate.candidate.is_empty() || text.contains("\"candidate\""))
     {
         return Some(WsMessage::IceCandidate(candidate));
     }

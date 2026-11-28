@@ -21,8 +21,10 @@ mod depacketizer;
 mod leb128;
 mod obu;
 mod packetizer;
+mod temporal_unit;
 
 pub use depacketizer::Av1Depacketizer;
+pub use temporal_unit::{Av1LayerData, repeat_sequence_header_per_layer, split_temporal_unit};
 
 #[derive(Default, Clone, Debug)]
 /// Packetizes AV1 temporal units into RTP payloads.

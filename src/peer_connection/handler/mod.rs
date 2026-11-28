@@ -1,4 +1,5 @@
 pub(crate) mod datachannel;
+pub(crate) mod declared_cname;
 pub(crate) mod demuxer;
 pub(crate) mod dtls;
 pub(crate) mod endpoint;

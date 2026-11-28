@@ -139,7 +139,7 @@ impl RTCPeerConnection {
             );
             // RFC 8853 section 5.3.1: "an offerer ... listing recv streams" is ready to
             // receive any of them.
-            let rids: Vec<String> = get_rids(media)
+            let rids: Vec<String> = get_rids(media, self.setting_engine.rid_id_grammar())
                 .into_iter()
                 .filter(|rid| rid.direction == SimulcastDirection::Recv && rid.simulcast)
                 .map(|rid| rid.id)

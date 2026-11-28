@@ -371,7 +371,7 @@ pub use jitterbuffer::receiver::{
     DEFAULT_CAPACITY as JITTER_BUFFER_DEFAULT_CAPACITY,
     DEFAULT_DEPTH as JITTER_BUFFER_DEFAULT_DEPTH, JitterBufferBuilder, JitterBufferInterceptor,
 };
-pub use keyframe::{FirCommands, KeyFrameRequestInterceptor};
+pub use keyframe::{FirCommands, KeyFrameRequestInterceptor, LocalKeyFrameRequest};
 pub use nack::NackControl;
 pub use nack::generator::{
     NackGeneratorBuilder, NackGeneratorInterceptor,
@@ -397,7 +397,7 @@ pub use pacing::sender::{
     DEFAULT_QUEUE_LIMIT as PACER_DEFAULT_QUEUE_LIMIT,
     DEFAULT_QUEUE_TIME_LIMIT as PACER_DEFAULT_QUEUE_TIME_LIMIT, PacerBuilder, PacerDiscard,
     PacerFlush, PacerInterceptor, PacerPause, QueueOverflow as PacerQueueOverflow,
-    RetransmissionsLeft,
+    RetransmissionsLeft, StreamsNotSending,
 };
 pub use packet::{Attribute, AttributedPacket, Packet, TaggedPacket};
 pub use pass_through::PassThroughInterceptor;

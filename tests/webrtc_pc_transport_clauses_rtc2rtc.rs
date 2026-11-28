@@ -15,7 +15,9 @@ use rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtci::peer_connection::event::RTCPeerConnectionEvent;
 use rtci::peer_connection::rtc_error::RTCErrorDetailType;
 use rtci::peer_connection::state::RTCPeerConnectionState;
-use rtci::peer_connection::transport::{RTCDtlsRole, RTCIceRole, RTCIceTransportState};
+use rtci::peer_connection::transport::{
+    RTCDtlsRole, RTCIceCandidateInit, RTCIceRole, RTCIceTransportState,
+};
 use std::time::{Instant, SystemTime};
 
 fn engine(role: RTCDtlsRole) -> SettingEngineBuilder {
@@ -130,10 +132,19 @@ fn a_role_conflict_leaves_the_ice_role_the_conflict_decided() -> Result<()> {
 }
 
 /// W3C 5.6.4: an ICE restart takes a "failed" (or "disconnected") transport back to
-/// "checking", and then connects again.
+/// "checking", and then connects again. The offerer ends its gathering and is told the
+/// answerer's end-of-candidates, so that losing consent fails its transport ("failed" needs
+/// them; without them it would stay "disconnected").
 #[test]
 fn an_ice_restart_takes_a_failed_transport_back_to_checking() -> Result<()> {
     let (mut pair, _) = Pair::connected(RTCDtlsRole::Client, "data")?;
+    pair.offerer
+        .pc
+        .add_local_candidate(RTCIceCandidateInit::default())?;
+    pair.offerer.pc.add_remote_candidate(RTCIceCandidateInit {
+        sdp_mline_index: Some(0),
+        ..Default::default()
+    })?;
     pair.offerer.drop_outgoing = true;
     pair.answerer.drop_outgoing = true;
     assert!(

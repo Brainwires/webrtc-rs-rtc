@@ -139,7 +139,11 @@ async fn run(
     let socket = UdpSocket::bind(format!("{host}:{port}")).await?;
     let local_addr = socket.local_addr()?;
 
+    // The browser page pastes its description and never signals the end of its candidates
+    // (Chromium writes no a=end-of-candidates): without it a lost path would stay "disconnected"
+    // (W3C webrtc-pc 5.6.4). The PAC timer stands in for it (RFC 8863 section 5).
     let setting_engine = SettingEngineBuilder::new()
+        .with_ice_failed_without_end_of_candidates(true)
         .with_answering_dtls_role(if is_client {
             RTCDtlsRole::Client
         } else {
@@ -228,6 +232,10 @@ async fn run(
     .new_candidate_host()?;
     let local_candidate_init = RTCIceCandidate::from(&candidate).to_json()?;
     peer_connection.add_local_candidate(local_candidate_init)?;
+    // This side's gathering is done: its end-of-candidates (W3C webrtc-pc 5.6.4: "failed" and
+    // "completed" need it; the answer then carries a=end-of-candidates).
+    peer_connection
+        .add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
 
     // Create an answer
     let answer = peer_connection.create_answer(None)?;

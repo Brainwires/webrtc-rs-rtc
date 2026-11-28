@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/bench-compare.py: the bencher parser, ratios and spread, the verdict's
-threshold and floor, new and gone benchmarks, and the accepted-regression allowlist.
+threshold and floor, the separation rule and its suspects, new and gone benchmarks, and the
+accepted-regression allowlist.
 
     python3 scripts/test_bench_compare.py
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -193,6 +196,56 @@ class Messages(unittest.TestCase):
         self.assertIn("an allowlist entry", failures[0])
 
 
+class Separation(unittest.TestCase):
+    """The second rule (row bench-2): every head round beyond every base round, over enough rounds."""
+
+    def rounds(self, values):
+        return [{"P": float(v)} for v in values]
+
+    def test_train_36_pacer_two_rounds_is_a_suspect_not_a_verdict(self):
+        # Train 36 round 11 (run 46081695614): x1.077, rounds 1.072 / 1.081, under the threshold.
+        results = bc.compare(self.rounds([111, 111]), self.rounds([119, 120]))
+        self.assertEqual("same", results[0].verdict)
+        self.assertEqual("slower", results[0].separated)
+        self.assertEqual(["P"], bc.suspects(results))
+
+    def test_separated_over_enough_rounds_is_slower(self):
+        r = bc.compare(self.rounds([111, 111, 112, 111, 110, 111]), self.rounds([119, 120, 119, 121, 120, 119]))[0]
+        self.assertEqual(("slower", "separation"), (r.verdict, r.by))
+        self.assertEqual([], bc.suspects([r]))
+
+    def test_overlapping_rounds_are_the_same(self):
+        r = bc.compare(self.rounds([100, 110, 100, 108]), self.rounds([109, 105, 112, 107]))[0]
+        self.assertEqual("same", r.verdict)
+        self.assertIsNone(r.separated)
+
+    def test_a_gap_under_the_margin_is_the_same(self):
+        # Separated but by 4 %: the rule wants more than 5 %.
+        r = bc.compare(self.rounds([100] * 4), self.rounds([104] * 4))[0]
+        self.assertEqual("same", r.verdict)
+
+    def test_a_gap_under_the_resolution_floor_is_the_same(self):
+        # 10 -> 12 ns is 20 %, but 2 ns is two steps of criterion's integer figures.
+        r = bc.compare(self.rounds([10] * 4), self.rounds([12] * 4))[0]
+        self.assertEqual("same", r.verdict)
+        self.assertIsNone(r.separated)
+
+    def test_faster_symmetrically(self):
+        r = bc.compare(self.rounds([120, 119, 121, 120]), self.rounds([110, 111, 110, 111]))[0]
+        self.assertEqual(("faster", "separation"), (r.verdict, r.by))
+
+    def test_the_threshold_rule_still_decides_first(self):
+        r = bc.compare(self.rounds([1000] * 4), self.rounds([2000] * 4))[0]
+        self.assertEqual(("slower", "threshold"), (r.verdict, r.by))
+
+    def test_a_separated_slower_bench_fails_the_job_and_an_entry_accepts_it(self):
+        results = bc.compare(self.rounds([111] * 4), self.rounds([120] * 4))
+        self.assertTrue(results[0].fails)
+        entry = bc.Allowed("P", 1.2, "zeroize-1")
+        results = bc.compare(self.rounds([111] * 4), self.rounds([120] * 4), allowlist=[entry])
+        self.assertFalse(results[0].fails)
+
+
 class Main(unittest.TestCase):
     def write(self, directory, name, text):
         path = Path(directory) / name
@@ -217,6 +270,16 @@ class Main(unittest.TestCase):
     def test_an_entry_without_a_ledger_row_is_refused(self):
         orphan = '[[accepted]]\nbench = "X/y"\nmax_ratio = 3.0\nledger = "no-such-row"\n'
         self.assertEqual(2, self.run_main([1000, 1000], [2000, 2100], orphan))
+
+    def test_suspects_lists_the_benches_to_measure_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = [self.write(d, f"b{i}", f"test X/y ... bench: {n} ns/iter (+/- 1)\n") for i, n in enumerate([111, 111])]
+            head = [self.write(d, f"h{i}", f"test X/y ... bench: {n} ns/iter (+/- 1)\n") for i, n in enumerate([119, 120])]
+            args = ["--base", *map(str, base), "--head", *map(str, head), "--allowlist", str(Path(d) / "none.toml"), "--suspects"]
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(0, bc.main(args))
+            self.assertEqual("X/y\n", out.getvalue())
 
     def test_no_head_lines_is_bad_input(self):
         with tempfile.TemporaryDirectory() as d:

@@ -26,8 +26,8 @@ use crate::peer_connection::sdp::{
     unknown_media_name,
 };
 use crate::peer_connection::sdp::{
-    described_ssrcs, is_lite_set, ls_groups, media_packet_time, media_rtcp_xr, remote_candidates,
-    share_bundle_destination,
+    answer_ice_options, described_ssrcs, is_lite_set, ls_groups, media_packet_time, media_rtcp_xr,
+    remote_candidates, share_bundle_destination,
 };
 use crate::peer_connection::state::signaling_state::check_next_signaling_state;
 use crate::peer_connection::transport::ice::candidate::RTCIceServerTransportProtocol;
@@ -120,6 +120,12 @@ pub(super) struct DescriptionSnapshot {
     last_stable_state: Option<LastStableState>,
     pending_remote_transport: Option<PendingRemoteTransport>,
     events: usize,
+    /// The remote description's declared CNAMEs and the declarations found contradicted
+    /// (`InterceptorHandlerContext::declared_cnames`, `contradicted_declarations`).
+    declared_cnames: (
+        std::collections::HashMap<SSRC, String>,
+        std::collections::HashMap<SSRC, String>,
+    ),
 }
 
 /// The ICE agent configuration the connection's settings make, for each of its transports.
@@ -328,8 +334,11 @@ impl RTCPeerConnection {
         let sctp_transport_id = RTCTransportId::new(transport_id_nonce, TransportKind::Sctp);
 
         // Create the ICE transport
-        let ice_transport =
+        let mut ice_transport =
             IceTransport::new(now, agent_config, crypto_provider.clone(), ice_transport_id)?;
+        ice_transport.agent.set_failed_without_end_of_candidates(
+            setting_engine.ice_failed_without_end_of_candidates,
+        );
 
         // Create the DTLS transport
         // The configuration keeps its certificates: `get_configuration` reports them and
@@ -414,6 +423,7 @@ impl RTCPeerConnection {
             datachannel_handler_context: DataChannelHandlerContext::new(now),
             interceptor_handler_context: InterceptorHandlerContext::default()
                 .with_source_departure_ending_tracks(setting_engine.source_departure_ends_track)
+                .with_rtp_timeout_muting(setting_engine.rtp_timeout_mutes_track)
                 .with_wall_clock(setting_engine.wall_clock),
             endpoint_handler_context: EndpointHandlerContext::default(),
             media_read_outs: VecDeque::new(),
@@ -903,6 +913,7 @@ impl RTCPeerConnection {
                 .setting_engine
                 .bundle_attributes_tagged_only,
             bundle_only_browser_form: self.setting_engine.bundle_only_sections_in_browser_form,
+            answer_offered_formats_only: false,
             sctp_max_message_size: self.setting_engine.sctp_max_message_size.as_usize(),
             sctp_port: self.sctp_transport().offer_port(),
             sctp_over_tcp: self.offers_sctp_over_tcp(&candidates),
@@ -917,6 +928,7 @@ impl RTCPeerConnection {
                 .write_ssrc_attributes_for_simulcast,
             ice_pacing: self.stated_ice_pacing(),
             ice_options_in_media_sections: self.setting_engine.ice_options_in_media_sections,
+            ice_options: vec!["trickle", "ice2"],
             ls_groups: vec![],
             selected_destination,
             remote_candidates,
@@ -1242,7 +1254,7 @@ impl RTCPeerConnection {
                             } else {
                                 superseded_clear_extensions(media)?
                             },
-                            rid_map: get_rids(media),
+                            rid_map: get_rids(media, self.setting_engine.rid_id_grammar()),
                             answer_direction,
                             offered_protos: offered_protos(media),
                             offered_rtcp_rsize: Some(if include_unmatched {
@@ -1422,6 +1434,7 @@ impl RTCPeerConnection {
                 .bundle_attributes_tagged_only,
             // Only an initial offer has bundle-only sections (RFC 9429 section 5.2.2).
             bundle_only_browser_form: false,
+            answer_offered_formats_only: self.setting_engine.answer_offered_formats_only,
             rtcp_mux_only: self.configuration.rtcp_mux_policy != RTCRtcpMuxPolicy::Negotiate,
             rtcp_mux_only_renegotiated: self.setting_engine.rtcp_mux_only_in_subsequent_offers,
             offered_tag_rtcp_mux_only: !include_unmatched
@@ -1443,6 +1456,17 @@ impl RTCPeerConnection {
                 .write_ssrc_attributes_for_simulcast,
             ice_pacing: self.stated_ice_pacing(),
             ice_options_in_media_sections: self.setting_engine.ice_options_in_media_sections,
+            ice_options: if include_unmatched {
+                vec!["trickle", "ice2"]
+            } else {
+                answer_ice_options(
+                    self.setting_engine.answer_ice_options,
+                    &remote_parsed
+                        .as_ref()
+                        .map(remote_ice_options)
+                        .unwrap_or_default(),
+                )
+            },
             ls_groups: if include_unmatched {
                 [
                     &self.current_local_description,
@@ -1641,6 +1665,15 @@ impl RTCPeerConnection {
             });
         }
 
+        // RFC 3264 section 8.3.2: every payload type number the description gives a format keeps
+        // meaning it for the rest of the session (`MediaEngine::payload_type_history`). A
+        // rolled-back remote offer's go with the media engine the rollback restores.
+        if sd.sdp_type != RTCSdpType::Rollback
+            && let Some(parsed) = sd.parsed.as_ref()
+        {
+            self.media_engine.record_payload_types(parsed);
+        }
+
         match (op, sd.sdp_type) {
             (StateChangeOp::SetLocal, RTCSdpType::Offer | RTCSdpType::Pranswer) => {
                 self.pending_local_description = Some(sd.clone());
@@ -1826,6 +1859,13 @@ impl RTCPeerConnection {
             last_stable_state: self.last_stable_state.clone(),
             pending_remote_transport: self.pending_remote_transport.clone(),
             events: self.pipeline_context.event_outs.len(),
+            declared_cnames: {
+                let ctx = &self.pipeline_context.interceptor_handler_context;
+                (
+                    ctx.declared_cnames.clone(),
+                    ctx.contradicted_declarations.clone(),
+                )
+            },
         }
     }
 
@@ -1863,6 +1903,8 @@ impl RTCPeerConnection {
         }
         self.pending_remote_transport = snapshot.pending_remote_transport;
         self.pipeline_context.event_outs.truncate(snapshot.events);
+        let ctx = &mut self.pipeline_context.interceptor_handler_context;
+        (ctx.declared_cnames, ctx.contradicted_declarations) = snapshot.declared_cnames;
         self.pipeline_context
             .interceptor_handler_context
             .ssrc_owners
@@ -2217,7 +2259,9 @@ impl RTCPeerConnection {
     /// is discarded, so its stream goes.
     /// W3C webrtc-pc "set the RTCSessionDescription", a remote offer that asks to receive
     /// simulcast (`a=simulcast:recv`, the first alternative of each stream) on a section whose
-    /// transceiver's sender has a lone encoding without a rid: the sender is "promoted to
+    /// transceiver's sender has a lone encoding without a rid, or no encodings yet (the sender
+    /// of a transceiver the offer created, "from the media description using
+    /// proposedSendEncodings", or of one that has not sent): the sender is "promoted to
     /// simulcast" with `proposedSendEncodings`, one encoding per offered rid in the offer's
     /// order, duplicates removed, at most [`MAX_SEND_ENCODINGS`], the one at `index` of `n`
     /// scaled down by 2^(n - index - 1) (video). The lone encoding is kept as
@@ -2241,7 +2285,7 @@ impl RTCPeerConnection {
                 continue;
             };
             let mut rids: Vec<String> = vec![];
-            for rid in get_rids(media) {
+            for rid in get_rids(media, self.setting_engine.rid_id_grammar()) {
                 if rid.direction == SimulcastDirection::Recv
                     && rid.simulcast
                     && !rids.contains(&rid.id)
@@ -2254,16 +2298,33 @@ impl RTCPeerConnection {
                 continue;
             }
             let kind = self.rtp_transceivers[i].kind();
-            let Some(base) = self.rtp_transceivers[i]
+            let Some(encodings) = self.rtp_transceivers[i]
                 .sender()
                 .as_ref()
-                .and_then(|sender| match sender.send_encodings() {
-                    [lone] if lone.rtp_coding_parameters.rid.is_empty() => Some(lone.clone()),
-                    _ => None,
-                })
+                .map(|sender| sender.send_encodings().to_vec())
             else {
                 continue;
             };
+            let base = match encodings.as_slice() {
+                [lone] if lone.rtp_coding_parameters.rid.is_empty() => lone.clone(),
+                // A sender without encodings yet: one made with its transceiver by this offer
+                // ("Create an RTCRtpSender, sender, from the media description using
+                // proposedSendEncodings"), or one of a transceiver that has not sent. The W3C
+                // sender has its one default encoding from creation; the engine gives it when
+                // first needed, here.
+                [] => match self.new_send_encodings(kind, vec![]) {
+                    Ok((mut defaults, _)) if !defaults.is_empty() => defaults.swap_remove(0),
+                    Ok(_) => continue,
+                    Err(err) => {
+                        log::warn!("no encodings for the proposed simulcast envelope: {err}");
+                        continue;
+                    }
+                },
+                _ => continue,
+            };
+            minted.extend(base.rtp_coding_parameters.ssrc);
+            minted.extend(base.rtp_coding_parameters.rtx.as_ref().map(|rtx| rtx.ssrc));
+            minted.extend(base.rtp_coding_parameters.fec.as_ref().map(|fec| fec.ssrc));
             let n = rids.len();
             let mut proposed = Vec::with_capacity(n);
             for (index, rid) in rids.into_iter().enumerate() {
@@ -2310,6 +2371,9 @@ impl RTCPeerConnection {
         } else {
             SimulcastDirection::Recv
         };
+        // RFC 9429 section 5.2.2 (`with_rejected_rids_kept_in_offers`): the streams a remote
+        // answer rejects stay in this endpoint's later offers.
+        let keep_rejected = !answer_is_local && self.setting_engine.rejected_rids_kept_in_offers;
         let transceiver_by_mid =
             RTCPeerConnection::transceiver_index_by_mid(&self.rtp_transceivers);
         for (offered, answered) in offer
@@ -2328,14 +2392,14 @@ impl RTCPeerConnection {
             let Some(sender) = self.rtp_transceivers[i].sender_mut() else {
                 continue;
             };
-            let offered_rids = get_rids(offered);
+            let offered_rids = get_rids(offered, self.setting_engine.rid_id_grammar());
             // RFC 8853 section 5.2 (a local answer: the offer's `recv` streams marked
             // paused) and section 5.3.3 (a remote answer: the answer's): the streams the
             // remote description marks `~` start paused.
             let remote_rids = if answer_is_local {
                 offered_rids.clone()
             } else {
-                get_rids(answered)
+                get_rids(answered, self.setting_engine.rid_id_grammar())
             };
             sender.set_initially_paused_rids(
                 remote_rids
@@ -2347,25 +2411,31 @@ impl RTCPeerConnection {
                     .collect(),
             );
             let formats = same_format(offered, answered);
-            let accepted: Vec<(String, RTCRtpRidRestrictions)> = get_rids(answered)
-                .into_iter()
-                .filter(|rid| rid.direction == ours && rid.simulcast)
-                .filter(|rid| {
-                    answer_is_local
-                        || offered_rids
-                            .iter()
-                            .find(|offered| {
-                                offered.id == rid.id
-                                    && offered.direction == SimulcastDirection::Send
-                            })
-                            .is_some_and(|offered| answered_rid_is_valid(offered, rid, &formats))
-                })
-                .map(|rid| {
-                    let restrictions = rid.to_restrictions();
-                    (rid.id, restrictions)
-                })
-                .collect();
-            sender.apply_simulcast_answer(&accepted);
+            // The connection's rid-id grammar, the one check_remote_description read this answer with:
+            // a=simulcast is parsed whole, so another grammar here would drop every stream of a line
+            // the checks let through (under with_published_rid_id_grammar), not only the odd rid.
+            let accepted: Vec<(String, RTCRtpRidRestrictions)> =
+                get_rids(answered, self.setting_engine.rid_id_grammar())
+                    .into_iter()
+                    .filter(|rid| rid.direction == ours && rid.simulcast)
+                    .filter(|rid| {
+                        answer_is_local
+                            || offered_rids
+                                .iter()
+                                .find(|offered| {
+                                    offered.id == rid.id
+                                        && offered.direction == SimulcastDirection::Send
+                                })
+                                .is_some_and(|offered| {
+                                    answered_rid_is_valid(offered, rid, &formats)
+                                })
+                    })
+                    .map(|rid| {
+                        let restrictions = rid.to_restrictions();
+                        (rid.id, restrictions)
+                    })
+                    .collect();
+            sender.apply_simulcast_answer(&accepted, keep_rejected);
         }
     }
 
@@ -2675,6 +2745,29 @@ impl RTCPeerConnection {
                 );
             }
         }
+        // The streams of the senders whose negotiated direction does not send, with their
+        // RTX and FEC streams: what the pacer holds of them goes now, and nothing of them is
+        // sent again (RFC 8866 sections 6.7.1 and 6.7.4: "No media is sent over an inactive
+        // media stream"; RFC 3264 section 5.1; W3C webrtc-pc 4.4.1.6: the answer sets
+        // `[[CurrentDirection]]`). RTCP goes on. Every answer says it again: a stream that
+        // sends again is no longer named.
+        let mut not_sending = Vec::new();
+        for transceiver in self.rtp_transceivers.iter().filter(live) {
+            let direction = transceiver.current_direction();
+            if direction == RTCRtpTransceiverDirection::Unspecified || direction.has_send() {
+                continue;
+            }
+            let Some(sender) = transceiver.sender() else {
+                continue;
+            };
+            for encoding in sender.send_encodings() {
+                let coding = &encoding.rtp_coding_parameters;
+                not_sending.extend(coding.ssrc);
+                not_sending.extend(coding.rtx.as_ref().map(|rtx| rtx.ssrc));
+                not_sending.extend(coding.fec.as_ref().map(|fec| fec.ssrc));
+            }
+        }
+        controls.push(interceptor::StreamsNotSending { ssrcs: not_sending }.into_packet(now));
         for control in controls {
             self.interceptor.handle_write(control)?;
         }
@@ -2873,6 +2966,30 @@ impl RTCPeerConnection {
                 && !transceiver_stopped
             {
                 sender.rebind_local_streams(&self.media_engine, &mut self.interceptor);
+                // A simulcast stream an earlier answer rejected and this one accepts again
+                // (`with_rejected_rids_kept_in_offers`) is sent from now on: its outbound
+                // statistics start (the streams that have them keep theirs).
+                if self.setting_engine.rejected_rids_kept_in_offers {
+                    for (encoding_index, coding) in sender.track().codings().iter().enumerate() {
+                        if let Some(ssrc) = coding.rtp_coding_parameters.ssrc
+                            && !sender.is_removed_ssrc(ssrc)
+                        {
+                            outbound_streams_to_create.push((
+                                ssrc,
+                                kind,
+                                mid.clone(),
+                                coding.rtp_coding_parameters.rid.clone(),
+                                encoding_index as u32,
+                                coding
+                                    .rtp_coding_parameters
+                                    .rtx
+                                    .as_ref()
+                                    .map(|rtx| rtx.ssrc),
+                                transceiver_id,
+                            ));
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -3030,11 +3147,22 @@ impl RTCPeerConnection {
         }
 
         let incoming_tracks = if let Some(parsed) = &remote_desc.parsed {
-            track_details_from_sdp(parsed)
+            track_details_from_sdp(parsed, self.setting_engine.rid_id_grammar())
         } else {
             vec![]
         };
         let appdata_names_the_track = self.setting_engine.msid_appdata_change_renews_track;
+        // RFC 5576 section 6.1: the CNAME each SSRC is declared with, against what its RTCP
+        // SDES names (`handler/declared_cname.rs`).
+        self.pipeline_context
+            .interceptor_handler_context
+            .set_declared_cnames(
+                remote_desc
+                    .parsed
+                    .as_ref()
+                    .map(sdp::declared_cnames)
+                    .unwrap_or_default(),
+            );
 
         for incoming_track in incoming_tracks.into_iter() {
             if let Some(transceiver) = self.rtp_transceivers.iter_mut().find(|transceiver| {
@@ -3047,6 +3175,19 @@ impl RTCPeerConnection {
             {
                 // The MediaStreams the track is in, one per `a=msid` line (RFC 8830 section 2).
                 receiver.set_streams(incoming_track.stream_ids.clone());
+
+                // RFC 5576 section 6.1: a declaration its source's SDES contradicted is not
+                // applied again to the stream it established, which keeps flowing as it is.
+                let ctx = &self.pipeline_context.interceptor_handler_context;
+                if incoming_track.ssrc.is_some_and(|ssrc| {
+                    ctx.declaration_contradicted(ssrc)
+                        && receiver
+                            .track()
+                            .get_codec_by_ssrc(ssrc)
+                            .is_some_and(|codec| !codec.mime_type.is_empty())
+                }) {
+                    continue;
+                }
 
                 if is_same_remote_track(receiver, &incoming_track, appdata_names_the_track) {
                     // Keep SSRCs and codecs learned from RTP; the sender may no longer attach
@@ -3190,6 +3331,21 @@ impl RTCPeerConnection {
                     receiver.adopt_early_codings(early);
                 }
             }
+        }
+
+        // RFC 5576 section 6.1: the declarations whose SSRC's SDES named another CNAME.
+        let mid_negotiated = self
+            .media_engine
+            .receive_header_extension_id(::sdp::extmap::SDES_MID_URI)
+            != 0;
+        let contradicted = self
+            .pipeline_context
+            .interceptor_handler_context
+            .withdraw_contradicted_declarations(&mut self.rtp_transceivers, mid_negotiated);
+        for ssrc in contradicted {
+            self.pipeline_context
+                .event_outs
+                .push_back(RTCPeerConnectionEvent::OnRemoteCnameMismatch(ssrc));
         }
 
         Ok(())

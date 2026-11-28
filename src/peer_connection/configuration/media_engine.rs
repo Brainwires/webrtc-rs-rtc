@@ -89,6 +89,28 @@ pub(crate) fn has_symmetric_configuration(codec: &RTCRtpCodec) -> bool {
         .any(|mime_type| codec.mime_type.eq_ignore_ascii_case(mime_type))
 }
 
+/// Whether two formats are the same codec for RFC 3264 section 8.3.2 ("the mapping from a
+/// particular dynamic payload type number to a particular codec ... MUST NOT change"): the
+/// same encoding name, clock rate and channel count (RFC 8866 section 6.6, `a=rtpmap`), and
+/// for a format whose parameters are its configuration (H.264, H.265, VP9, AV1:
+/// [`has_symmetric_configuration`]) the same configuration. Other parameters may change
+/// (RFC 3264 section 6.1: they "MAY be different"), and an RTX format may repair another
+/// primary.
+pub(crate) fn is_same_codec(first: &RTCRtpCodec, second: &RTCRtpCodec) -> bool {
+    first.mime_type.eq_ignore_ascii_case(&second.mime_type)
+        && first.clock_rate == second.clock_rate
+        && (first.channels == second.channels || first.channels == 0 || second.channels == 0)
+        && (!has_symmetric_configuration(first)
+            || codec_parameters_fuzzy_search(
+                first,
+                &[RTCRtpCodecParameters {
+                    rtp_codec: second.clone(),
+                    payload_type: 0,
+                }],
+            )
+            .1 == CodecMatch::Exact)
+}
+
 /// The fmtp line of an H.264 answer: this endpoint's parameters (`local`), with the offer's
 /// profile and the level RFC 6184 section 8.2.2 allows: this endpoint's own when both sides
 /// say `level-asymmetry-allowed=1`, else the lower of the two.
@@ -534,6 +556,15 @@ pub struct MediaEngine {
     pub(crate) negotiated_video_codecs: Vec<RTCRtpCodecParameters>,
     pub(crate) negotiated_audio_codecs: Vec<RTCRtpCodecParameters>,
     pub(crate) negotiated_application_codecs: Vec<RTCRtpCodecParameters>,
+    /// Every dynamic payload type number a description of the session (local or remote, offer
+    /// or answer) has given a format, with the first format it named: RFC 3264 section 8.3.2,
+    /// "the mapping from a particular dynamic payload type number to a particular codec within
+    /// that media stream MUST NOT change for the duration of a session". Kept for the whole
+    /// connection, not per m= section: in a BUNDLE group one number has one configuration
+    /// (RFC 9143 section 9.1.1), so this only ever avoids a number. A format this endpoint
+    /// adds to an answer or numbers in an offer never takes a number this maps to another
+    /// format ([`Self::payload_type_means_another_format`]).
+    pub(crate) payload_type_history: std::collections::HashMap<PayloadType, RTCRtpCodec>,
     /// The payload types of the negotiated lists that number an SFrame section's formats
     /// (`a=sframe`, draft-ietf-avtcore-rtp-sframe-03 section 6): the SFrame sections of a
     /// connection number their formats apart from the plain ones ("payload types for media
@@ -607,6 +638,7 @@ impl MediaEngine {
             negotiated_video_codecs: Default::default(),
             negotiated_audio_codecs: Default::default(),
             negotiated_application_codecs: Default::default(),
+            payload_type_history: Default::default(),
             sframe_payload_types: Default::default(),
             header_extensions: Default::default(),
             negotiated_header_extensions: Default::default(),
@@ -1782,6 +1814,43 @@ impl MediaEngine {
     /// dynamic one (96 to 127, then 35 to 63; never 64 to 95, RFC 5761 section 4); an added
     /// RTX format's `apt` follows its primary. Negotiated payload types are never renumbered
     /// (section 5.2.2: they "MUST stay the same" for the session's lifetime).
+    /// Records the payload type numbers of an applied description (RFC 3264 section 8.3.2): each
+    /// dynamic number (96 to 127, 35 to 63) of an m= section that is not rejected (port zero
+    /// without `a=bundle-only`, RFC 3264 section 6, RFC 9143 section 6) and that no earlier
+    /// description of the session gave a format keeps the format this one gives it.
+    pub(crate) fn record_payload_types(&mut self, description: &SessionDescription) {
+        for media in &description.media_descriptions {
+            if media.media_name.port.value == 0 && !media.has_attribute("bundle-only") {
+                continue;
+            }
+            let Ok(codecs) = crate::peer_connection::sdp::codecs_from_media_description(media)
+            else {
+                continue;
+            };
+            for codec in codecs {
+                if (96..=127).contains(&codec.payload_type)
+                    || (35..=63).contains(&codec.payload_type)
+                {
+                    self.payload_type_history
+                        .entry(codec.payload_type)
+                        .or_insert(codec.rtp_codec);
+                }
+            }
+        }
+    }
+
+    /// Whether an earlier description of the session gave `payload_type` a format other than
+    /// `codec` (RFC 3264 section 8.3.2), so that `codec` must not take that number.
+    pub(crate) fn payload_type_means_another_format(
+        &self,
+        payload_type: PayloadType,
+        codec: &RTCRtpCodecParameters,
+    ) -> bool {
+        self.payload_type_history
+            .get(&payload_type)
+            .is_some_and(|earlier| !is_same_codec(earlier, &codec.rtp_codec))
+    }
+
     pub(crate) fn offer_codecs_for_section(
         &self,
         kind: RtpCodecKind,
@@ -1810,13 +1879,18 @@ impl MediaEngine {
             .chain(&self.video_codecs)
             .map(|codec| codec.payload_type)
             .collect();
+        // RFC 3264 section 8.3.2: a number an earlier description of the session gave a format
+        // keeps meaning it; a new number is one no description used.
         let mut free = (96..=127u8)
             .chain(35..=63u8)
-            .filter(|pt| !reserved.contains(pt));
-        let mut number = |registered_pt: PayloadType,
+            .filter(|pt| !reserved.contains(pt) && !self.payload_type_history.contains_key(pt));
+        let mut number = |codec: &RTCRtpCodecParameters,
                           taken: &mut std::collections::HashSet<PayloadType>|
          -> Option<PayloadType> {
-            let pt = if taken.contains(&registered_pt) {
+            let registered_pt = codec.payload_type;
+            let pt = if taken.contains(&registered_pt)
+                || self.payload_type_means_another_format(registered_pt, codec)
+            {
                 free.by_ref().find(|pt| !taken.contains(pt))?
             } else {
                 registered_pt
@@ -1837,7 +1911,7 @@ impl MediaEngine {
                     primaries.insert(codec.payload_type, negotiated.payload_type);
                 }
                 _ => {
-                    let Some(pt) = number(codec.payload_type, &mut taken) else {
+                    let Some(pt) = number(codec, &mut taken) else {
                         continue;
                     };
                     primaries.insert(codec.payload_type, pt);
@@ -1860,7 +1934,7 @@ impl MediaEngine {
             if repaired {
                 continue;
             }
-            let Some(pt) = number(codec.payload_type, &mut taken) else {
+            let Some(pt) = number(codec, &mut taken) else {
                 continue;
             };
             let mut rtx = (*codec).clone();
@@ -2494,6 +2568,27 @@ impl MediaEngine {
         } else {
             vec![]
         }
+    }
+
+    /// The URIs of the header extensions registered for `typ` that `direction` allows, in
+    /// registration order, each once (W3C webrtc-pc 5.2 / 5.3 getCapabilities: the
+    /// implemented extensions, whatever was negotiated).
+    pub(crate) fn registered_header_extension_uris(
+        &self,
+        typ: RtpCodecKind,
+        direction: RTCRtpTransceiverDirection,
+    ) -> Vec<String> {
+        let mut uris: Vec<String> = vec![];
+        for e in &self.header_extensions {
+            if e.is_matching_direction(direction)
+                && (e.is_audio && typ == RtpCodecKind::Audio
+                    || e.is_video && typ == RtpCodecKind::Video)
+                && !uris.contains(&e.uri)
+            {
+                uris.push(e.uri.clone());
+            }
+        }
+        uris
     }
 
     pub(crate) fn get_rtp_parameters_by_kind(

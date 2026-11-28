@@ -45,6 +45,21 @@ impl Needle {
         }
     }
 
+    /// A needle whose key name is made at run time ("key 2, epoch 1: SRTP encryption key").
+    /// The name is leaked: a test makes a few hundred of them.
+    pub fn named(key: String, form: &'static str, bytes: &[u8]) -> Self {
+        Self::new(Box::leak(key.into_boxed_str()), form, false, bytes)
+    }
+
+    /// Whether `haystack` starts with the needle.
+    pub fn starts(&self, haystack: &[u8]) -> bool {
+        haystack.len() >= self.len
+            && haystack[..self.len]
+                .iter()
+                .zip(&self.inverted[..self.len])
+                .all(|(h, n)| *h == !*n)
+    }
+
     /// The needle's length in bytes.
     pub fn len(&self) -> usize {
         self.len
@@ -79,6 +94,37 @@ impl Needle {
 
     pub fn describe(&self) -> String {
         format!("{} ({}, {} bytes)", self.form, self.key, self.len)
+    }
+}
+
+/// Finds every needle of a set in a byte string: each position is looked up by its first two
+/// bytes, so a search costs little more than reading the memory.
+pub struct Finder<'a> {
+    needles: &'a [Needle],
+    /// The needles starting with each two-byte prefix.
+    by_prefix: Vec<Vec<u32>>,
+}
+
+impl<'a> Finder<'a> {
+    pub fn new(needles: &'a [Needle]) -> Self {
+        let mut by_prefix = vec![Vec::new(); 1 << 16];
+        for (n, needle) in needles.iter().enumerate() {
+            assert!(needle.len() >= 2, "a needle of {} bytes", needle.len());
+            by_prefix[needle.prefix() as usize].push(n as u32);
+        }
+        Self { needles, by_prefix }
+    }
+
+    /// Calls `found(needle, offset)` for every needle at every offset of `haystack` it is at.
+    pub fn each(&self, haystack: &[u8], mut found: impl FnMut(usize, usize)) {
+        for i in 0..haystack.len().saturating_sub(1) {
+            let prefix = u16::from_le_bytes([haystack[i], haystack[i + 1]]);
+            for &n in &self.by_prefix[prefix as usize] {
+                if self.needles[n as usize].starts(&haystack[i..]) {
+                    found(n as usize, i);
+                }
+            }
+        }
     }
 }
 
@@ -160,6 +206,26 @@ impl Schedule {
         &self.bytes[16 * i..16 * (i + 1)]
     }
 
+    /// Round key `i` of the equivalent inverse cipher (FIPS-197 section 5.3.5): InvMixColumns
+    /// of round key `i`, which is what an implementation that decrypts with AESDEC / AESD keeps
+    /// beside the encryption schedule for the rounds between the first and the last (RustCrypto
+    /// `aes` builds both schedules whenever it is keyed). The transform is invertible: whoever
+    /// has one of these has the round key.
+    pub fn inverse_round_key(&self, i: usize) -> [u8; 16] {
+        let rk = self.round_key(i);
+        let mut out = [0u8; 16];
+        for c in 0..4 {
+            let a = [rk[4 * c], rk[4 * c + 1], rk[4 * c + 2], rk[4 * c + 3]];
+            for r in 0..4 {
+                out[4 * c + r] = gmul(a[r], 0x0e)
+                    ^ gmul(a[(r + 1) % 4], 0x0b)
+                    ^ gmul(a[(r + 2) % 4], 0x0d)
+                    ^ gmul(a[(r + 3) % 4], 0x09);
+            }
+        }
+        out
+    }
+
     /// The cipher (FIPS-197 section 5.1) on one block.
     pub fn encrypt(&self, block: &mut [u8; 16]) {
         add(block, self.round_key(0));
@@ -203,6 +269,19 @@ fn xtime(b: u8) -> u8 {
     (b << 1) ^ if b & 0x80 != 0 { 0x1b } else { 0 }
 }
 
+/// Multiplication in GF(2^8) (FIPS-197 section 4.2).
+fn gmul(mut a: u8, mut b: u8) -> u8 {
+    let mut product = 0;
+    while b != 0 {
+        if b & 1 != 0 {
+            product ^= a;
+        }
+        a = xtime(a);
+        b >>= 1;
+    }
+    product
+}
+
 fn add(block: &mut [u8; 16], round_key: &[u8]) {
     for (b, k) in block.iter_mut().zip(round_key) {
         *b ^= k;
@@ -214,10 +293,25 @@ fn add(block: &mut [u8; 16], round_key: &[u8]) {
 // the 96-bit salt to 112 bits), key derivation rate zero.
 
 pub fn derive(master_key: &[u8], master_salt: &[u8], label: u8, out: &mut [u8]) {
+    derive_at(master_key, master_salt, label, 0, out);
+}
+
+/// The same with a key derivation rate: `index_over_kdr` is `index DIV kdr` (48 bits), XORed
+/// into the key id under the label (RFC 3711 section 4.3.1).
+pub fn derive_at(
+    master_key: &[u8],
+    master_salt: &[u8],
+    label: u8,
+    index_over_kdr: u64,
+    out: &mut [u8],
+) {
     let schedule = Schedule::expand(master_key);
     let mut x = [0u8; 16];
     x[..master_salt.len()].copy_from_slice(master_salt);
     x[7] ^= label;
+    for (dst, src) in x[8..14].iter_mut().zip(&index_over_kdr.to_be_bytes()[2..]) {
+        *dst ^= src;
+    }
     for (i, chunk) in out.chunks_mut(16).enumerate() {
         let mut block = x;
         block[14..].copy_from_slice(&(i as u16).to_be_bytes());
@@ -438,6 +532,239 @@ pub fn context_needles(
     out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Every form, for the residue measurement (`key_residue.rs`).
+
+const INVERSE_ROUND_KEYS: [&str; 15] = [
+    "inverse round key 0",
+    "inverse round key 1",
+    "inverse round key 2",
+    "inverse round key 3",
+    "inverse round key 4",
+    "inverse round key 5",
+    "inverse round key 6",
+    "inverse round key 7",
+    "inverse round key 8",
+    "inverse round key 9",
+    "inverse round key 10",
+    "inverse round key 11",
+    "inverse round key 12",
+    "inverse round key 13",
+    "inverse round key 14",
+];
+
+/// Every form of an AES key an implementation may hold or compute on the way: the key, the
+/// round keys, the round keys of the equivalent inverse cipher (rounds 1 to Nr - 1; the first
+/// and last are plain round keys), and with `gcm` the GHASH key in three forms: `H`, `H` as
+/// the two host-order 64-bit words a table set-up is handed, and `H * x` in GF(2^128) as
+/// carry-less multiplication code keeps it (the first table entry of `gcm_init_clmul`,
+/// `gcm_init_v8` and the VPCLMULQDQ set-up of BoringSSL-derived code: the 128-bit value
+/// shifted left by one, reduced with 0xc2...01, stored as two little-endian 64-bit words, low
+/// word first; the other word order is searched too).
+fn every_aes_form(out: &mut Vec<Needle>, key_name: &str, key: &[u8], gcm: bool) {
+    out.push(Needle::named(key_name.to_owned(), "the key", key));
+    let schedule = Schedule::expand(key);
+    let nk = key.len() / 4;
+    for (i, name) in ROUND_KEYS.iter().enumerate().take(schedule.rounds + 1) {
+        if 4 * i >= nk {
+            out.push(Needle::named(
+                key_name.to_owned(),
+                name,
+                schedule.round_key(i),
+            ));
+        }
+    }
+    for (i, name) in INVERSE_ROUND_KEYS
+        .iter()
+        .enumerate()
+        .take(schedule.rounds)
+        .skip(1)
+    {
+        let mut inverse = schedule.inverse_round_key(i);
+        out.push(Needle::named(key_name.to_owned(), name, &inverse));
+        wipe(&mut inverse);
+    }
+    if gcm {
+        let mut h = [0u8; 16];
+        schedule.encrypt(&mut h);
+        out.push(Needle::named(key_name.to_owned(), "GHASH key H", &h));
+        let mut value = u128::from_be_bytes(h);
+        let mut words = [0u8; 16];
+        words[..8].copy_from_slice(&((value >> 64) as u64).to_le_bytes());
+        words[8..].copy_from_slice(&(value as u64).to_le_bytes());
+        out.push(Needle::named(
+            key_name.to_owned(),
+            "GHASH key H (two host-order words, little-endian host)",
+            &words,
+        ));
+        let carry = value >> 127 != 0;
+        value <<= 1;
+        if carry {
+            value ^= 0xc200_0000_0000_0000_0000_0000_0000_0001;
+        }
+        words = value.to_le_bytes();
+        out.push(Needle::named(
+            key_name.to_owned(),
+            "GHASH table entry H*x (low word first)",
+            &words,
+        ));
+        words.rotate_left(8);
+        out.push(Needle::named(
+            key_name.to_owned(),
+            "GHASH table entry H*x (high word first)",
+            &words,
+        ));
+        wipe(&mut words);
+        wipe(&mut h);
+        value = 0;
+        let _ = std::hint::black_box(value);
+    }
+}
+
+/// Every form of an HMAC-SHA1 key: the key, the first 20 bytes of the two padded key blocks
+/// (`key XOR ipad`, `key XOR opad`: RFC 2104 section 2), and the two SHA-1 states after them
+/// in both word orders.
+fn every_hmac_form(out: &mut Vec<Needle>, key_name: &str, key: &[u8]) {
+    out.push(Needle::named(key_name.to_owned(), "the key", key));
+    for (pad, form) in [(0x36u8, "key XOR ipad"), (0x5c, "key XOR opad")] {
+        let mut block = [0u8; 20];
+        for (b, k) in block.iter_mut().zip(key) {
+            *b = k ^ pad;
+        }
+        out.push(Needle::named(key_name.to_owned(), form, &block));
+        wipe(&mut block);
+    }
+    let (inner, outer) = hmac_sha1_states(key);
+    for (state, le, be) in [
+        (
+            &inner,
+            "HMAC inner state (little-endian words)",
+            "HMAC inner state (big-endian words)",
+        ),
+        (
+            &outer,
+            "HMAC outer state (little-endian words)",
+            "HMAC outer state (big-endian words)",
+        ),
+    ] {
+        for (form, big_endian) in [(le, false), (be, true)] {
+            let mut bytes = words(state, big_endian);
+            out.push(Needle::named(key_name.to_owned(), form, &bytes));
+            wipe(&mut bytes);
+        }
+    }
+}
+
+/// The name of the session key `name` in a needle set: with `who` (which master key) and the
+/// key derivation epoch when either tells more than the name.
+fn session_key_name(who: &str, epoch: Option<u64>, name: &str) -> String {
+    match epoch {
+        Some(epoch) => format!("{who}epoch {epoch} {name}"),
+        None => format!("{who}{name}"),
+    }
+}
+
+/// Every key a context of `profile` derives from the master key and salt in the key derivation
+/// epochs `epochs` (`index DIV kdr`; `[0]` with a zero rate), in every form
+/// ([`every_aes_form`], [`every_hmac_form`]): the SRTP and SRTCP encryption, authentication and
+/// salting keys, the RFC 6904 header extension keys k_he and k_hs (derived with the SRTP index
+/// whether or not an extension is encrypted), the master key itself, which the key
+/// derivation keys AES with, and the master salt. `who` names the master key when a context has several.
+pub fn every_needle(
+    profile: ProtectionProfile,
+    master_key: &[u8],
+    master_salt: &[u8],
+    epochs: &[u64],
+    who: &str,
+) -> Vec<Needle> {
+    let mut out = Vec::new();
+    let aead = matches!(
+        profile,
+        ProtectionProfile::AeadAes128Gcm | ProtectionProfile::AeadAes256Gcm
+    );
+    let null = matches!(
+        profile,
+        ProtectionProfile::NullHmacSha1_80 | ProtectionProfile::NullHmacSha1_32
+    );
+    let key_len = profile.key_len();
+    let salt_len = if aead { 12 } else { 14 };
+    let mut buf = [0u8; 32];
+    for &epoch in epochs {
+        let named = |name: &str| session_key_name(who, (*epochs != [0]).then_some(epoch), name);
+        for (encryption, authentication, salt, names) in [
+            (
+                0x00u8,
+                0x01u8,
+                0x02u8,
+                [
+                    "SRTP encryption key",
+                    "SRTP authentication key",
+                    "SRTP salting key",
+                ],
+            ),
+            (
+                0x03,
+                0x04,
+                0x05,
+                [
+                    "SRTCP encryption key",
+                    "SRTCP authentication key",
+                    "SRTCP salting key",
+                ],
+            ),
+        ] {
+            if !null {
+                derive_at(
+                    master_key,
+                    master_salt,
+                    encryption,
+                    epoch,
+                    &mut buf[..key_len],
+                );
+                every_aes_form(&mut out, &named(names[0]), &buf[..key_len], aead);
+            }
+            if !aead {
+                derive_at(
+                    master_key,
+                    master_salt,
+                    authentication,
+                    epoch,
+                    &mut buf[..20],
+                );
+                every_hmac_form(&mut out, &named(names[1]), &buf[..20]);
+            }
+            derive_at(master_key, master_salt, salt, epoch, &mut buf[..salt_len]);
+            out.push(Needle::named(named(names[2]), "the key", &buf[..salt_len]));
+            wipe(&mut buf);
+        }
+        if !null {
+            derive_at(master_key, master_salt, 0x06, epoch, &mut buf[..key_len]);
+            every_aes_form(
+                &mut out,
+                &named("header extension encryption key"),
+                &buf[..key_len],
+                false,
+            );
+        }
+        derive_at(master_key, master_salt, 0x07, epoch, &mut buf[..salt_len]);
+        out.push(Needle::named(
+            named("header extension salting key"),
+            "the key",
+            &buf[..salt_len],
+        ));
+        wipe(&mut buf);
+    }
+    every_aes_form(&mut out, &format!("{who}master key"), master_key, false);
+    // RFC 7714 section 13.1: "If the master salt is to be kept secret, it MUST be properly
+    // erased when no longer needed." DTLS-SRTP's is secret: it comes out of the exporter.
+    out.push(Needle::named(
+        format!("{who}master salt"),
+        "the key",
+        master_salt,
+    ));
+    out
+}
+
 /// The local primitives against their standards' vectors. Panics on a mismatch.
 pub fn check_local_primitives() {
     fn hex(s: &str) -> Vec<u8> {
@@ -451,6 +778,13 @@ pub fn check_local_primitives() {
     assert_eq!(
         hex("d014f9a8c9ee2589e13f0cc8b6630ca6"),
         schedule.round_key(10)
+    );
+    // FIPS-197 appendix C.1, equivalent inverse cipher: round[1].ik_sch is InvMixColumns of
+    // round key 9 of the key 000102...0f.
+    let schedule = Schedule::expand(&hex("000102030405060708090a0b0c0d0e0f"));
+    assert_eq!(
+        hex("13aa29be9c8faff6f770f58000f7bf03"),
+        schedule.inverse_round_key(9)
     );
     // FIPS-197 appendix C.1 to C.3.
     for (key, expected) in [
@@ -512,6 +846,17 @@ pub fn rtp(sequence_number: u16) -> Vec<u8> {
     let mut packet = vec![0x80, 96];
     packet.extend_from_slice(&sequence_number.to_be_bytes());
     packet.extend_from_slice(&[0, 0, 0, 1, 0x11, 0x22, 0x33, 0x44]);
+    packet.extend_from_slice(b"payload of a packet");
+    packet
+}
+
+/// An RTP packet with a one-byte header extension (RFC 8285 section 4.2): one element, id 1,
+/// three octets.
+pub fn rtp_with_extension(sequence_number: u16) -> Vec<u8> {
+    let mut packet = vec![0x90, 96];
+    packet.extend_from_slice(&sequence_number.to_be_bytes());
+    packet.extend_from_slice(&[0, 0, 0, 1, 0x11, 0x22, 0x33, 0x44]);
+    packet.extend_from_slice(&[0xbe, 0xde, 0x00, 0x01, 0x12, 0xa1, 0xb2, 0xc3]);
     packet.extend_from_slice(b"payload of a packet");
     packet
 }

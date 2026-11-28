@@ -292,7 +292,8 @@ async fn main() -> Result<()> {
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     Command::AddIceCandidate(candidate) => {
-                        if let Err(e) = peer_connection.add_local_candidate(candidate) {
+                        // The peer's candidate (it was given as a local one).
+                        if let Err(e) = peer_connection.add_remote_candidate(candidate) {
                             eprintln!("Failed to add ICE candidate: {}", e);
                         }
                     }
@@ -305,6 +306,12 @@ async fn main() -> Result<()> {
                             // Add local candidate
                             if let Err(e) = peer_connection.add_local_candidate(local_candidate_init.clone()) {
                                 eprintln!("Failed to add local candidate: {}", e);
+                            }
+                            // This side's gathering is done: the answer carries a=end-of-candidates
+                            // (W3C webrtc-pc 5.6.4: the peer's transport is "failed" only once it
+                            // has the end of the candidates, "disconnected" until then).
+                            if let Err(e) = peer_connection.add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default()) {
+                                eprintln!("Failed to end local gathering: {}", e);
                             }
 
                             // Create answer

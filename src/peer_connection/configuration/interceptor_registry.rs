@@ -157,7 +157,7 @@ use std::time::Duration;
 /// example here reaches for both, and the definitions live in `rtci-interceptor` because the chain
 /// does.
 pub use interceptor::{Registry, Slot};
-use shared::error::Result;
+use shared::error::{Error, Result};
 
 /// Registers a standard set of interceptors for typical WebRTC usage.
 ///
@@ -451,6 +451,33 @@ pub struct DefaultInterceptorOptions {
     /// estimate keeps it) or bring it down to the bound. See
     /// [`Gcc::with_received_rate_bound`](interceptor::Gcc::with_received_rate_bound).
     pub gcc_received_rate_bound: interceptor::ReceivedRateBound,
+    /// The congestion controller's start, in bits per second: its target before any
+    /// congestion feedback, what the pacer first releases media at and what the start-up
+    /// probes are a multiple of (three and six times), on every transport and again from a
+    /// new path. Default [`GCC_INITIAL_BITRATE`](interceptor::GCC_INITIAL_BITRATE), 300 kbit/s
+    /// (libwebrtc's `start` too, `pc/peer_connection_factory.cc` at a222406d).
+    ///
+    /// No specification names a value: RFC 8836 section 2, requirement 4, asks the algorithm
+    /// to "adapt as quickly as possible to initial network conditions" and allows
+    /// "history-based startup (start at a point expected to be at or below channel bandwidth
+    /// from historical information [...])", warning that "Starting too low and/or adapting up
+    /// too slowly can cause a critical point in a personal communication to be poor" and
+    /// "Starting too high above the available bandwidth causes other problems";
+    /// draft-ietf-rmcat-gcc-02 gives no start value. An application that knows the path (a
+    /// previous call's estimate) sets it here. Must lie within
+    /// [`congestion_min_bitrate`](Self::congestion_min_bitrate)..=[`congestion_max_bitrate`](Self::congestion_max_bitrate):
+    /// `register_default_interceptors_with_options` refuses other values
+    /// (`Error::InvalidBitrate`).
+    pub congestion_start_bitrate: f64,
+    /// The congestion controller's floor, bits per second: the target never goes below it
+    /// (it is lowered by a smaller REMB, TMMBR or `b=AS` / `b=TIAS` limit, or by
+    /// `CongestionControlHandle::set_session_bitrate_limit`). Default
+    /// [`GCC_MIN_BITRATE`](interceptor::GCC_MIN_BITRATE), 100 kbit/s.
+    /// `CongestionControlHandle::set_min_bitrate` changes it during the call.
+    pub congestion_min_bitrate: f64,
+    /// The congestion controller's ceiling, bits per second. Default
+    /// [`GCC_MAX_BITRATE`](interceptor::GCC_MAX_BITRATE), 100 Mbit/s.
+    pub congestion_max_bitrate: f64,
     /// Whether the abs-send-time header extension is offered on audio as well as on video
     /// ([`configure_abs_send_time`]). `false` by default: it serves the receive-side estimate
     /// (REMB), which runs on video; Chromium offers it on audio too.
@@ -611,6 +638,9 @@ impl std::fmt::Debug for DefaultInterceptorOptions {
                 &self.gcc_one_decrease_per_round_trip,
             )
             .field("gcc_received_rate_bound", &self.gcc_received_rate_bound)
+            .field("congestion_start_bitrate", &self.congestion_start_bitrate)
+            .field("congestion_min_bitrate", &self.congestion_min_bitrate)
+            .field("congestion_max_bitrate", &self.congestion_max_bitrate)
             .field("abs_send_time_on_audio", &self.abs_send_time_on_audio)
             .field(
                 "receiver_reference_time_on_audio",
@@ -689,6 +719,9 @@ impl DefaultInterceptorOptions {
             gcc_threshold_time_base: interceptor::ThresholdTimeBase::Arrival,
             gcc_one_decrease_per_round_trip: false,
             gcc_received_rate_bound: interceptor::ReceivedRateBound::LimitsIncrease,
+            congestion_start_bitrate: interceptor::GCC_INITIAL_BITRATE,
+            congestion_min_bitrate: interceptor::GCC_MIN_BITRATE,
+            congestion_max_bitrate: interceptor::GCC_MAX_BITRATE,
             abs_send_time_on_audio: false,
             receiver_reference_time_on_audio: false,
             video_red_ulpfec: false,
@@ -709,6 +742,27 @@ impl DefaultInterceptorOptions {
             nack_max_repair_age: Some(interceptor::NACK_MAX_REPAIR_AGE),
             nack_repair_backlog_bound: Some(interceptor::NACK_REPAIR_BACKLOG_BOUND),
             wall_clock: None,
+        }
+    }
+
+    /// The congestion controller's start, floor and ceiling, checked: finite, the floor not
+    /// negative, the start above zero, and `min <= start <= max` (libwebrtc's
+    /// `PeerConnection::SetBitrate` refuses the same, `pc/peer_connection.cc` at a222406d).
+    fn congestion_bitrates(&self) -> Result<(f64, f64, f64)> {
+        let (start, min, max) = (
+            self.congestion_start_bitrate,
+            self.congestion_min_bitrate,
+            self.congestion_max_bitrate,
+        );
+        if [start, min, max].iter().all(|v| v.is_finite())
+            && min >= 0.0
+            && start > 0.0
+            && min <= start
+            && start <= max
+        {
+            Ok((start, min, max))
+        } else {
+            Err(Error::InvalidBitrate)
         }
     }
 
@@ -882,7 +936,10 @@ pub fn register_default_interceptors_with_options(
     // One controller, bound and pacer per transport: each transport is a path of its own
     // (RFC 8836 section 2; an RTP session each, RFC 8834 section 4.4). The handle reads the
     // first transport's controller.
-    let initial_target = Gcc::default().target_bitrate();
+    // The start, floor and ceiling: one value seeds the controller of every transport, the
+    // remote-limit interceptor and the pacer, so the first target is the same in all three.
+    let (start, min, max) = options.congestion_bitrates()?;
+    let initial_target = Gcc::new(start, min, max).target_bitrate();
     let congestion_control_builder = {
         let transports = transports.clone();
         let unnegotiated_tmmbr = options.unnegotiated_tmmbr;
@@ -894,7 +951,7 @@ pub fn register_default_interceptors_with_options(
         let received_rate_bound = options.gcc_received_rate_bound;
         let send_rate_told_to_rtcp = options.rtcp_share_follows_send_rate;
         move |session: usize| {
-            let estimator = Gcc::default()
+            let estimator = Gcc::new(start, min, max)
                 .with_threshold_time_base(threshold_time_base)
                 .with_one_decrease_per_round_trip(one_decrease_per_round_trip)
                 .with_received_rate_bound(received_rate_bound);

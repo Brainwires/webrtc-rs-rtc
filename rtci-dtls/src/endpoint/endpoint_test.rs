@@ -1993,6 +1993,30 @@ fn a_client_with_no_name_and_no_address_sends_no_server_name() -> Result<()> {
     Ok(())
 }
 
+/// A client that would verify the server's certificate by name, with no server name and no
+/// remote address, has nothing to verify against: the builder refuses it (0.2.0 verified
+/// against a made-up "localhost"). With a name, or with an address, it builds.
+#[test]
+fn a_nameless_client_that_verifies_by_name_is_refused() -> Result<()> {
+    let verifying = || {
+        ConfigBuilder::default()
+            .with_crypto_provider(provider())
+            .with_cipher_suites(vec![SUITE])
+    };
+    assert!(
+        matches!(
+            verifying().build(true, None),
+            Err(Error::Other(message)) if message.contains("server name")
+        ),
+        "no name to verify the certificate against"
+    );
+    verifying()
+        .with_server_name("example.org".to_owned())
+        .build(true, None)?;
+    verifying().build(true, Some(server_addr()))?;
+    Ok(())
+}
+
 #[test]
 fn the_server_name_extension_never_carries_an_ip_address() -> Result<()> {
     let now = Instant::now();

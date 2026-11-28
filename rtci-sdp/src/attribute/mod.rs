@@ -82,7 +82,7 @@ pub use rtp::{
 };
 pub use sctp::{MaxMessageSize, SctpMap, SctpPort};
 pub use security::{Fingerprint, Identity, Setup, TlsId};
-pub use simulcast::{Rid, RidDirection, Simulcast, SimulcastId};
+pub use simulcast::{Rid, RidDirection, RidIdGrammar, Simulcast, SimulcastId};
 pub use source::{Ssrc, SsrcGroup};
 pub use validate::check_attribute;
 

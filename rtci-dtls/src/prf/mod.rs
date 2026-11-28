@@ -99,7 +99,23 @@ pub(crate) fn prf_pre_master_secret(
 // HMAC output, each A(i). It is all built in zeroizing buffers sized up front (a buffer that grew
 // would leave a copy in the allocation it moved from), and the secret is keyed into the HMAC
 // once.
+//
+// It runs on a stack that is overwritten afterwards (`crypto::on_erased_stack`): each HMAC
+// leaves the keyed hash states of the secret, and its output, in the provider's frames (ring
+// copies the keyed context onto the stack per MAC; measured by tests/key_residue.rs, where the
+// master secret's HMAC states were the largest DTLS residue). That covers the master secret, the
+// extended master secret, the key block, verify_data and the exporter.
 pub(crate) fn prf_p_hash(
+    crypto: &dyn RTCCrypto,
+    secret: &[u8],
+    seed: &[u8],
+    requested_length: usize,
+    h: CipherSuiteHash,
+) -> Result<SecretVec> {
+    crypto::on_erased_stack(|| p_hash(crypto, secret, seed, requested_length, h))
+}
+
+fn p_hash(
     crypto: &dyn RTCCrypto,
     secret: &[u8],
     seed: &[u8],

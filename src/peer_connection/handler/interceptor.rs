@@ -65,6 +65,14 @@ pub(crate) struct InterceptorHandlerContext {
     /// The CNAME each remote SSRC named in its SDES (RFC 3550 6.5.1), which is what binds the
     /// streams of one remote endpoint together for synchronisation.
     pub(crate) remote_cnames: HashMap<SSRC, String>,
+    /// The CNAME each SSRC of the remote description is declared with (`a=ssrc:<ssrc>
+    /// cname:`, RFC 5576 section 6.1), set with each remote description
+    /// ([`Self::set_declared_cnames`]).
+    pub(crate) declared_cnames: HashMap<SSRC, String>,
+    /// The declared SSRCs whose RTCP SDES named another CNAME than the description, with the
+    /// CNAME the description declared: the description of the source is not applicable to
+    /// the source received (RFC 5576 section 6.1; `declared_cname.rs`).
+    pub(crate) contradicted_declarations: HashMap<SSRC, String>,
     /// The MID each remote SSRC named in an RTCP SDES MID item (RFC 9143 sections 9.2 and
     /// 15.1): the m= section of a stream whose packets carry no MID header extension and whose
     /// SSRC no description declares.
@@ -127,6 +135,9 @@ pub(crate) struct InterceptorHandlerContext {
     /// `SettingEngineBuilder::with_source_departure_ends_track`: a remote track whose SSRCs
     /// have all left (BYE, RTP timeout) ends instead of being muted (RFC 8830 section 3).
     source_departure_ends_track: bool,
+    /// `SettingEngineBuilder::with_rtp_timeout_mutes_track`: a remote source that timed out
+    /// mutes its track as a BYE does.
+    rtp_timeout_mutes_track: bool,
     /// The sequence number of the packet whose MID last moved each SSRC to another m=
     /// section (RFC 7941 section 4.2.6). Bounded by `MAX_REMOTE_CNAMES`.
     mid_moves: HashMap<SSRC, u16>,
@@ -145,6 +156,12 @@ impl InterceptorHandlerContext {
     /// `SettingEngineBuilder::with_source_departure_ends_track`.
     pub(crate) fn with_source_departure_ending_tracks(mut self, ends: bool) -> Self {
         self.source_departure_ends_track = ends;
+        self
+    }
+
+    /// `SettingEngineBuilder::with_rtp_timeout_mutes_track`.
+    pub(crate) fn with_rtp_timeout_muting(mut self, mutes: bool) -> Self {
+        self.rtp_timeout_mutes_track = mutes;
         self
     }
 
@@ -176,6 +193,8 @@ impl Default for InterceptorHandlerContext {
             event_outs: Default::default(),
             cname: interceptor::generate_rtcp_cname(),
             remote_cnames: Default::default(),
+            declared_cnames: Default::default(),
+            contradicted_declarations: Default::default(),
             sdes_mids: Default::default(),
             ssrcs_replaced: false,
             placed_ssrcs: Default::default(),
@@ -194,6 +213,7 @@ impl Default for InterceptorHandlerContext {
             srtp_keyed: Default::default(),
             newly_bound: None,
             source_departure_ends_track: false,
+            rtp_timeout_mutes_track: false,
             mid_moves: Default::default(),
             departed_sources: Default::default(),
             reporting_ssrc: None,
@@ -792,18 +812,20 @@ impl<'a> InterceptorHandler<'a> {
                 continue;
             };
             for &source in &goodbye.sources {
-                self.source_left(now, source);
+                self.source_left(now, source, false);
             }
         }
     }
 
     /// A remote source has left the session: by a BYE (RFC 3550 6.6), or by the RTP timeout
-    /// (RFC 3550 6.3.5: nothing heard from it for five report intervals; the RTCP session's
-    /// `SourceTimedOut`). RFC 8830 section 3: a track whose SSRCs are all gone "has ended";
-    /// W3C webrtc 9.3, which governs track state under this API (RFC 9429 defers to it), has
-    /// the track muted (`OnMute`) instead, and only negotiation ends a remote track. Its next
-    /// RTP packet unmutes it.
-    fn source_left(&mut self, now: Instant, source: SSRC) {
+    /// (`timed_out`; RFC 3550 6.3.5: nothing heard from it for five report intervals; the RTCP
+    /// session's `SourceTimedOut`). RFC 8830 section 3: a track whose SSRCs are all gone "has
+    /// ended"; W3C webrtc 9.3, which governs track state under this API (RFC 9429 defers to
+    /// it), has the track muted (`OnMute`) instead when the SSRC "is removed due to reception
+    /// of a BYE", and only negotiation ends a remote track. Its next RTP packet unmutes it. A
+    /// timeout mutes nothing (Candidate Correction 57, w3c/webrtc-pc PR #3082, removed "or via
+    /// timeout"), unless `with_rtp_timeout_mutes_track`.
+    fn source_left(&mut self, now: Instant, source: SSRC, timed_out: bool) {
         // The source left, whether it was a stream of its own or a contributor to a mixer's
         // (a CSRC): no receiver lists it any more.
         for transceiver in self.rtp_transceivers.iter_mut() {
@@ -847,6 +869,9 @@ impl<'a> InterceptorHandler<'a> {
                 }
                 return;
             }
+        }
+        if timed_out && !self.ctx.rtp_timeout_mutes_track {
+            return;
         }
         let track = receiver.track_mut();
         if track.muted() || track.ready_state() == MediaStreamTrackState::Ended {
@@ -911,6 +936,25 @@ impl<'a> InterceptorHandler<'a> {
                 {
                     self.ctx.remote_cnames.insert(*ssrc, cname.clone());
                 }
+                // RFC 5576 section 6.1: an SDES CNAME other than the description's for a
+                // declared SSRC (`declared_cname.rs`).
+                if self.ctx.declaration_contradicted(*ssrc) {
+                    let mid_negotiated = self
+                        .media_engine
+                        .receive_header_extension_id(::sdp::extmap::SDES_MID_URI)
+                        != 0;
+                    for ssrc in self
+                        .ctx
+                        .withdraw_contradicted_declarations(self.rtp_transceivers, mid_negotiated)
+                    {
+                        self.ctx.event_outs.push_back(TaggedRTCEventInternal {
+                            now,
+                            event: RTCEventInternal::RTCPeerConnectionEvent(
+                                RTCPeerConnectionEvent::OnRemoteCnameMismatch(ssrc),
+                            ),
+                        });
+                    }
+                }
             }
             RtcpSessionEvent::SsrcCollision { ssrc, replacement } => {
                 // RFC 3550 8.2, RFC 5576 section 5, RFC 8834 section 4.8. The session's own
@@ -955,8 +999,9 @@ impl<'a> InterceptorHandler<'a> {
                     });
                 }
             }
-            // RFC 3550 6.3.5: the remote source timed out; it is gone as after a BYE.
-            RtcpSessionEvent::SourceTimedOut { ssrc } => self.source_left(now, *ssrc),
+            // RFC 3550 6.3.5: the remote source timed out; it is gone as after a BYE, but its
+            // track is not muted for it (W3C webrtc-pc Candidate Correction 57).
+            RtcpSessionEvent::SourceTimedOut { ssrc } => self.source_left(now, *ssrc, true),
             // RFC 8108 6.1: the SSRC the first stream is to be sent on.
             RtcpSessionEvent::ReportingSsrc { ssrc } => self.ctx.reporting_ssrc = *ssrc,
             _ => {}
@@ -1849,20 +1894,37 @@ impl<'a> InterceptorHandler<'a> {
     }
 
     /// webrtc-encoded-transform 6.4: a PLI or FIR for an SSRC a sender sends is a
-    /// `keyframerequest` for the encoding of that SSRC, with its RID.
-    fn announce_key_frame_requests(&mut self, now: Instant, packets: &[Box<dyn rtcp::Packet>]) {
+    /// `keyframerequest` for the encoding of that SSRC, with its RID; each is followed by
+    /// `OnKeyFrameRequestOrigin`, the same request with where it came from. `local` is the
+    /// [`interceptor::LocalKeyFrameRequest`] the packet carries when an interceptor of this
+    /// chain made it; without one it came from the remote peer, whatever its sender SSRC.
+    fn announce_key_frame_requests(
+        &mut self,
+        now: Instant,
+        packets: &[Box<dyn rtcp::Packet>],
+        local: Option<interceptor::LocalKeyFrameRequest>,
+    ) {
+        use crate::peer_connection::event::{RTCKeyFrameRequestEvent, RTCKeyFrameRequestOrigin};
         use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
         use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
-        let mut requested: Vec<u32> = Vec::new();
+        let mut requested: Vec<(u32, RTCKeyFrameRequestOrigin)> = Vec::new();
         for packet in packets {
             let any = packet.as_any();
             if let Some(pli) = any.downcast_ref::<PictureLossIndication>() {
-                requested.push(pli.media_ssrc);
+                let origin = local.map_or(
+                    RTCKeyFrameRequestOrigin::RemotePictureLossIndication,
+                    RTCKeyFrameRequestOrigin::Local,
+                );
+                requested.push((pli.media_ssrc, origin));
             } else if let Some(fir) = any.downcast_ref::<FullIntraRequest>() {
-                requested.extend(fir.fir.iter().map(|entry| entry.ssrc));
+                let origin = local.map_or(
+                    RTCKeyFrameRequestOrigin::RemoteFullIntraRequest,
+                    RTCKeyFrameRequestOrigin::Local,
+                );
+                requested.extend(fir.fir.iter().map(|entry| (entry.ssrc, origin)));
             }
         }
-        for ssrc in requested {
+        for (ssrc, origin) in requested {
             let found = self
                 .rtp_transceivers
                 .iter()
@@ -1879,13 +1941,25 @@ impl<'a> InterceptorHandler<'a> {
                         .map(|e| (id, e.rtp_coding_parameters.rid.clone()))
                 });
             if let Some((id, rid)) = found {
+                let sender = crate::rtp_transceiver::RTCRtpSenderId::from(id);
+                let rid = (!rid.is_empty()).then_some(rid);
                 self.ctx.event_outs.push_back(TaggedRTCEventInternal {
                     now,
                     event: RTCEventInternal::RTCPeerConnectionEvent(
                         RTCPeerConnectionEvent::OnKeyFrameRequest {
-                            sender: crate::rtp_transceiver::RTCRtpSenderId::from(id),
-                            rid: (!rid.is_empty()).then_some(rid),
+                            sender,
+                            rid: rid.clone(),
                         },
+                    ),
+                });
+                self.ctx.event_outs.push_back(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::RTCPeerConnectionEvent(
+                        RTCPeerConnectionEvent::OnKeyFrameRequestOrigin(RTCKeyFrameRequestEvent {
+                            sender,
+                            rid,
+                            origin,
+                        }),
                     ),
                 });
             }
@@ -2594,7 +2668,11 @@ impl<'a>
                 match &packet.message.packet {
                     Packet::Rtcp(rtcp_packet) => {
                         trace!("Interceptor forwarded a RTCP packet {:?}", rtcp_packet);
-                        self.announce_key_frame_requests(packet.now, rtcp_packet);
+                        let local = packet
+                            .message
+                            .custom::<interceptor::LocalKeyFrameRequest>()
+                            .copied();
+                        self.announce_key_frame_requests(packet.now, rtcp_packet, local);
                     }
                     // Media on its way to the application: its sources are the receiver's
                     // synchronization and contributing sources from now on.
@@ -2800,6 +2878,10 @@ mod interceptor_early_media_test;
 #[cfg(test)]
 #[path = "interceptor_circuit_breaker_test.rs"]
 mod interceptor_circuit_breaker_test;
+
+#[cfg(test)]
+#[path = "interceptor_key_frame_request_test.rs"]
+mod interceptor_key_frame_request_test;
 
 /// The octets SRTCP adds to a compound packet under `context`'s profile (RFC 3711 section
 /// 3.3 and 3.4, RFC 7714 section 9): the E flag and SRTCP index, and the HMAC or AEAD tag. No

@@ -1,7 +1,7 @@
 //! Every secret of a DTLS association is erased when it is no longer needed: RFC 5246 section
 //! 8.1 (the premaster secret "should be deleted from memory once the master_secret has been
 //! computed"), RFC 8446 section 7.1 (a secret "SHOULD be erased" once what derives from it is
-//! computed), RFC 7714 section 13.1 and RFC 3711 section 9.3 for the SRTP keys a DTLS-SRTP
+//! computed), RFC 7714 section 13.1 for the SRTP keys a DTLS-SRTP
 //! association exports (RFC 5764 section 4.2), and the project's rule that memory a secret was
 //! in is overwritten before it is freed.
 //!

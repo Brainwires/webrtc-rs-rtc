@@ -35,8 +35,6 @@ states something true and checkable.
 | `setting` | The clause's behaviour is implemented and has a test that fails without it; it is selected by the named setting; the default differs because the named browser cell or deployed peer cannot interoperate with it. |
 | `conflict` | Two specifications conflict for this endpoint: the clause's behaviour is implemented and has a test that fails without it, selected by the named setting; the other specification's form, which governs this endpoint (a W3C specification of the JavaScript API the engine is under, or RFC 9429 for a JSEP endpoint), is the default and has a test of its own. |
 | `setting` | The clause's behaviour is implemented and has a test that fails without it; it is selected by the named setting; the default differs because the named browser cell or deployed peer cannot interoperate with it, or because a named test of the repository measured it worse ("measured", below). |
-| `setting` | The clause's behaviour is implemented and has a test that fails without it; it is selected by the named setting; the default differs because the named browser cell or deployed peer cannot interoperate with it, or because a named test of the repository measured it worse ("measured", below). |
-| `conflict` | Two specifications conflict for this endpoint: the clause's behaviour is implemented and has a test that fails without it, selected by the named setting; the other specification's form, which governs this endpoint (a W3C specification of the JavaScript API the engine is under, or RFC 9429 for a JSEP endpoint), is the default and has a test of its own. |
 | `untested` | Implemented, no such test (or the test is hollow: it asserts constants or mocks the unit). |
 | `partial` | Some of it is implemented; the note says what is missing. |
 | `missing` | Not implemented. A clause listed as "Not implemented, on purpose" is still `missing`. |
@@ -90,6 +88,20 @@ interoperable form. A new `setting` row's setting needs a `StrictRfc` value in
 `src/peer_connection/configuration/behaviour_profile.rs`: the profile's completeness test fails a
 setting that has no entry there. `StrictRfc` does not interoperate with browsers; it exists to run
 the RFC forms together.
+
+## Contradictions
+
+Where a specification contradicts itself or another specification (a `conflict` row, a
+standing departure in `docs/conformance.md`, or a note that records an ambiguity), the default
+and the row's wording follow the current draft work of the people who maintain it, not our own
+reading (owner rule, 2026-11-27): the W3C editor's draft with its merged pull requests, candidate
+corrections and issue resolutions; the IETF working group's "bis" Internet-Draft and tracker;
+the RFC's errata. A note cites it by correction number, PR, issue or draft version, with its
+date ("Candidate Correction 37, w3c/webrtc-pc PR #2794, 2022-12-08"), and says so plainly when no
+draft work exists. `docs/conformance/draft-work.md` is the register of these: each entry quotes
+the clauses, the draft work and its date, and whether the default matches it. A row that moves
+to or from `conflict`, or a new departure, gets an entry there. The register is re-checked before
+each release (`docs/releasing.md`).
 
 ## Classes of the open MUST rows
 

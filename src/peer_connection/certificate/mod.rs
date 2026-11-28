@@ -548,8 +548,15 @@ impl RTCCertificate {
     ///
     /// # Errors
     ///
-    /// Returns an error for any other key type, if no built-in crypto provider is enabled, or
-    /// if the provider cannot import the key.
+    /// Returns an error for any other key type, or if the provider cannot import the key.
+    ///
+    /// Only with a built-in provider (feature `crypto-ring` or `crypto-aws-lc-rs`): rcgen's
+    /// `KeyPair` exists only with an rcgen crypto backend, which those features turn on. Without
+    /// one, generate through the application's provider ([`generate`](Self::generate),
+    /// [`generate_certificate`](Self::generate_certificate)) or wrap a key it holds
+    /// ([`generate_from_signing_key`](Self::generate_from_signing_key),
+    /// [`from_signing_key`](Self::from_signing_key), [`from_pkcs8`](Self::from_pkcs8)).
+    #[cfg(any(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
     pub fn from_key_pair(key_pair: rcgen::KeyPair) -> Result<Self> {
         let scheme = if key_pair.is_compatible(&rcgen::PKCS_ED25519) {
             SignatureScheme::Ed25519

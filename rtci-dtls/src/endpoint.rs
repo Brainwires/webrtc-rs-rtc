@@ -339,9 +339,8 @@ impl Endpoint {
             // `current_retransmit_timer` on the completed path, so `handle_timeout` cannot fire
             // for it either. `handshake_timeout`'s Finished branch regenerates the flight — with
             // fresh record sequence numbers, since a verbatim replay would be dropped by the
-            // peer's replay window (4.1.2.6) — under the existing retransmission budget.
-            // Clear `handshake_rx` first so
-            // that retransmission re-sends the buffered flight instead of re-parsing the whole
+            // peer's replay window (4.1.2.6) — once per repeat, for FINAL_FLIGHT_ANSWER_PERIOD
+            // (240 s) after the handshake. Clear `handshake_rx` first so that retransmission re-sends the buffered flight instead of re-parsing the whole
             // transcript in `finish()`.
             conn.handshake_rx = None;
             conn.handshake_timeout(now)?;
@@ -1649,42 +1648,60 @@ mod tests {
         Ok(())
     }
 
+    /// RFC 6347 4.2.4: "for at least twice the default MSL defined for [TCP], when in the
+    /// FINISHED state, the node that transmits the last flight [...] MUST respond to a
+    /// retransmit of the peer's last flight with a retransmit of the last flight." Twelve
+    /// authenticated repeats of the peer's last flight (more than the seven of
+    /// `DEFAULT_MAXIMUM_RETRANSMIT_NUMBER`), spread over the 220 s after the handshake, are
+    /// each answered with one retransmission of the same size; one 245 s after it is not
+    /// answered, and the association stays up. Both roles.
     #[cfg(feature = "crypto-ring")]
     #[test]
-    fn authenticated_finished_repeats_still_obey_the_retry_budget() -> Result<()> {
+    fn authenticated_finished_repeats_are_answered_for_twice_the_msl() -> Result<()> {
         for client_receives in [true, false] {
             let (mut client, mut server) = completed_client_and_server()?;
+            let completed = Instant::now();
             let (receiver, sender, receiver_addr, sender_addr) = if client_receives {
                 (&mut client, &mut server, client_addr(), server_addr())
             } else {
                 (&mut server, &mut client, server_addr(), client_addr())
             };
             let repeats = DEFAULT_MAXIMUM_RETRANSMIT_NUMBER + 5;
+            // The sender makes its genuine repeats however many are asked for.
             sender
                 .connections
                 .get_mut(&receiver_addr)
                 .unwrap()
                 .maximum_retransmit_number = repeats;
-            let mut answered = 0;
+            let mut answers = vec![];
             for index in 0..repeats {
+                let at = completed + Duration::from_secs(20 * index as u64);
                 for datagram in repeat_cached_flight(sender, receiver_addr)? {
-                    receiver.read(Instant::now(), sender_addr, None, datagram)?;
+                    receiver.read(at, sender_addr, None, datagram)?;
                 }
-                let mut produced = false;
+                let mut datagrams = 0;
                 while receiver.poll_transmit().is_some() {
-                    produced = true;
+                    datagrams += 1;
                 }
-                if produced {
-                    answered += 1;
-                }
-                if index >= DEFAULT_MAXIMUM_RETRANSMIT_NUMBER {
-                    assert!(
-                        !produced,
-                        "the receiver stops answering after its retry budget"
-                    );
-                }
+                answers.push(datagrams);
             }
-            assert_eq!(answered, DEFAULT_MAXIMUM_RETRANSMIT_NUMBER);
+            let role = if client_receives { "client" } else { "server" };
+            assert!(
+                answers.iter().all(|datagrams| *datagrams > 0),
+                "{role}: every repeat within 240 s is answered: {answers:?}"
+            );
+            assert!(
+                answers.iter().all(|datagrams| *datagrams == answers[0]),
+                "{role}: one retransmission per repeat: {answers:?}"
+            );
+            let late = completed + Duration::from_secs(245);
+            for datagram in repeat_cached_flight(sender, receiver_addr)? {
+                receiver.read(late, sender_addr, None, datagram)?;
+            }
+            assert!(
+                receiver.poll_transmit().is_none(),
+                "{role}: a repeat 245 s after the handshake is not answered"
+            );
             assert!(receiver.connections[&sender_addr].is_handshake_completed());
         }
         Ok(())

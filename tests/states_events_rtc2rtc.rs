@@ -66,15 +66,23 @@ struct Peer {
 
 impl Peer {
     fn new(addr: SocketAddr, role: RTCDtlsRole, now: Instant) -> Result<Self> {
+        Self::with_settings(addr, role, now, |s| s)
+    }
+
+    /// [`Peer::new`] with `settings` applied to its setting engine.
+    fn with_settings(
+        addr: SocketAddr,
+        role: RTCDtlsRole,
+        now: Instant,
+        settings: impl FnOnce(SettingEngineBuilder) -> SettingEngineBuilder,
+    ) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
         let pc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_media_engine(media_engine)
             .with_setting_engine(
-                SettingEngineBuilder::new()
-                    .with_answering_dtls_role(role)
-                    .build(),
+                settings(SettingEngineBuilder::new().with_answering_dtls_role(role)).build(),
             )
             .build(now)?;
         Ok(Self {
@@ -311,11 +319,15 @@ fn transport_state_events_come_before_the_connection_events_they_cause() -> Resu
         );
     }
 
-    // The link goes: consent lapses (RFC 7675), the transport is disconnected, then failed.
+    // The link goes: consent lapses (RFC 7675), the transport is disconnected. With no
+    // end-of-candidates on either side it stays so (W3C 5.6.4: "failed" needs the transport to
+    // have "finished gathering, received an indication that there are no more remote
+    // candidates"; until then "disconnected"), past the consent expiry and the checking
+    // timeout: the run ends at its deadline, 120 s on.
     let before = offerer.events.len();
     offerer.cut = true;
     answerer.cut = true;
-    run(&mut offerer, &mut answerer, now, now, |a, _| {
+    let now = run(&mut offerer, &mut answerer, now, now, |a, _| {
         a.pc.ice_connection_state() == RTCIceConnectionState::Failed
     })?;
     offerer.drain_events();
@@ -326,9 +338,126 @@ fn transport_state_events_come_before_the_connection_events_they_cause() -> Resu
         "{labels:?}"
     );
     assert!(
+        !labels.iter().any(|l| l.ends_with(":failed")),
+        "failed without the end of the candidates: {labels:?}"
+    );
+    assert_eq!(
+        offerer.pc.ice_connection_state(),
+        RTCIceConnectionState::Disconnected
+    );
+
+    // The application ends its gathering and relays the peer's end-of-candidates: "failed"
+    // comes, in the same order.
+    let before = offerer.events.len();
+    offerer
+        .pc
+        .add_local_candidate(RTCIceCandidateInit::default())?;
+    offerer.pc.add_remote_candidate(RTCIceCandidateInit {
+        sdp_mid: Some("0".to_owned()),
+        ..Default::default()
+    })?;
+    run(&mut offerer, &mut answerer, now, now, |a, _| {
+        a.pc.ice_connection_state() == RTCIceConnectionState::Failed
+    })?;
+    offerer.drain_events();
+    let labels: Vec<String> = offerer.events[before..].iter().filter_map(label).collect();
+    assert!(
         position(&labels, "ice-transport:failed") < position(&labels, "ice:failed")
             && position(&labels, "ice:failed") < position(&labels, "connection:failed"),
         "{labels:?}"
+    );
+    Ok(())
+}
+
+/// W3C 5.6.4: "The failed and completed states require an indication that there are no
+/// additional remote candidates. This can be indicated by calling addIceCandidate with a
+/// candidate value whose candidate property is set to an empty string or by
+/// canTrickleIceCandidates being set to false." The answerer receives an offer without
+/// `a=ice-options:trickle` (`canTrickleIceCandidates` false) and ends its own gathering; the
+/// offerer does not end its gathering (its answer, which repeats only the options the offer
+/// had, RFC 9429 section 5.3.1, says no `trickle` either, so the offerer has the remote
+/// indication but not its own). The link is cut: the answerer's transport fails, the
+/// offerer's stays "disconnected".
+#[test]
+fn a_peer_that_cannot_trickle_is_the_indication_that_no_candidate_is_to_come() -> Result<()> {
+    let start = Instant::now();
+    let mut offerer = Peer::new("127.0.0.1:51120".parse()?, RTCDtlsRole::Client, start)?;
+    let mut answerer = Peer::new("127.0.0.1:51121".parse()?, RTCDtlsRole::Server, start)?;
+    offerer.pc.create_data_channel("probe", None)?;
+    let without_trickle = |sdp: String| {
+        sdp.lines()
+            .filter(|line| !line.starts_with("a=ice-options:"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            + "\r\n"
+    };
+    negotiate(&mut offerer, &mut answerer, start, without_trickle)?;
+    assert_eq!(answerer.pc.can_trickle_ice_candidates(), Some(false));
+    answerer
+        .pc
+        .add_local_candidate(RTCIceCandidateInit::default())?;
+    let connected = |p: &Peer| p.pc.connection_state() == RTCPeerConnectionState::Connected;
+    let now = run(&mut offerer, &mut answerer, start, start, |a, b| {
+        connected(a) && connected(b)
+    })?;
+    assert_eq!(
+        answerer.pc.ice_connection_state(),
+        RTCIceConnectionState::Completed,
+        "nothing to come on either side for the answerer"
+    );
+
+    offerer.cut = true;
+    answerer.cut = true;
+    run(&mut offerer, &mut answerer, now, now, |_, b| {
+        b.pc.ice_connection_state() == RTCIceConnectionState::Failed
+    })?;
+    assert_eq!(
+        answerer.pc.ice_connection_state(),
+        RTCIceConnectionState::Failed
+    );
+    assert_eq!(
+        offerer.pc.ice_connection_state(),
+        RTCIceConnectionState::Disconnected
+    );
+    Ok(())
+}
+
+/// `SettingEngineBuilder::with_ice_failed_without_end_of_candidates(true)` (the `Chrome`
+/// profile, libwebrtc's form; RFC 8863 section 5: the PAC timer as the end-of-candidates
+/// fallback): with nothing signalled, a cut link fails both transports once consent has
+/// lapsed and the PAC timer (39.5 s) has expired.
+#[test]
+fn a_cut_link_fails_without_the_end_of_candidates_when_set_to() -> Result<()> {
+    let start = Instant::now();
+    let mut offerer = Peer::with_settings(
+        "127.0.0.1:51130".parse()?,
+        RTCDtlsRole::Client,
+        start,
+        |s| s.with_ice_failed_without_end_of_candidates(true),
+    )?;
+    let mut answerer = Peer::with_settings(
+        "127.0.0.1:51131".parse()?,
+        RTCDtlsRole::Server,
+        start,
+        |s| s.with_ice_failed_without_end_of_candidates(true),
+    )?;
+    offerer.pc.create_data_channel("probe", None)?;
+    negotiate(&mut offerer, &mut answerer, start, |sdp| sdp)?;
+    let connected = |p: &Peer| p.pc.connection_state() == RTCPeerConnectionState::Connected;
+    let now = run(&mut offerer, &mut answerer, start, start, |a, b| {
+        connected(a) && connected(b)
+    })?;
+    offerer.cut = true;
+    answerer.cut = true;
+    let failed = |p: &Peer| p.pc.ice_connection_state() == RTCIceConnectionState::Failed;
+    let at = run(&mut offerer, &mut answerer, now, now, |a, b| {
+        failed(a) && failed(b)
+    })?;
+    assert!(failed(&offerer) && failed(&answerer));
+    assert!(
+        at.duration_since(start) >= Duration::from_millis(39_500),
+        "not before the PAC timer: {:?}",
+        at.duration_since(start)
     );
     Ok(())
 }
@@ -817,6 +946,10 @@ fn ice_candidate_errors_follow_the_spec_rules() -> Result<()> {
         })
         .collect();
     assert_eq!(errors.len(), 2, "701 once per URL: {errors:?}");
+    // 4.8.3 url: "the STUN or TURN URL that identifies the STUN or TURN server for which the
+    // failure occurred", each event its own.
+    assert_eq!(errors[0].url, "stun:stun.example.org");
+    assert_eq!(errors[1].url, "turn:turn.example.org");
     assert_eq!(errors[0].address, "10.0.0.1", "an exposed address is given");
     assert_eq!(
         (errors[1].address.as_str(), errors[1].port),

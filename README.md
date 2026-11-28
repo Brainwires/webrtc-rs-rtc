@@ -49,26 +49,29 @@ whole session reproducible in a test without a socket or a sleep.
 
 ## Status
 
-As of 2026-11-26 the workspace is audited clause by clause against 111 specifications (the W3C WebRTC
+As of 2026-11-26 the workspace is audited clause by clause against 113 specifications (the W3C WebRTC
 API, statistics, extensions, encoded transform and SVC specifications, and the IETF RFCs and drafts
 WebRTC uses); every row names the code and the test that proves it. From
 [docs/conformance/audit/COUNTS.md](docs/conformance/audit/COUNTS.md), of the rows that bind this engine:
 
 | Level | Rows that apply | RFC behaviour tested | Tested as the default |
 | --- | ---: | ---: | ---: |
-| MUST | 5094 | 5064 (99.4 %) | 5032 (98.8 %) |
-| SHOULD | 988 | 922 (93.3 %) | 916 (92.7 %) |
-| MAY | 605 | 501 (82.8 %) | 500 (82.6 %) |
+| MUST | 5098 | 5095 (99.9 %) | 5057 (99.2 %) |
+| SHOULD | 988 | 925 (93.6 %) | 919 (93.0 %) |
+| MAY | 605 | 503 (83.1 %) | 501 (82.8 %) |
 
 "RFC behaviour tested" includes the clauses whose RFC behaviour is selected by a named setting because a
-browser or a deployed peer cannot interoperate with it by default. 30 MUST rows are open (17 untested,
-11 partial, 2 missing, none violated); each, with its class and reason, is in [docs/conformance/audit/OPEN-MUST.md](docs/conformance/audit/OPEN-MUST.md); what
-is not implemented on purpose is in [docs/conformance.md](docs/conformance.md). Three defaults depart from a MUST by the
-owner's decision, not for interoperability, and are listed in docs/conformance.md ("Standing departures from a MUST"),
-each with the setting that gives the RFC form (the `StrictRfc` profile sets all three): the H.264 de-interleaving order
-(**this default does not follow RFC 6184 section 7.2**: PDON does not start at 0, which would deliver a stream's DON 0
-last), the RTP circuit breaker's packet size (RFC 8083 section 3), and an answer with RTCP feedback its offer lacked,
-which is applied rather than refused (**this default does not follow RFC 9429 section 5.11**). Known issues are tracked
+browser or a deployed peer cannot interoperate with it by default. 3 MUST rows are open (0 untested,
+3 partial, 0 missing, none violated); each, with its class and reason, is in [docs/conformance/audit/OPEN-MUST.md](docs/conformance/audit/OPEN-MUST.md); what
+is not implemented on purpose is in [docs/conformance.md](docs/conformance.md). Three defaults depart from a MUST by
+the owner's decision, not for interoperability, and are listed in docs/conformance.md ("Standing departures from a
+MUST"), each with the setting that gives the RFC form (the `StrictRfc` profile sets all three): the H.264
+de-interleaving order (**this default does not follow RFC 6184 section 7.2**: PDON does not start at 0, which would
+deliver a stream's DON 0 last; `MediaEngine::set_h264_literal_pdon(true)`), the formats of an answer (RFC 9429
+section 5.3.1, whose "MUST be added after all existing formats" the next bullet's "MAY include formats that are
+locally supported but not present in the offer" contradicts: answers list only the offered formats;
+`SettingEngineBuilder::with_answer_offered_formats_only(false)`) and the RTP circuit breaker's packet size (RFC 8083
+section 3; `DefaultInterceptorOptions::circuit_breaker_packet_size`, the `LastFrames` form). Known issues are tracked
 in the repository's [issues](https://github.com/Brainwires/rtci/issues), security problems as
 [SECURITY.md](SECURITY.md) describes.
 
@@ -130,6 +133,44 @@ and an Allocate still under way is followed and its allocation deleted. Each one
 socket is free for another connection, whose Allocate on the same 5-tuple would otherwise be
 refused with 437 while the old allocation lives (up to its lifetime, 10 minutes by default).
 Dropping a connection without `close()` sends nothing.
+
+TURN credentials that expire (a TURN REST API username, `<expiry>:<id>`) are rotated on a live
+connection with `rotate_ice_servers(now, servers)` and one offer / answer round: the peer sees an
+ICE restart (same connection, new ice-ufrag, same DTLS fingerprint). For no gap, bind a second
+UDP socket and add its host candidate after `create_offer` and before `set_local_description`
+of the restart offer: the new allocation is made from it, the old one relays until the new pair
+carries the data and is then deleted, and `OnTurnAllocationReleased` names the old socket, which
+the application may then close. With one socket the old allocation is released first
+(`OnTurnAllocationReplacedInPlace`). After the restart, re-send your host candidates to the peer
+(a candidate kept across the restart is not announced again).
+
+**Re-allocating on the same socket after a release.** A TURN allocation is its 5-tuple's (RFC
+8656 section 2.2), and an Allocate on a 5-tuple that still has one is refused with 437 (section
+7.2). On a 437 the client "SHOULD pick another client transport address", tries three, and then
+"SHOULD NOT try to create another allocation on the server for 2 minutes" (section 7.4), so no
+client retries on the refused 5-tuple. RFC 8656 section 8.2 has the server delete an allocation
+as soon as it answers the Refresh of LIFETIME 0; coturn does not: it answers, keeps the
+allocation for one more second (`refresh_relay_connection` floors the lifetime at 1 s) and
+answers an Allocate on that 5-tuple meanwhile with 437. Observed live (a consumer, 2026-11-27,
+production coturn): on two back-to-back restarts an Allocate about 140 ms after a confirmed
+release got 437 and one 3.0 s later succeeded, both times.
+- *Engine-run TURN* (`RelayGathering::Engine`, the default): within one peer connection (an ICE
+  restart with new TURN credentials and one UDP socket) the engine allocates again on a released
+  5-tuple only once the server has answered the release, and
+  `SettingEngineBuilder::with_turn_reallocation_delay` makes it wait longer after that answer
+  (2 s covers coturn; the default, zero, is RFC 8656's). On a 437 it raises
+  `OnTurnRequestRejected { method: "Allocate", error_code: 437, .. }`, moves the Allocate to
+  another UDP host candidate's base of the transport if there is one (up to three), and
+  otherwise leaves that server alone for two minutes: that ICE generation has no relayed
+  candidate from it, and an ICE restart after the two minutes allocates again. A *new* peer
+  connection on the socket of one that was closed does not know of the old one's release:
+  after `OnTurnAllocationReleased` wait for the server's hold (2 s for coturn) before it
+  gathers, or give it another UDP socket (a second host candidate) as well.
+- *Application-run TURN* (`RelayGathering::Application`, your own `rtci::turn::client::Client`):
+  the same rules are yours. Delete with `Relay::close` and wait for
+  `Event::AllocationReleased`, then for the server's hold, before an `allocate` from the same
+  local address to the same server; on an `AllocateError` with code 437, allocate from another
+  socket, or leave the server for two minutes.
 
 `handle_event` is also part of the trait, but `RTCEvent` is currently uninhabited: no value of it can be constructed,
 so there is nothing to call it with. It exists so the signature is already right when the first inbound event variant
@@ -343,6 +384,10 @@ server URI without a port the engine first asks for its NAPTR and SRV records
 back-pressure signal: the engine holds a window of unacknowledged bytes per connection.
 `SettingEngineBuilder::with_tcp_candidate_gathering(false)` keeps the engine's TCP off; an
 application that never polls the stream interface gets no TCP candidate and nothing changes.
+Poll it before adding the end of candidates: the end of gathering waits for the listeners only
+of an application that has served the interface; one that ends its candidates first gets no TCP
+candidate (none may follow the end of candidates, RFC 8838 section 13), a warning in the log,
+and a `StopListening` after each `Listen` once it does poll.
 
 **What is engine and what is driver.** The engine (`rtci`) decides and runs every protocol:
 which TCP candidates exist, which connections to open and when to close them, RFC 4571 and
@@ -365,6 +410,7 @@ The driver also has the socket choices a server makes:
 | One UDP port for many peer connections | `sockets::UfragMux`: register every `pc.ice_username_fragments()` entry after each local description; `route(from, datagram)` picks the connection |
 | One passive ICE-TCP port for many peer connections | `DriverConfig::shared_passive`, `sockets::accept_by_ufrag`, then `StreamDriver::adopt_shared` on the connection the first check names |
 | Which local addresses get candidates | `sockets::AddressFilter` (`bind_addresses`, `include_loopback`, `include_link_local`, `interface_filter`, `ip_filter`) and `local_addresses()` |
+| mDNS on loopback on Windows (off by default: it leaves the group's route on loopback for the whole host) | `PeerDriverConfig::mdns_on_loopback_on_windows` |
 | SRV / NAPTR lookups and per-family answers | feature `dns-records` (hickory-resolver) |
 | A server behind a 1:1 NAT | `SettingEngineBuilder::with_nat_1to1_ips(vec![external_ip], RTCIceCandidateType::Host)` (or `Srflx` to add a server-reflexive candidate beside each host one); it applies to the engine's TCP candidates too |
 
@@ -573,6 +619,14 @@ more than one m= section (nor, by the same rule, a `balanced` offer with two sec
 `SettingEngineBuilder::with_bundle_only_sections_in_browser_form(true)` alone, or `balanced`
 with one section of each type. Offers from browsers and answers are not affected.
 
+**Answers list the offered formats only (since 0.3.0).** Without codec preferences, an answer lists the offered
+formats this endpoint supports, in the offer's order, as every browser answers (RFC 9429 5.3.1: the answer "MAY include
+formats that are locally supported but not present in the offer"). Up to 0.2.x it also listed every other media format
+registered for the kind after them, the literal reading of the bullet before ("MUST be added after all existing
+formats"), and received on them; `SettingEngineBuilder::with_answer_offered_formats_only(false)`, or the `StrictRfc`
+profile, still answers that way. The two bullets of RFC 9429 5.3.1 contradict each other; the choice and its reasons
+are a standing departure in [docs/conformance.md](docs/conformance.md).
+
 **At run time**, `SettingEngineBuilder::with_behaviour_profile`, `MediaEngine::for_profile` and
 `DefaultInterceptorOptions::for_profile` select a profile for one peer connection; `BehaviourProfile::from_name` reads
 one from configuration. **At build time**, two cargo features of `rtci` change `BehaviourProfile::default()`, and with it
@@ -723,6 +777,20 @@ fn add_video(
     Ok(pc.add_track(track)?)
 }
 ```
+
+The engine does not encode: the application writes RTP with `RTCRtpSender::write_rtp`. What it
+sends is the codec negotiated for the sender, the first media codec of
+`RTCRtpSender::get_parameters().rtp_parameters.codecs`, with that codec's payload type (the
+remote description's number, RFC 3264 section 5.1). A remote description changes it, so after
+applying an answer (or, when answering, an offer) the application reads it again and encodes
+that codec, rather than keeping the encoder it chose from `setCodecPreferences` or its own
+offer. A packet written with a payload type that is not negotiated is sent with the negotiated
+one: `write_rtp` rewrites the number, never the payload, so bytes of another codec would go out
+labelled as the negotiated one. Each rewrite is counted:
+`RTCRtpSender::rewritten_payload_type_rtp_packets()` (every rewrite, the same codec renumbered
+included) and `RTCRtpSender::rewritten_from_another_codec_rtp_packets()` (the written number
+names a different format), summed on the connection by the `RTCPeerConnection` methods of the
+same names. An application's tests can assert the second stays 0.
 
 ### Statistics
 

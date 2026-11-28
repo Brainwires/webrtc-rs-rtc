@@ -2094,6 +2094,37 @@ fn the_server_hello_has_its_own_random_and_legacy_version_fefd() -> Result<()> {
     Ok(())
 }
 
+/// RFC 9147 section 5: "DTLS servers MUST NOT echo the "legacy_session_id" value from the
+/// client" (no TLS 1.3 compatibility mode). A client that cached a session id of a DTLS 1.2
+/// server sends it (section 5.3); this one's ClientHello is given a full 32-byte id. The
+/// ServerHello (no cookie exchange) and the HelloRetryRequest (cookie exchange) both carry an
+/// empty legacy_session_id_echo, byte 34 of the body.
+#[test]
+fn the_server_echoes_no_legacy_session_id() -> Result<()> {
+    for cookie_exchange in [false, true] {
+        let answer = server_answers(
+            server_builder().with_cookie_exchange(cookie_exchange),
+            |hello| hello.session_id = vec![0x5e; 32],
+        )?;
+        assert!(!answer.is_empty(), "cookies: {cookie_exchange}: answered");
+        let (handshake_type, _, body, _) = first_message(&answer[0]);
+        assert_eq!(handshake_type, messages::SERVER_HELLO);
+        let hello = ServerHello::parse(&body).expect("a ServerHello");
+        assert_eq!(
+            hello.legacy_session_id_echo,
+            &[] as &[u8],
+            "cookies: {cookie_exchange}: the session id is not echoed"
+        );
+        assert_eq!(body[34], 0, "cookies: {cookie_exchange}");
+        assert_eq!(
+            hello.random == messages::HELLO_RETRY_REQUEST_RANDOM,
+            cookie_exchange,
+            "a HelloRetryRequest exactly when the server asks for a cookie"
+        );
+    }
+    Ok(())
+}
+
 /// The cookie a ClientHello carries, in the legacy_cookie field (DTLS 1.2) or the cookie
 /// extension (DTLS 1.3), if any.
 fn cookie_of(datagram: &[u8]) -> Option<Vec<u8>> {

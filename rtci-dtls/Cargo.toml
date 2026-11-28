@@ -49,6 +49,11 @@ anyhow.workspace = true
 ctrlc.workspace = true
 futures.workspace = true
 
+# tests/key_residue.rs runs DTLS key handling on threads whose stacks the test maps itself
+# (mmap, pthread_attr_setstack; the module is rtci-srtp's tests/owned_stack).
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 #[[example]]
 #name = "dtls_chat_server"
 #path = "examples/dtls_chat_server.rs"

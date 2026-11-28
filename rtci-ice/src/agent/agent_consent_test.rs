@@ -113,15 +113,17 @@ fn test_peer_requests_alone_do_not_keep_consent() {
         let _ = a.handle_inbound(now, &mut req, 0, remote);
         let _ = sent_requests(&mut a); // our checks go unanswered
         a.validate_selected_pair(now);
-        if a.connection_state == ConnectionState::Failed {
+        if a.get_selected_candidate_pair().is_none() {
             break;
         }
     }
-    assert_eq!(
-        a.connection_state,
-        ConnectionState::Failed,
+    // Consent expired: the pair is no longer used (`Failed`, or `Disconnected` while the end
+    // of the candidates or the PAC timer is awaited, W3C webrtc-pc 5.6.4).
+    assert!(
+        a.get_selected_candidate_pair().is_none() && a.media_path().is_none(),
         "the peer's own requests kept consent alive"
     );
+    assert_ne!(a.connection_state, ConnectionState::Connected);
 }
 
 #[test]

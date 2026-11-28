@@ -511,7 +511,18 @@ async fn run(
     });
 
     let mut buf = vec![0; 2000];
+    // The browser page sends only its description, never the end of its candidates, so the
+    // transport cannot become "failed" (W3C webrtc-pc 5.6.4: "failed" needs the indication that
+    // there are no more remote candidates): a lost path stays "disconnected". This
+    // application gives up on its own after 30 s of it.
+    let mut disconnected_since: Option<Instant> = None;
     'EventLoop: loop {
+        if disconnected_since
+            .is_some_and(|since| since.elapsed() >= std::time::Duration::from_secs(30))
+        {
+            eprintln!("Peer Connection disconnected for 30 s: giving up. Exiting...");
+            break 'EventLoop;
+        }
         while let Some(msg) = peer_connection.poll_write() {
             match socket.send_to(&msg.message, msg.transport.peer_addr).await {
                 Ok(n) => {
@@ -536,6 +547,11 @@ async fn run(
                 }
                 RTCPeerConnectionEvent::OnConnectionStateChangeEvent(peer_connection_state) => {
                     println!("Peer Connection State has changed: {peer_connection_state}");
+                    if peer_connection_state == RTCPeerConnectionState::Disconnected {
+                        disconnected_since.get_or_insert_with(Instant::now);
+                    } else {
+                        disconnected_since = None;
+                    }
                     if peer_connection_state == RTCPeerConnectionState::Failed {
                         eprintln!("Peer Connection State has gone to failed! Exiting...");
                         break 'EventLoop;

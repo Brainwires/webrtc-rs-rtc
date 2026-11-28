@@ -5,14 +5,17 @@
 //!
 //! Key material: every struct holding secret key material derives `Zeroize` and
 //! `ZeroizeOnDrop`, or holds each secret in [`SecretVec`]; secret keys are drawn with
-//! [`RTCRandom::fill_secret`]; [`scrub_stack`] overwrites what building a key schedule left in
-//! dead stack frames. The RustCrypto primitives the built-in providers use (`aes`, `ctr`, the
-//! HMAC-SHA1 of the ring provider) erase their key schedules when dropped. ring's own key
-//! objects (AEAD, header-protection and HMAC keys) do not erase themselves, so the ring provider
-//! keeps each in an allocation of its own and overwrites it after the drop
-//! (`docs/key-erasure.md`).
+//! [`RTCRandom::fill_secret`]; [`on_erased_stack`] runs key set-up and overwrites the stack it
+//! ran on, and [`scrub_stack`] is the overwrite by itself. The RustCrypto primitives the
+//! built-in providers use (`aes`, `ctr`, and the `hmac` / `sha1` of the ring provider's
+//! HMAC-SHA1) erase their key schedules and hash states when dropped, and their keyed objects
+//! are used in place: an AES-CTR keystream runs over a reference to the boxed schedule, an
+//! HMAC-SHA1 is computed in the boxed keyed object. ring's own key objects (AEAD,
+//! header-protection and HMAC keys) do not erase themselves, so the ring provider keeps each in
+//! an allocation of its own and overwrites it after the drop (`docs/key-erasure.md`).
 
 mod algorithm;
+mod erased_stack;
 mod error;
 mod hkdf;
 #[cfg(feature = "openssl")]
@@ -38,6 +41,7 @@ pub mod conformance;
 pub mod fuzzing;
 
 pub use algorithm::*;
+pub use erased_stack::on_erased_stack;
 pub use error::CryptoError;
 pub use hkdf::{hkdf_expand, hkdf_expand_label, hkdf_extract};
 #[cfg(feature = "openssl")]

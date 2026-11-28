@@ -2200,9 +2200,10 @@ fn test_unauthenticated_traffic_does_not_refresh_consent() -> Result<()> {
         let _ = a.is_valid_non_stun_traffic(t(secs), transport);
         a.validate_selected_pair(t(secs));
     }
-    assert_eq!(
-        a.connection_state,
-        ConnectionState::Failed,
+    // Consent expired: the pair is no longer used (`Failed`, or `Disconnected` while the end
+    // of the candidates or the PAC timer is awaited, W3C webrtc-pc 5.6.4).
+    assert!(
+        a.get_selected_candidate_pair().is_none() && a.media_path().is_none(),
         "unauthenticated traffic kept consent alive"
     );
     Ok(())

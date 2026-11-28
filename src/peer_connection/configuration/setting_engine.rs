@@ -435,6 +435,7 @@ pub struct SettingEngine {
     pub(crate) timeout: Timeout,
     pub(crate) data_channel: DataChannel,
     pub(crate) turn_allocation_refresh_interval_cap: Option<Duration>,
+    pub(crate) turn_reallocation_delay: Duration,
     pub(crate) candidates: Candidates,
     pub(crate) ice: IceBehaviour,
     pub(crate) multicast_dns: MulticastDNS,
@@ -461,6 +462,8 @@ pub struct SettingEngine {
     pub(crate) msid_appdata_change_renews_track: bool,
     /// RFC 8830 section 3: a remote track whose SSRCs have all left (BYE, timeout) ends.
     pub(crate) source_departure_ends_track: bool,
+    /// [`SettingEngineBuilder::with_rtp_timeout_mutes_track`].
+    pub(crate) rtp_timeout_mutes_track: bool,
     /// RFC 9429 section 5.3.1: an answer rejects the section of a transceiver stopped after
     /// the offer arrived.
     pub(crate) stopping_transceiver_rejected_in_answer: bool,
@@ -487,6 +490,10 @@ pub struct SettingEngine {
     pub(crate) rtcp_mux_only_in_subsequent_offers: bool,
     /// [`SettingEngineBuilder::with_bundle_only_sections_in_browser_form`].
     pub(crate) bundle_only_sections_in_browser_form: bool,
+    /// [`SettingEngineBuilder::with_answer_offered_formats_only`].
+    pub(crate) answer_offered_formats_only: bool,
+    /// [`SettingEngineBuilder::with_answer_ice_options`].
+    pub(crate) answer_ice_options: AnswerIceOptions,
     /// [`SettingEngineBuilder::with_unique_transport_credentials`]: every transport of the
     /// connection gets ICE credentials of its own. The derived default `false` shares the first
     /// transport's.
@@ -540,6 +547,9 @@ pub struct SettingEngine {
     /// [`SettingEngineBuilder::with_sctp_handshake_timers_back_off_rto`]. `true` (the
     /// default) is RFC 9260 5.1's.
     pub(crate) sctp_handshake_timers_back_off_rto: bool,
+    /// [`SettingEngineBuilder::with_ice_failed_without_end_of_candidates`]. `false` (the
+    /// default) is W3C webrtc-pc 5.6.4's "failed".
+    pub(crate) ice_failed_without_end_of_candidates: bool,
     /// A message over 16 KB is refused on an association without message interleaving
     /// (RFC 8831 section 6.6). `None` is the default, on.
     pub(crate) sctp_message_size_limit_without_interleaving: Option<bool>,
@@ -567,8 +577,16 @@ pub struct SettingEngine {
     pub(crate) ignore_rid_pause_for_recv: bool,
     /// [`SettingEngineBuilder::with_rid_pause_marks`].
     pub(crate) rid_pause_marks: bool,
+    /// [`SettingEngineBuilder::with_published_rid_id_grammar`].
+    pub(crate) published_rid_id_grammar: bool,
     /// [`SettingEngineBuilder::with_rollback_content_ignored`].
     pub(crate) rollback_content_ignored: bool,
+    /// [`SettingEngineBuilder::with_rollback_resets_offer_created_senders`].
+    pub(crate) rollback_resets_offer_created_senders: bool,
+    /// [`SettingEngineBuilder::with_rejected_rids_kept_in_offers`].
+    pub(crate) rejected_rids_kept_in_offers: bool,
+    /// [`SettingEngineBuilder::with_remote_rid_renegotiation_refused`].
+    pub(crate) remote_rid_renegotiation_refused: bool,
     /// [`SettingEngineBuilder::with_strict_sdp_attribute_grammar`].
     pub(crate) strict_sdp_attribute_grammar: bool,
     /// [`SettingEngineBuilder::with_w3c_simulcast_answer`].
@@ -630,6 +648,37 @@ pub struct SettingEngine {
     pub(crate) dtls_flight_interval: DtlsFlightInterval,
 }
 
+/// What an answer's `a=ice-options` line says of the `trickle` and `ice2` options
+/// ([`SettingEngineBuilder::with_answer_ice_options`]). RFC 9429 section 5.3.1 and RFC 8840
+/// section 4.1.3, RFC 8445 section 10 and RFC 8839 section 4.3.2 disagree
+/// (`docs/conformance/spec-issues.md` row 28). Offers always say `trickle ice2` (RFC 9429
+/// sections 5.2.1 and 5.2.2); other options of the offer are never echoed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AnswerIceOptions {
+    /// RFC 9429 section 5.3.1: the line, "with the "trickle" option as specified in
+    /// [RFC8840], Section 4.1.3 and the "ice2" option as specified in [RFC8445], Section 10,
+    /// is only included if such an option was present in the offer". An offer with neither
+    /// gets no `a=ice-options` line (the attribute has at least one option, RFC 8839 section
+    /// 5.6); a browser's offer (`trickle`) gets `trickle`. The default: RFC 9429 governs a JSEP
+    /// endpoint, and its working group made the condition on `trickle` deliberate
+    /// (`rtcweb-wg/jsep#23`).
+    #[default]
+    AsOffered,
+    /// libwebrtc's answer: `trickle` whatever the offer had
+    /// (`p2p/base/transport_description_factory.cc`, `TransportDescriptionFactory::CreateAnswer`,
+    /// `desc->AddOption(ICE_OPTION_TRICKLE)`). libwebrtc never writes `ice2`; this engine is
+    /// RFC 8445 compliant and keeps saying so where the offer did (`ice2` as offered).
+    TrickleAlways,
+    /// RFC 8840 section 4.1.3 ("In any case, the Answerer MUST include the
+    /// "ice-options:trickle" attribute"), RFC 8445 section 10 ("An agent compliant to this
+    /// specification MUST inform the peer about the compliance using the 'ice2' option") and
+    /// RFC 8839 section 4.3.2: every answer says `trickle ice2`. The `StrictRfc` profile's
+    /// value (the RFC form of the `conflict` rows RFC8839-4.3.2-3, RFC8839-4.2.1.5-1 and
+    /// RFC8445-10-1).
+    Always,
+}
+
 /// How the first DTLS retransmission timer of a peer connection's handshake is chosen
 /// ([`SettingEngineBuilder::with_dtls_flight_interval`]). The timer doubles on each
 /// retransmission either way (RFC 9147 section 5.8.2, RFC 6347 section 4.2.4.1).
@@ -675,6 +724,7 @@ impl SettingEngine {
             timeout: Default::default(),
             data_channel: Default::default(),
             turn_allocation_refresh_interval_cap: Default::default(),
+            turn_reallocation_delay: Duration::ZERO,
             candidates: Default::default(),
             ice: Default::default(),
             multicast_dns: Default::default(),
@@ -683,7 +733,8 @@ impl SettingEngine {
             disable_sdp_tls_id: Default::default(),
             dtls_new_association_without_ice_restart: Default::default(),
             msid_removal_ends_track: Default::default(),
-            unoffered_feedback_refused: Default::default(),
+            // RFC 9429 section 5.11: such an answer "MUST result in an error".
+            unoffered_feedback_refused: true,
             stopping_transceiver_rejected_in_answer: Default::default(),
             dtls_use_srtp_only_with_media: Default::default(),
             accept_lowercase_fingerprints: Default::default(),
@@ -691,6 +742,8 @@ impl SettingEngine {
             max_bundle_ignored: Default::default(),
             rtcp_mux_only_in_subsequent_offers: false,
             bundle_only_sections_in_browser_form: false,
+            answer_offered_formats_only: true,
+            answer_ice_options: AnswerIceOptions::default(),
             unique_transport_credentials: Default::default(),
             separate_fec_sessions: false,
             explicit_rollback_only: Default::default(),
@@ -714,6 +767,7 @@ impl SettingEngine {
             sctp_rto: Default::default(),
             sctp_max_retransmissions: Default::default(),
             sctp_handshake_timers_back_off_rto: true,
+            ice_failed_without_end_of_candidates: false,
             sctp_message_size_limit_without_interleaving: Default::default(),
             data_channel_max_buffer_size: Default::default(),
             data_channel_send_before_ack: Default::default(),
@@ -724,7 +778,11 @@ impl SettingEngine {
             srtp_rekeying_both_at_warning: Default::default(),
             ignore_rid_pause_for_recv: Default::default(),
             rid_pause_marks: Default::default(),
+            published_rid_id_grammar: Default::default(),
             rollback_content_ignored: Default::default(),
+            rollback_resets_offer_created_senders: Default::default(),
+            rejected_rids_kept_in_offers: Default::default(),
+            remote_rid_renegotiation_refused: Default::default(),
             strict_sdp_attribute_grammar: Default::default(),
             w3c_simulcast_answer: Default::default(),
             nominated_candidates_only: Default::default(),
@@ -736,6 +794,7 @@ impl SettingEngine {
             // Train 11's fields, at the value the derive gave them.
             msid_appdata_change_renews_track: Default::default(),
             source_departure_ends_track: Default::default(),
+            rtp_timeout_mutes_track: Default::default(),
             bundled_fingerprints_agree: Default::default(),
             cryptex_required_on_every_bundled_section: Default::default(),
             dtls_connection_id_length: Default::default(),
@@ -814,6 +873,23 @@ impl SettingEngine {
     /// the server.
     pub fn turn_allocation_refresh_interval_cap(&self) -> Option<Duration> {
         self.turn_allocation_refresh_interval_cap
+    }
+
+    /// The `rid-id` grammar received lines are read with
+    /// ([`SettingEngineBuilder::with_published_rid_id_grammar`]).
+    pub(crate) fn rid_id_grammar(&self) -> sdp::attribute::RidIdGrammar {
+        if self.published_rid_id_grammar {
+            sdp::attribute::RidIdGrammar::Published
+        } else {
+            sdp::attribute::RidIdGrammar::Corrected
+        }
+    }
+
+    /// How long after the release of one of its TURN allocations over UDP the engine waits
+    /// before it allocates again from the same local address to the same server
+    /// ([`SettingEngineBuilder::with_turn_reallocation_delay`]; zero by default).
+    pub fn turn_reallocation_delay(&self) -> Duration {
+        self.turn_reallocation_delay
     }
 
     /// The SOFTWARE of the ICE agent's STUN messages, in the form of
@@ -1029,6 +1105,25 @@ impl SettingEngineBuilder {
     /// one second are rounded up by the TURN client.
     pub fn with_turn_allocation_refresh_interval_cap(mut self, cap: Duration) -> Self {
         self.0.turn_allocation_refresh_interval_cap = Some(cap);
+        self
+    }
+
+    /// Waits `delay` after the release of one of the engine's TURN allocations over UDP has
+    /// ended before allocating again on the same 5-tuple (the same local address to the same
+    /// server address), e.g. a restart with new TURN credentials and one UDP socket.
+    ///
+    /// The engine always waits for the server's answer to the release (its Refresh of
+    /// LIFETIME 0) before it allocates on that 5-tuple again: until then the allocation is
+    /// the 5-tuple's and an Allocate is refused with 437 (RFC 8656 section 7.2), after which
+    /// the client leaves the server alone for two minutes (section 7.4). RFC 8656 section 8.2
+    /// has the server delete the allocation at once, so zero (the default) is the RFC's
+    /// behaviour. Some servers keep the 5-tuple a little longer after answering: coturn turns
+    /// a requested lifetime of zero into a one-second timer (`refresh_relay_connection`) and
+    /// answers 437 until it fires; two seconds is enough there. It does not cover a new peer
+    /// connection on the socket of one that was closed: the new one does not know of the
+    /// old one's release (see the README, "re-allocating on the same socket after a release").
+    pub fn with_turn_reallocation_delay(mut self, delay: Duration) -> Self {
+        self.0.turn_reallocation_delay = delay;
         self
     }
 
@@ -1900,6 +1995,43 @@ impl SettingEngineBuilder {
         self
     }
 
+    /// Whether an ICE transport whose checks have failed, or whose consent has expired, is
+    /// "failed" without the indications W3C webrtc-pc 5.6.4 makes "failed" wait for, once the
+    /// PAC timer (RFC 8863) has expired. `false` by default.
+    ///
+    /// The default is W3C webrtc-pc 5.6.4: "failed" is a transport that "has finished
+    /// gathering, received an indication that there are no more remote candidates, finished
+    /// checking all candidate pairs, and all pairs have either failed connectivity checks or
+    /// lost consent"; the indication is an end-of-candidates candidate
+    /// (`add_remote_candidate` with an empty `candidate`), `a=end-of-candidates` in the remote
+    /// description, or a remote description without `a=ice-options:trickle`, and gathering
+    /// is finished when the application has added its end-of-candidates local candidate.
+    /// Without them the transport is "disconnected" ("it is still gathering and/or waiting
+    /// for additional remote candidates") and becomes "failed" as soon as they are in, or
+    /// "checking" when a new candidate comes; `restart_ice` starts it over. An application
+    /// that never relays the peer's end-of-candidates sees "disconnected", never "failed".
+    ///
+    /// `true` is libwebrtc's behaviour (the `Chrome` behaviour profile, row
+    /// `ice.failed-without-end-of-candidates`) and the end-of-candidates fallback RFC 8863
+    /// section 5 allows ("ICE agents MAY use the PAC timer to also serve as an
+    /// end-of-candidates fallback"): once the PAC timer has expired (39.5 s after the checks
+    /// began, with the defaults) the transport fails by the checking timeout
+    /// (`with_ice_timeouts`), a failed nomination or consent expiry without them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder;
+    ///
+    /// let _setting_engine = SettingEngineBuilder::new()
+    ///     .with_ice_failed_without_end_of_candidates(true)
+    ///     .build();
+    /// ```
+    pub fn with_ice_failed_without_end_of_candidates(mut self, enabled: bool) -> Self {
+        self.0.ice_failed_without_end_of_candidates = enabled;
+        self
+    }
+
     /// Ta, the pacing of connectivity checks (RFC 8445 section 14.2), `None` for the default
     /// of 50 ms (never under 5 ms). A value other than the default is proposed to the peer as
     /// `a=ice-pacing` (RFC 8839 section 5.5) in every description, and both agents use the
@@ -2269,7 +2401,8 @@ impl SettingEngineBuilder {
     }
 
     /// Refuses a remote answer whose media section has an `a=rtcp-fb` line its offer did not
-    /// have. The default is `false`; the `StrictRfc` behaviour profile sets it.
+    /// have. The default is `true` (the `Rfc`, `StrictRfc` and `Performance` behaviour
+    /// profiles); the `Chrome` profile sets `false`.
     ///
     /// RFC 9429 section 5.11: "If the 'm=' section references RTCP feedback mechanisms that
     /// were not present in the corresponding 'm=' section in the offer, this indicates a
@@ -2278,10 +2411,22 @@ impl SettingEngineBuilder {
     /// [`Error::ErrAnswerDoesNotMatchOffer`](shared::error::Error::ErrAnswerDoesNotMatchOffer)
     /// for such an answer and leaves the offer pending.
     ///
-    /// **This default does not follow RFC 9429 section 5.11** (owner decision; `docs/conformance.md`,
-    /// "Standing departures from a MUST"): the answer is applied, the extra feedback is logged
-    /// and never enabled, since what is negotiated is the intersection with this endpoint's own
-    /// feedback for the format. libwebrtc does the same: it raises no error and intersects.
+    /// With `false` the answer is applied, the extra feedback is logged and never enabled,
+    /// since what is negotiated is the intersection with this endpoint's own feedback for the
+    /// format. That is libwebrtc's form: it raises no error for such an answer and intersects.
+    /// No recorded answer of a browser or of the interop peers (Pion, aiortc, str0m,
+    /// webrtc-rs 0.17) carries such a line.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder;
+    ///
+    /// // Apply such answers as libwebrtc does.
+    /// let setting_engine = SettingEngineBuilder::new()
+    ///     .with_unoffered_feedback_refused(false)
+    ///     .build();
+    /// ```
     pub fn with_unoffered_feedback_refused(mut self, refused: bool) -> Self {
         self.0.unoffered_feedback_refused = refused;
         self
@@ -2325,6 +2470,22 @@ impl SettingEngineBuilder {
     /// once every SSRC it receives has left; one that is heard again before then has not.
     pub fn with_source_departure_ends_track(mut self, ends: bool) -> Self {
         self.0.source_departure_ends_track = ends;
+        self
+    }
+
+    /// Mutes a remote track when one of its SSRCs times out (RFC 3550 section 6.3.5: nothing
+    /// heard from it for five report intervals), as a BYE does. The default is `false`.
+    ///
+    /// W3C webrtc-pc Candidate Correction 57 (w3c/webrtc-pc PR #3082, 2025-10-23, "RTCP
+    /// timeout is not a reason to mute a remote track", fixing #3077) took "or via timeout"
+    /// out of section 9.3: the track is muted when an SSRC "is removed due to reception of a
+    /// BYE". By default a timed-out source is forgotten (no receiver lists it) and its track
+    /// stays as it is. `true` takes the form of the Recommendation of 13 March 2025 without
+    /// its candidate corrections ("removed either due to reception of a BYE or via timeout").
+    /// [`SettingEngineBuilder::with_source_departure_ends_track`] ends the track when all its
+    /// SSRCs have left, by BYE or timeout, whatever this says.
+    pub fn with_rtp_timeout_mutes_track(mut self, mutes: bool) -> Self {
+        self.0.rtp_timeout_mutes_track = mutes;
         self
     }
 
@@ -2565,6 +2726,52 @@ impl SettingEngineBuilder {
     /// with two sections of one media type.
     pub fn with_bundle_only_sections_in_browser_form(mut self, browser_form: bool) -> Self {
         self.0.bundle_only_sections_in_browser_form = browser_form;
+        self
+    }
+
+    /// Whether an answer lists only formats the offer has. The default is `true` (0.3.0; it
+    /// was `false` up to 0.2.x), in the `Rfc`, `Chrome` and `Performance` behaviour profiles;
+    /// the `StrictRfc` profile sets `false`.
+    ///
+    /// With `true` (the default), an answer lists only the offered formats this endpoint
+    /// supports, matched by the engine's codec-matching rules, in the offer's order, each repair
+    /// format (RTX, RED, FEC) only with the primary format it repairs: the intersection, as
+    /// libwebrtc (Chrome), Firefox and WebKit answer. RFC 9429 section 5.3.1: "the media formats
+    /// in the answer MUST include at least one format that is present in the offer but MAY
+    /// include formats that are locally supported but not present in the offer". The
+    /// web-platform-tests assume it (`webrtc/protocol/h265-level-id.https.html` asserts that
+    /// the offerer's sender has exactly one codec).
+    ///
+    /// With `false`, an answer to a section the transceiver has no codec preferences for lists
+    /// those formats and then every other media format this endpoint has registered for the
+    /// kind, the literal reading of the bullet before (RFC 9429 section 5.3.1: "Any currently
+    /// available media formats that are not present in the current remote description MUST
+    /// be added after all existing formats"; RFC 3264 section 6.1: the answer "MAY indicate
+    /// additional media formats, not listed in the corresponding stream in the offer, that
+    /// the answerer is willing to send or receive"). The added formats carry no repair format
+    /// and no feedback, and this endpoint receives on them (RFC 3264 section 6.1: "The
+    /// answerer MUST be prepared to receive media for recvonly or sendrecv streams using any
+    /// media formats listed for those streams in the answer"). They are live: the offerer may
+    /// switch to one (WebKit did), and they are among the offerer's send codecs (W3C
+    /// [[SendCodecs]]). `docs/conformance.md` lists this default as a standing departure from
+    /// that MUST sentence, with the reasons.
+    ///
+    /// An answer with codec preferences is not affected: it lists the preferences that were
+    /// offered whatever this setting says (RFC 9429 section 5.3.1, "MUST exclude any codecs not
+    /// present in the codec preferences").
+    pub fn with_answer_offered_formats_only(mut self, offered_only: bool) -> Self {
+        self.0.answer_offered_formats_only = offered_only;
+        self
+    }
+
+    /// What an answer's `a=ice-options` line says ([`AnswerIceOptions`]). The default is
+    /// [`AnswerIceOptions::AsOffered`], RFC 9429 section 5.3.1 (`Rfc` and `Performance`
+    /// profiles): an answer to a browser's offer says `trickle` alone, one to an offer
+    /// without the line has none. The `Chrome` profile sets
+    /// [`AnswerIceOptions::TrickleAlways`], the `StrictRfc` profile
+    /// [`AnswerIceOptions::Always`] (`docs/conformance/spec-issues.md` row 28).
+    pub fn with_answer_ice_options(mut self, options: AnswerIceOptions) -> Self {
+        self.0.answer_ice_options = options;
         self
     }
 
@@ -3424,6 +3631,23 @@ impl SettingEngineBuilder {
         self
     }
 
+    /// Reads the rid-ids of received `a=rid` and `a=simulcast` lines with the grammar of RFC
+    /// 8851 section 10 as published, `rid-id = 1*(alpha-numeric / "-" / "_")` of any length,
+    /// instead of the corrected one. The default is `false`.
+    ///
+    /// Erratum 7132 (Verified 2022-10-13) corrects the grammar to `rid-id =
+    /// 1*255(alpha-numeric)`, "consistent with the rules for the RtpStreamId/RepairedRtpStreamId
+    /// SDES from RFC 8852 section 3", the identifier a rid is sent as. By default a received
+    /// `a=rid` line whose rid-id has `-` or `_` or more than 255 characters is discarded (RFC
+    /// 8851 section 6.2.2 step 1: "In the case of a syntax error, the 'a=rid' line is
+    /// discarded"), and a description whose `a=simulcast` line names one is refused (RFC 9429
+    /// section 5.8). `true` takes them, for a peer that still writes the published form. Rids
+    /// this endpoint writes are always in the corrected form (W3C webrtc-pc addTransceiver).
+    pub fn with_published_rid_id_grammar(mut self, published: bool) -> Self {
+        self.0.published_rid_id_grammar = published;
+        self
+    }
+
     /// Ignores the SDP of a `rollback` description instead of refusing one that has any. The
     /// default is `false`.
     ///
@@ -3434,6 +3658,78 @@ impl SettingEngineBuilder {
     /// whatever the SDP holds.
     pub fn with_rollback_content_ignored(mut self, ignored: bool) -> Self {
         self.0.rollback_content_ignored = ignored;
+        self
+    }
+
+    /// Returns, on a rollback of a remote offer to receive simulcast, the sender of a
+    /// transceiver that offer created, kept because a track was added to it since
+    /// (`add_track`), to one encoding without a rid: the track's. The default is `false`.
+    ///
+    /// W3C webrtc-pc: the sender of a transceiver a remote offer creates starts with
+    /// `[[LastStableRidlessSendEncodings]]` "initialized to null" ("create an RTCRtpSender");
+    /// the slot is set only when an offer is applied in stable, before that transceiver
+    /// exists, and a rollback restores it only "If [[LastStableRidlessSendEncodings]] is not
+    /// null". So by default the sender keeps the encodings the offer proposed. WPT
+    /// `webrtc/simulcast/negotiation-encodings.https.html`, "sRD(simulcast offer), addTrack,
+    /// then rollback brings us back to having a single encoding" (written for
+    /// w3c/webrtc-pc#2764) expects one rid-less encoding: `true` takes that form, which
+    /// Firefox 161 has and Chrome 158 and Safari 27.2 do not (wpt.fyi).
+    pub fn with_rollback_resets_offer_created_senders(mut self, resets: bool) -> Self {
+        self.0.rollback_resets_offer_created_senders = resets;
+        self
+    }
+
+    /// Keeps offering, in later offers, the simulcast streams a remote answer rejected (left
+    /// out of its `a=simulcast`), as RFC 9429 section 5.2.2 writes subsequent offers. The
+    /// default is `false`.
+    ///
+    /// W3C webrtc-pc "set the RTCSessionDescription": "If description is missing any of the
+    /// previously negotiated layers, then remove the dictionaries that correspond to the
+    /// missing layers from transceiver.\[\[Sender\]\].\[\[SendEncodings\]\]", and its
+    /// `createOffer` adds "an a=rid send line" "for each encoding given in
+    /// \[\[SendEncodings\]\]": by default the sender drops the encodings of the rejected
+    /// streams, and the next offer has neither their `a=rid` lines nor their place in
+    /// `a=simulcast` (the W3C "simulcast envelope ... may be narrowed ... but cannot be
+    /// reexpanded"). RFC 9429 section 5.2.2: "For RtpTransceivers that are still present, the
+    /// "a=rid" lines MUST stay the same" and "any "a=simulcast" line MUST stay the same".
+    ///
+    /// With `true`, after a remote answer the sender still sends only the streams the answer
+    /// kept (RFC 8853 section 5.3.3: the offerer "MUST NOT send any RTP packets corresponding
+    /// to the removed rid-ids"), and `get_parameters` lists only those, but it keeps the
+    /// rejected encodings: each later offer writes their `a=rid` lines as first offered and
+    /// lists them in `a=simulcast` in their first place. A rejected stream counts as paused
+    /// (RFC 8853 section 5.3.4: the `send` pause marks "SHALL reflect the offerer's opinion of
+    /// the current pause state"), so it is written `~rid` only where the engine writes pause
+    /// marks at all ([`Self::with_rid_pause_marks`], or RFC 7728 pause negotiated); otherwise
+    /// the line is the first offer's. A later answer that accepts such a stream again brings
+    /// its encoding back, and it is sent (RFC 8853 section 5.3.4: offers "inside an existing
+    /// session follow the same rules as for initial SDP offer"; section 5.3.3: the offerer
+    /// "MAY send any of the kept "receive"-direction rid-id alternatives"). Streams a local
+    /// answer leaves out are not kept: section 5.2.2 is about the offers that follow this
+    /// endpoint's own.
+    pub fn with_rejected_rids_kept_in_offers(mut self, kept: bool) -> Self {
+        self.0.rejected_rids_kept_in_offers = kept;
+        self
+    }
+
+    /// Refuses, with `InvalidAccessError`, a remote offer that asks a sender with a simulcast
+    /// envelope for a stream (an `a=simulcast` `recv` rid) outside its encodings. The default
+    /// is `false`.
+    ///
+    /// W3C webrtc-pc Candidate Correction 37 (w3c/webrtc-pc PR #2794, 2022-12-08: "Don't fail
+    /// sRD(offer) over rid mismatch, just answer with unicast") removed the step of "set a
+    /// session description" that failed such an offer ("This specification does not allow
+    /// remotely initiated RID renegotiation"). By default the offer is applied: the sender's
+    /// encodings stay, the answer leaves out "any RID not found in the corresponding
+    /// transceiver's [[Sender]].[[SendEncodings]]", and applying the answer removes the
+    /// encodings it does not list (all but the first when it lists none). `true` takes the form
+    /// of the Recommendation of 13 March 2025 without its candidate corrections, which refused
+    /// the offer ("If the description attempted to renegotiate RIDs ... reject p with a newly
+    /// created InvalidAccessError"). Browsers do not refuse it (w3c/webrtc-pc#2762). A remote
+    /// answer is never refused for its rids: RFC 8851 section 6.4 ignores a rid the offer
+    /// lacks.
+    pub fn with_remote_rid_renegotiation_refused(mut self, refused: bool) -> Self {
+        self.0.remote_rid_renegotiation_refused = refused;
         self
     }
 
@@ -3852,6 +4148,19 @@ mod tests {
             SettingEngine::default().multicast_dns.mode,
             MulticastDnsMode::QueryOnly
         );
+    }
+
+    #[test]
+    fn test_turn_reallocation_delay() {
+        assert_eq!(
+            SettingEngine::default().turn_reallocation_delay(),
+            Duration::ZERO
+        );
+        let delay = Duration::from_secs(2);
+        let setting_engine = SettingEngineBuilder::new()
+            .with_turn_reallocation_delay(delay)
+            .build();
+        assert_eq!(setting_engine.turn_reallocation_delay(), delay);
     }
 
     #[test]

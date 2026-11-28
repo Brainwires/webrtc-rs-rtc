@@ -851,6 +851,24 @@ fn new_cipher(
     }
     profile.ensure_crypto_supported(crypto)?;
 
+    // Deriving the session keys and building their ciphers and MACs puts the master key, the
+    // session keys, their AES schedules, GHASH keys and HMAC states into the stack frames of
+    // the functions that do it, this crate's and the provider's. RFC 7714 section 13.1: "All
+    // keys MUST be properly erased when no longer needed". So all of it runs in frames below
+    // one that overwrites the stack under it afterwards; what comes back is a box.
+    crypto::on_erased_stack(|| {
+        build_cipher(profile, master_key, master_salt, crypto, rate, provider)
+    })
+}
+
+fn build_cipher(
+    profile: ProtectionProfile,
+    master_key: &[u8],
+    master_salt: &[u8],
+    crypto: &dyn RTCCrypto,
+    rate: KeyDerivationRate,
+    provider: Option<Arc<dyn RTCCryptoProvider>>,
+) -> Result<Box<dyn Cipher>> {
     Ok(if profile.is_aead() {
         // `CipherAeadAesGcm::new` selects AES-128 vs AES-256 from the profile itself.
         Box::new(CipherAeadAesGcm::new(

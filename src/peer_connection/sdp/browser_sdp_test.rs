@@ -73,7 +73,7 @@ fn every_attribute_real_writers_put_in_a_description_passes_the_grammar_check() 
     let mut refused = vec![];
     for fixture in fixtures() {
         let desc = parsed(&fixture);
-        if let Err(e) = check_attribute_lines(&desc, false) {
+        if let Err(e) = check_attribute_lines(&desc, false, RidIdGrammar::Corrected) {
             refused.push(format!("{}: {e}", fixture.name));
         }
     }
@@ -150,7 +150,7 @@ fn the_strict_grammar_refuses_real_descriptions_only_for_the_listed_tolerances()
     let mut unexpected = vec![];
     for fixture in fixtures() {
         let desc = parsed(&fixture);
-        let strict = check_attribute_lines(&desc, true);
+        let strict = check_attribute_lines(&desc, true, RidIdGrammar::Corrected);
         if strict.is_err() != needs_a_tolerance(&desc) {
             unexpected.push(format!("{}: strict reading {strict:?}", fixture.name));
         }

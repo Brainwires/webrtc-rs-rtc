@@ -7,6 +7,9 @@ mod vp9_layers_test;
 #[cfg(test)]
 mod vp9_test;
 
+mod superframe;
+pub use superframe::{VP9_MAX_SUPERFRAME_FRAMES, join_superframe, split_superframe};
+
 use crate::packetizer::{Depacketizer, Payloader};
 use shared::error::{Error, Result};
 

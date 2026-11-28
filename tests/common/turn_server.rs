@@ -6,6 +6,13 @@
 //! `use-auth-secret`) the username's timestamp is checked on EVERY authenticated request: an
 //! expired one is answered 401, as coturn does.
 //!
+//! `release_linger` models what coturn does with a Refresh of LIFETIME 0 (RFC 8656 section 8.2
+//! has the server delete the allocation at once): coturn answers it with success but floors
+//! the lifetime at one second (`refresh_relay_connection` in `src/server/ns_turn_server.c`:
+//! `if (lifetime < 1) lifetime = 1;`), so the allocation lives on until that timer fires, and an
+//! Allocate on its 5-tuple meanwhile is answered 437 before any authentication
+//! (`handle_turn_command`: "Mismatched allocation: wrong transaction ID").
+//!
 //! No sockets: the test hands it what a client sent to one of its addresses (`client_sent`) and
 //! what a peer sent to a relayed address (`peer_sent`), and takes what it sends from `out`.
 //! Time is the test's virtual clock.
@@ -107,6 +114,9 @@ pub struct TurnServer {
     /// While set, what the server sends waits in `held` instead of `out`.
     pub hold: bool,
     pub held: Vec<(SocketAddr, SocketAddr, Vec<u8>)>,
+    /// coturn's Refresh of LIFETIME 0 (see the module text): answered, the allocation kept
+    /// this long, and an Allocate on its 5-tuple answered 437 before authentication.
+    pub release_linger: Option<Duration>,
 }
 
 impl TurnServer {
@@ -128,7 +138,13 @@ impl TurnServer {
             stale_nonce_next: false,
             hold: false,
             held: vec![],
+            release_linger: None,
         }
+    }
+
+    /// The virtual instant the server's clock starts at.
+    pub fn start(&self) -> Instant {
+        self.start
     }
 
     /// The unix time at virtual instant `now`.
@@ -277,7 +293,17 @@ impl TurnServer {
         }
         self.requests
             .push((from, to, m.typ.method, username.clone(), asked));
-        let reply = self.request(now, tuple, &mut m, &username, asked)?;
+        let lingering = self.release_linger.is_some()
+            && m.typ.method == METHOD_ALLOCATE
+            && self
+                .allocations
+                .get(&tuple)
+                .is_some_and(|a| a.expires > now && a.allocate_tid != m.transaction_id);
+        let reply = if lingering {
+            self.error(&m, CODE_ALLOC_MISMATCH, &username, None)?
+        } else {
+            self.request(now, tuple, &mut m, &username, asked)?
+        };
         if self.hold {
             self.held.push((to, from, reply));
         } else {
@@ -369,7 +395,12 @@ impl TurnServer {
                 let lifetime = asked.unwrap_or(DEFAULT_LIFETIME).min(MAX_LIFETIME);
                 if lifetime.is_zero() {
                     let relayed = a.relayed;
-                    self.allocations.remove(&tuple);
+                    match self.release_linger {
+                        Some(linger) => a.expires = now + linger,
+                        None => {
+                            self.allocations.remove(&tuple);
+                        }
+                    }
                     self.deleted.push((tuple.0, tuple.1, relayed, now));
                 } else {
                     a.expires = now + lifetime;

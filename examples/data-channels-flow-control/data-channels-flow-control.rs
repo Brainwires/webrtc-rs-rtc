@@ -163,6 +163,10 @@ async fn run_requester(
 
     // Add local candidates
     requester.add_local_candidate(RTCIceCandidate::from(&req_candidate).to_json()?)?;
+    // This side's gathering is done: its end-of-candidates goes with the description (a=end-of-candidates). W3C webrtc-pc 5.6.4: the peer's transport is
+    // "failed" only once it has the end of the candidates, "disconnected" until then.
+    requester
+        .add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
 
     // Create offer
     let offer = requester.create_offer(None)?;
@@ -316,6 +320,10 @@ async fn run_responder(
 
     // Add local candidates
     responder.add_local_candidate(RTCIceCandidate::from(&resp_candidate).to_json()?)?;
+    // This side's gathering is done: its end-of-candidates goes with the description (a=end-of-candidates). W3C webrtc-pc 5.6.4: the peer's transport is
+    // "failed" only once it has the end of the candidates, "disconnected" until then.
+    responder
+        .add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
 
     let offer = offer_rx.recv().await.unwrap();
     // set offer

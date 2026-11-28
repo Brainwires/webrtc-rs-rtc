@@ -369,6 +369,10 @@ fn create_peer_connection(
     .new_candidate_host()?;
     let local_candidate_init = RTCIceCandidate::from(&candidate).to_json()?;
     peer_connection.add_local_candidate(local_candidate_init)?;
+    // This side's gathering is done: its end-of-candidates goes with the description (a=end-of-candidates). W3C webrtc-pc 5.6.4: the peer's transport is
+    // "failed" only once it has the end of the candidates, "disconnected" until then.
+    peer_connection
+        .add_local_candidate(rtci::peer_connection::transport::RTCIceCandidateInit::default())?;
 
     // Create answer
     let answer = peer_connection.create_answer(None)?;

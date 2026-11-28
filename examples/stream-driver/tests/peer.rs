@@ -45,6 +45,9 @@ struct Side {
     discarded: Vec<(u64, bool, Instant)>,
     /// When each new association's DTLS transport connected.
     dtls_connected: Vec<Instant>,
+    /// Only TCP candidates of this type are carried to the other side (all candidates when
+    /// `None`).
+    carry: Option<&'static str>,
 }
 
 impl Side {
@@ -70,6 +73,7 @@ impl Side {
             rtp: vec![],
             discarded: vec![],
             dtls_connected: vec![],
+            carry: None,
         })
     }
 
@@ -80,6 +84,10 @@ impl Side {
                 RTCPeerConnectionEvent::OnIceCandidateEvent(event) => {
                     if let Some(candidate) = event.candidate.filter(|c| !c.end_of_candidates)
                         && let Ok(init) = candidate.to_json()
+                        && self.carry.is_none_or(|tcptype| {
+                            init.candidate.contains(" tcp ")
+                                && init.candidate.contains(&format!("tcptype {tcptype}"))
+                        })
                     {
                         self.outgoing.push(init);
                     }
@@ -651,5 +659,35 @@ async fn the_driver_marks_each_datagram_with_its_flows_codepoint() -> Result<()>
             }
         }
     }
+    Ok(())
+}
+
+/// RFC 6544 section 6.1 over real sockets: two lite peers (both descriptions `a=ice-lite`, no
+/// connectivity check from either), the offerer's active TCP candidate and the answerer's
+/// passive one the only candidates carried. The offerer opens the connection of the pair it
+/// selects, the answerer carries its side of the DTLS handshake on the connection it
+/// accepted, and the offerer's media arrives.
+#[tokio::test]
+async fn two_lite_peers_connect_over_tcp_and_carry_media() -> Result<()> {
+    let lite = || SettingEngineBuilder::new().with_lite(true);
+    let mut a = Side::new(lite())?;
+    let mut b = Side::new(lite())?;
+    a.carry = Some("active");
+    b.carry = Some("passive");
+    let audio = connected(&mut a, &mut b).await?;
+    for seq in 1..=50u16 {
+        write_audio(&mut a, audio, seq)?;
+        run_for(&mut a, &mut b, Duration::from_millis(5)).await?;
+    }
+    let all = run_until(&mut a, &mut b, Duration::from_secs(5), |_, b| {
+        b.rtp.len() >= 50
+    })
+    .await?;
+    let received: HashSet<u16> = b.rtp.iter().copied().collect();
+    let missing: Vec<u16> = (1..=50).filter(|s| !received.contains(s)).collect();
+    assert!(
+        all && missing.is_empty(),
+        "media over TCP: missing {missing:?}"
+    );
     Ok(())
 }

@@ -575,6 +575,19 @@ fn drive(
         world.peers[i].pc.add_local_candidate(candidate.clone())?;
         world.peers[1 - i].pc.add_remote_candidate(candidate)?;
     }
+    // Each side ends its gathering and is told the other's end-of-candidates: a session whose
+    // checks or consent fail is "failed" (W3C webrtc-pc 5.6.4), not left "disconnected".
+    for i in 0..2 {
+        world.peers[i]
+            .pc
+            .add_local_candidate(RTCIceCandidateInit::default())?;
+        world.peers[1 - i]
+            .pc
+            .add_remote_candidate(RTCIceCandidateInit {
+                sdp_mid: Some("0".to_owned()),
+                ..Default::default()
+            })?;
+    }
 
     let start = world.now;
     let interval = Duration::from_millis(2);

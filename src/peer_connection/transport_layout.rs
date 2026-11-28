@@ -153,6 +153,9 @@ impl RTCPeerConnection {
         ice_transport
             .agent
             .set_temporary_ipv6_addresses(self.temporary_ipv6_addresses.clone());
+        ice_transport.agent.set_failed_without_end_of_candidates(
+            self.setting_engine.ice_failed_without_end_of_candidates,
+        );
         let certificates = self.dtls_transport().certificates.clone();
         let resumption = self.dtls_transport().resumption.clone();
         let dtls_transport = internal::new_dtls_transport(

@@ -1470,11 +1470,13 @@ mod tests {
     #[test]
     fn restart_clears_stale_client_config_when_switching_to_server() {
         let mut t = auto_role_transport();
-        // First start as client.
+        // First start as client: a stand-in for the client config the transport makes, which
+        // verifies the peer by fingerprint, not by name (`insecure_skip_verify`).
         t.state_change(RTCDtlsTransportState::Connected);
         t.dtls_handshake_config = Some(Arc::new(
             ::dtls::config::ConfigBuilder::default()
                 .with_crypto_provider(crypto::default_provider().unwrap())
+                .with_insecure_skip_verify(true)
                 .build(true, None)
                 .unwrap(),
         ));

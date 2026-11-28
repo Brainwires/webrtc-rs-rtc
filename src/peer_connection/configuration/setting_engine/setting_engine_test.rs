@@ -338,7 +338,8 @@ fn test_set_lite() {
 
     let lite = offer_with(SettingEngineBuilder::new().with_lite(true).build());
     assert!(lite.contains("a=ice-lite"), "{lite}");
-    assert!(!lite.contains("a=ice-options:trickle"), "{lite}");
+    // RFC 8840 section 4 / RFC 8838 Appendix B: a lite agent that trickles says so.
+    assert!(lite.contains("a=ice-options:trickle ice2"), "{lite}");
     assert!(!lite.contains("a=ice-pacing"), "{lite}");
 }
 

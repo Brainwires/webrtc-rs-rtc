@@ -96,3 +96,69 @@ fn an_in_progress_reset_waits_for_its_final_response() -> Result<()> {
     assert_eq!(0, a.streams[&3].sequence_number);
     Ok(())
 }
+
+/// RFC 6525 section 5.2.7 H1: "If the timer was not running for the Re-configuration Request
+/// Sequence Number, the processing of the Re-configuration Response Parameter is complete."
+/// While the reset of stream 3 is outstanding, responses whose sequence number has no running
+/// timer (the one after the outstanding request's, an earlier one, and one far away), each
+/// of every result, change nothing: the request stays outstanding and timed, the stream keeps
+/// its sequence numbers and its pending reset, and nothing is reported. The response for the
+/// outstanding request still completes it.
+#[test]
+fn a_response_for_no_outstanding_request_changes_nothing() -> Result<()> {
+    let mut a = timed_test_association();
+    let now = Instant::now();
+    let rsn = reset_after_two_messages(&mut a, now)?;
+    assert!(
+        a.timers.get(Timer::Reconfig).is_some(),
+        "the request is timed"
+    );
+    assert!(a.streams[&3].outgoing_reset_pending);
+    a.events.clear();
+
+    for unknown in [
+        rsn.wrapping_add(1),
+        rsn.wrapping_sub(1),
+        rsn.wrapping_add(0x8000_0000),
+    ] {
+        for result in [
+            ReconfigResult::SuccessPerformed,
+            ReconfigResult::SuccessNop,
+            ReconfigResult::Denied,
+            ReconfigResult::ErrorRequestAlreadyInProgress,
+            ReconfigResult::InProgress,
+        ] {
+            a.handle_reconfig(&response(unknown, result))?;
+            assert_eq!(
+                a.reconfigs.keys().copied().collect::<Vec<_>>(),
+                vec![rsn],
+                "response {unknown} ({result:?}): the request stays outstanding"
+            );
+            assert!(
+                a.timers.get(Timer::Reconfig).is_some(),
+                "response {unknown} ({result:?}): the timer runs on"
+            );
+            assert!(
+                a.reconfig_in_flight.is_some(),
+                "response {unknown} ({result:?}): the request is still in flight"
+            );
+            assert!(
+                !a.restart_reconfig_timer && !a.reconfig_in_progress,
+                "response {unknown} ({result:?}): not taken as the request's in-progress answer"
+            );
+            assert_eq!(2, a.streams[&3].sequence_number, "response {unknown}");
+            assert!(a.streams[&3].outgoing_reset_pending, "response {unknown}");
+            assert!(
+                a.events.is_empty(),
+                "response {unknown} ({result:?}): nothing reported: {:?}",
+                a.events
+            );
+        }
+    }
+
+    a.handle_reconfig(&response(rsn, ReconfigResult::SuccessPerformed))?;
+    assert!(a.reconfigs.is_empty());
+    assert!(a.timers.get(Timer::Reconfig).is_none());
+    assert_eq!(0, a.streams[&3].sequence_number);
+    Ok(())
+}

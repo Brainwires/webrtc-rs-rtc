@@ -14,7 +14,9 @@ use rtci::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent};
 use rtci::peer_connection::message::RTCMessage;
 use rtci::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use std::time::{Duration, Instant};
-use testenv::{Env, EnvPeer, Gather, TurnTransport, negotiate, pump};
+use testenv::{
+    Env, EnvPeer, Gather, TurnTransport, negotiate, negotiate_without_end_of_candidates, pump,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Long enough for ICE to give up (the agent's failed timeout plus checks) on a pair of NATs
@@ -246,4 +248,84 @@ nat_matrix! {
     portrestricted_portrestricted: "portrestricted", "portrestricted";
     portrestricted_symmetric: "portrestricted", "symmetric";
     symmetric_symmetric: "symmetric", "symmetric";
+}
+
+/// W3C webrtc-pc 5.6.4 on real NATs with no path between them (symmetric <-> symmetric, no
+/// relay): "The failed and completed states require an indication that there are no additional
+/// remote candidates". Without either peer's end of candidates the checks that all failed leave
+/// both agents `disconnected` for as long as the test waits (`FAIL_TIMEOUT`, past the checking
+/// timeout and the PAC timer); with `with_ice_failed_without_end_of_candidates(true)` (RFC 8863
+/// section 5: "ICE agents MAY use the PAC timer to also serve as an end-of-candidates fallback")
+/// they fail, as `nat_matrix_without_turn` does with the indications.
+fn no_path_without_end_of_candidates(fallback: bool) {
+    use rtci::peer_connection::configuration::setting_engine::SettingEngineBuilder;
+    use rtci::peer_connection::state::RTCPeerConnectionState;
+    common::install_crypto_provider();
+    let env = Env::get();
+    let pc = || {
+        RTCPeerConnectionBuilder::new()
+            .with_setting_engine(
+                SettingEngineBuilder::new()
+                    .with_ice_failed_without_end_of_candidates(fallback)
+                    .build(),
+            )
+            .build(Instant::now())
+            .expect("peer connection")
+    };
+    let mut a = EnvPeer::new("a", "h-symmetric-a", Gather::DIRECT, &env, pc()).expect("peer a");
+    let mut b = EnvPeer::new("b", "h-symmetric-b", Gather::DIRECT, &env, pc()).expect("peer b");
+    a.pc.create_data_channel("testenv", None)
+        .expect("data channel");
+    negotiate_without_end_of_candidates(&mut a, &mut b).expect("negotiate");
+    let failed = pump(&mut [&mut a, &mut b], FAIL_TIMEOUT, |p| {
+        p[0].failed() || p[1].failed()
+    })
+    .expect("pump");
+    eprintln!(
+        "NO-END-OF-CANDIDATES fallback={fallback}: states a={:?} b={:?}",
+        a.connection_state(),
+        b.connection_state()
+    );
+    assert!(
+        !a.connected() && !b.connected(),
+        "symmetric <-> symmetric connected without a relay"
+    );
+    if fallback {
+        let both = pump(&mut [&mut a, &mut b], FAIL_TIMEOUT, |p| {
+            p[0].failed() && p[1].failed()
+        })
+        .expect("pump");
+        assert!(
+            failed && both,
+            "with the fallback ICE never reported failure (a {:?}, b {:?})",
+            a.connection_state(),
+            b.connection_state()
+        );
+    } else {
+        assert!(
+            !failed,
+            "failed without an end-of-candidates indication (a {:?}, b {:?})",
+            a.connection_state(),
+            b.connection_state()
+        );
+        assert_eq!(
+            (a.connection_state(), b.connection_state()),
+            (
+                Some(RTCPeerConnectionState::Disconnected),
+                Some(RTCPeerConnectionState::Disconnected)
+            )
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the real-network test environment (coturn, NAT namespaces): scripts/test-env/run.sh"]
+fn without_end_of_candidates_a_pair_of_nats_with_no_path_stays_disconnected() {
+    no_path_without_end_of_candidates(false);
+}
+
+#[test]
+#[ignore = "needs the real-network test environment (coturn, NAT namespaces): scripts/test-env/run.sh"]
+fn with_the_fallback_setting_a_pair_of_nats_with_no_path_fails_without_end_of_candidates() {
+    no_path_without_end_of_candidates(true);
 }

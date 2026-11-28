@@ -50,6 +50,13 @@ reassembling it, unless it lets the engine do so: the SFrame RTP payload format
 (draft-ietf-avtcore-rtp-sframe-03) is in `rtci-rtp` (`codec::sframe`), and the root crate (`rtci`)
 negotiates it (`a=sframe`) and applies it to a transceiver's packets.
 
+Scalable video: RFC 9605 section 6.1.3 makes the sender put each layer in its own ciphertext, so
+that a forwarder can drop layers. This crate encrypts what it is given; the root crate's
+`rtp_transceiver::sframe_transform` (`RTCRtpSFrameEncryptor::set_scalability`,
+`transform_access_unit`, `transform_layer_frame`, `join_layer_frames`) splits VP9 superframes and
+AV1 temporal units into their spatial layers, and its module documentation says how an
+application hands layer frames.
+
 ## Specifications
 
 RFC 9605 and the SFrame parts of draft-ietf-avtcore-rtp-sframe-03; clause-by-clause status in

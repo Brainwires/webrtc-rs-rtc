@@ -457,6 +457,19 @@ impl<'a>
                     });
                 }
                 ::ice::Event::CandidatePairRemoved(local, remote) => {
+                    // The selected pair may be the one removed (the application removed it,
+                    // or its consent expired while the transport waits for the end of the
+                    // candidates, W3C webrtc-pc 5.6.4): with none left and no path, the
+                    // transport has no selected pair (webrtc-stats
+                    // `selectedCandidatePairChanges`: "Going from not having a selected
+                    // candidate pair to having a selected candidate pair, or the other way
+                    // around, also increases this counter"). An ICE restart that keeps the
+                    // previous path (RFC 8445 Section 9) still has one: not a change.
+                    let agent = &self.ctx.ice_transport.agent;
+                    if agent.get_selected_candidate_pair().is_none() && agent.media_path().is_none()
+                    {
+                        self.stats.on_selected_candidate_pair(None);
+                    }
                     let pair = self.ctx.ice_transport.exposed_pair(&local, &remote);
                     self.ctx.event_outs.push_back(TaggedRTCEventInternal {
                         now,
